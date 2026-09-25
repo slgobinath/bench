@@ -1,5 +1,6 @@
 pub mod platforms;
 mod system_window_tabs;
+pub mod worktree_tint;
 
 use gpui::{
     Action, AnyElement, App, Context, Decorations, Entity, Hsla, InteractiveElement, IntoElement,
@@ -14,6 +15,7 @@ use ui::{
     prelude::*,
     utils::{TRAFFIC_LIGHT_PADDING, platform_title_bar_height},
 };
+use std::path::PathBuf;
 use workspace::{MultiWorkspace, SidebarRenderState, SidebarSide};
 
 use crate::{
@@ -132,6 +134,21 @@ impl PlatformTitleBar {
             .unwrap_or_default()
     }
 
+    /// The worktree the window is showing, which is what its title bar is
+    /// tinted by; see [`worktree_tint`].
+    fn active_worktree(&self, cx: &App) -> Option<PathBuf> {
+        let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
+        let workspace = multi_workspace.read(cx).workspace().clone();
+        workspace
+            .read(cx)
+            .project()
+            .read(cx)
+            .worktree_paths(cx)
+            .ordered_pairs()
+            .next()
+            .map(|(_, worktree)| worktree.clone())
+    }
+
     pub fn is_multi_workspace_enabled(cx: &App) -> bool {
         !DisableAiSettings::get_global(cx).disable_ai
     }
@@ -214,6 +231,11 @@ impl Render for PlatformTitleBar {
 
         let button_layout = self.effective_button_layout(&decorations, cx);
         let sidebar = self.sidebar_render_state(cx);
+        // Bench: which worktree you are in, as a colour.
+        let titlebar_background = worktree_tint::title_bar_background(
+            self.active_worktree(cx).as_deref(),
+            titlebar_color,
+        );
 
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)
@@ -306,7 +328,7 @@ impl Render for PlatformTitleBar {
                     .border(theme::CLIENT_SIDE_DECORATION_BORDER)
                     .border_color(titlebar_color),
             })
-            .bg(titlebar_color)
+            .bg(titlebar_background)
             .content_stretch()
             .child(
                 div()

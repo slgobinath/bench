@@ -11,7 +11,9 @@ workspace = true
 [lib]
 path = "src/platform_title_bar.rs"
 doctest = false
-test = false
+# Upstream turned tests off for a crate that had none. `worktree_tint` has
+# some, and they are the kind worth keeping: two worktrees of one repository
+# getting the same colour is the whole failure mode.
 
 [dependencies]
 gpui.workspace = true
