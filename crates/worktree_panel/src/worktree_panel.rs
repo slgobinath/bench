@@ -26,25 +26,30 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use git::repository::{CreateWorktreeTarget, Worktree as GitWorktree};
+use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
+use git_ui_core::pull_request_color::pull_request_color;
+use github_cli::{self, PullRequest, PullRequestState};
 use gpui::{
-    Animation, AnimationExt as _, App, AsyncWindowContext, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, Task, Transformation, WeakEntity, Window, actions,
-    percentage, prelude::*, svg,
+    Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, Context, DismissEvent,
+    Entity,
+    EventEmitter, FocusHandle, Focusable, Global, Task, Transformation, WeakEntity, Window,
+    actions, percentage, prelude::*, svg,
 };
 use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
 use ui::{Indicator, Label, ListItem, ListItemSpacing, Tooltip, prelude::*};
-use ui_input::InputField;
+use ui_input::{ErasedEditor, InputField};
 use util::path_list::PathList;
 use util::paths::home_dir;
+use util::ResultExt as _;
 use workspace::{
     ModalView, MultiWorkspace, MultiWorkspaceEvent, OpenMode, RemovalIntent, Workspace,
-    dock::{DockPosition, Panel, PanelEvent},
+    dock::{DockPosition, Panel, PanelEvent, PanelSizeState},
 };
 use zed_actions::SwitchWorktree;
 
@@ -113,7 +118,43 @@ struct WorktreeRow {
     /// is the thing the others are linked to — so it gets no delete button.
     is_main: bool,
     is_active: bool,
+    /// What became of the pull request opened from this worktree's branch,
+    /// when there is one; see [`WorktreePanel::scan_pull_requests`].
+    pull_request: Option<PullRequestState>,
+    /// The agents running in this worktree's terminals, counted by what they
+    /// are doing.
+    agents: AgentSummary,
 }
+
+/// What is known about one project's pull requests; see
+/// [`WorktreePanel::scan_pull_requests`].
+enum PullRequestScan {
+    /// The first scan of this project is running. Nothing is drawn from it
+    /// until it lands, which is why a refresh keeps the old answer instead of
+    /// going back through here.
+    Pending { _scan: Task<()> },
+    Found {
+        /// The state of each branch's pull request, by branch name. A branch
+        /// with no pull request is absent rather than present and empty.
+        by_branch: HashMap<SharedString, PullRequestState>,
+        /// When this was asked, which is what [`PULL_REQUEST_REFRESH`] is
+        /// measured from.
+        at: Instant,
+        /// A refresh in flight. The answer already found stays on screen until
+        /// it lands, because a colour that blinks off every five minutes would
+        /// be worse than one that is briefly five minutes old.
+        _refresh: Option<Task<()>>,
+    },
+}
+
+/// How long a project's pull request states are trusted before they are asked
+/// for again.
+///
+/// A pull request merges while Bench is open, and the icon that said "open"
+/// should not keep saying it for the rest of the session. Long enough that the
+/// panel is not a source of `gh` processes, short enough that a merge shows up
+/// while you still remember making it.
+const PULL_REQUEST_REFRESH: Duration = Duration::from_secs(300);
 
 /// A [`Workspace`] in the window, with the worktree root it is showing.
 struct OpenWorktree {
@@ -124,22 +165,80 @@ struct OpenWorktree {
 /// What the panel knows about the worktrees of a project the window has no
 /// workspace open for; see [`WorktreePanel::discover`].
 enum Discovery {
-    /// The scan is running. The task is held here so that it is cancelled when
-    /// the panel goes away.
+    /// The scan is running.
     Pending { _scan: Task<()> },
     /// What git reported. Empty means the project is not a git repository, or
     /// that git could not be asked.
-    Found(Vec<GitWorktree>),
+    Found {
+        worktrees: Vec<GitWorktree>,
+        at: Instant,
+    },
+}
+
+/// How long git's answer about a project's worktrees is trusted. Worktrees are
+/// made and removed outside Bench as well as in it, and a project that is only
+/// a row has no repository entity to watch.
+const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
+
+/// What has been scanned about each project, for the whole application.
+///
+/// A panel belongs to one worktree — there is a workspace each — but a
+/// project's worktrees and pull requests are facts about the project, not
+/// about the window you are looking through. Holding them per panel meant two
+/// things, both bad: a panel drawn for the first time had nothing to show and
+/// filled in a moment later, which is the flicker you see when clicking
+/// through worktrees, and every panel ran its own `git worktree list` and
+/// `gh pr list` over the same projects.
+/// What the panel shows that is not derived from the window: which projects
+/// are collapsed, and which chevron is mid-turn.
+///
+/// Shared for the same reason the scans are. There is a panel per worktree,
+/// and "is this project collapsed" is a fact about the project — collapsing it
+/// in one worktree and finding it open in the next is the panel disagreeing
+/// with itself.
+#[derive(Default)]
+struct PanelView {
+    collapsed: Vec<ProjectGroupKey>,
+    /// The project whose chevron is turning, and when it started.
+    ///
+    /// The animation has to play on a click and *only* on a click. A panel is
+    /// a fresh element tree every time its worktree comes forward, and
+    /// `with_animation` replays whenever its element is mounted, so without
+    /// this every chevron in the panel spins on every switch.
+    turning: Option<(ProjectGroupKey, Instant)>,
+}
+
+impl Global for PanelView {}
+
+#[derive(Default)]
+struct ProjectScans {
+    discovered: HashMap<PathBuf, Discovery>,
+    pull_requests: HashMap<PathBuf, PullRequestScan>,
+}
+
+impl Global for ProjectScans {}
+
+/// Puts a scan's result where every panel can see it, and asks the windows to
+/// draw: the panel that started a scan is not necessarily the one on screen
+/// when it lands.
+fn record_scan(cx: &mut App, record: impl FnOnce(&mut ProjectScans)) {
+    record(cx.default_global::<ProjectScans>());
+    cx.refresh_windows();
 }
 
 pub struct WorktreePanel {
+    /// The workspace this panel belongs to — one of the window's many, and the
+    /// one whose dock it sits in. Held to tell it apart from its siblings in
+    /// [`Self::showing_in_another_worktree`], not to read.
+    workspace: WeakEntity<Workspace>,
     multi_workspace: WeakEntity<MultiWorkspace>,
     focus_handle: FocusHandle,
-    /// Repositories the user has collapsed, by key. Absent means expanded: a
-    /// window that has just opened a repository should show its worktrees.
-    collapsed: Vec<ProjectGroupKey>,
-    /// The worktrees of projects with no workspace open, by project root.
-    discovered: HashMap<PathBuf, Discovery>,
+    /// The filter box at the top of the panel; see [`Self::filter`].
+    ///
+    /// The editor itself rather than an `InputField`, which draws a filled,
+    /// bordered box: the panel's header is chrome, and a box with a border
+    /// around it there competes with the rows for attention.
+    filter: Arc<dyn ErasedEditor>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -149,19 +248,21 @@ impl WorktreePanel {
         cx: AsyncWindowContext,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         cx.spawn(async move |cx| {
+            let handle = workspace.clone();
             workspace.update_in(cx, |workspace, window, cx| {
                 let multi_workspace = workspace
                     .multi_workspace()
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("the worktree panel needs a multi workspace"))?;
-                anyhow::Ok(cx.new(|cx| Self::new(multi_workspace, window, cx)))
+                anyhow::Ok(cx.new(|cx| Self::new(handle, multi_workspace, window, cx)))
             })?
         })
     }
 
     fn new(
+        workspace: WeakEntity<Workspace>,
         multi_workspace: WeakEntity<MultiWorkspace>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut subscriptions = Vec::new();
@@ -187,11 +288,41 @@ impl WorktreePanel {
                 },
             ));
         }
+        // The tracker sweeps on its own clock and says so only when something
+        // actually moved, which is why this is a subscription rather than an
+        // observer: a redraw per second, forever, is not what a panel that is
+        // usually idle should cost.
+        if let Some(tracker) = AgentTracker::try_global(cx) {
+            subscriptions.push(cx.subscribe(&tracker, |_, _, _: &AgentsChanged, cx| cx.notify()));
+        }
+
+        let filter = (ui_input::ERASED_EDITOR_FACTORY
+            .get()
+            .expect("the erased editor factory, which `editor::init` sets"))(
+            window, cx
+        );
+        filter.set_placeholder_text("Filter", window, cx);
+        // Every keystroke changes which rows there are, and the rows are
+        // derived on each draw, so there is nothing to keep in step — only to
+        // redraw.
+        subscriptions.push(filter.subscribe(
+            Box::new({
+                let panel = cx.entity().downgrade();
+                move |event, _window, cx| {
+                    if event == ui_input::ErasedEditorEvent::BufferEdited {
+                        panel.update(cx, |_, cx| cx.notify()).ok();
+                    }
+                }
+            }),
+            window,
+            cx,
+        ));
+
         Self {
+            workspace,
             multi_workspace,
             focus_handle: cx.focus_handle(),
-            collapsed: Vec::new(),
-            discovered: HashMap::new(),
+            filter,
             _subscriptions: subscriptions,
         }
     }
@@ -287,8 +418,14 @@ impl WorktreePanel {
 
         if open_worktrees.is_empty() {
             let root = project_root(key);
-            match root.as_ref().and_then(|root| self.discovered.get(root)) {
-                Some(Discovery::Found(found)) => worktrees = found.clone(),
+            let discovered = root
+                .as_ref()
+                .zip(cx.try_global::<ProjectScans>())
+                .and_then(|(root, scans)| scans.discovered.get(root));
+            match discovered {
+                Some(Discovery::Found {
+                    worktrees: found, ..
+                }) => worktrees = found.clone(),
                 Some(Discovery::Pending { .. }) | None => return Vec::new(),
             }
             anchor = root;
@@ -299,6 +436,8 @@ impl WorktreePanel {
             .map(|open| open.root.clone())
             .collect();
         let switch_from = open_worktrees.first().map(|open| open.workspace.clone());
+        let pull_requests = self.scanned_pull_requests(key, cx);
+        let tracker = AgentTracker::try_global(cx);
 
         plan_rows(&worktrees, &open_roots, anchor.as_deref())
             .into_iter()
@@ -332,6 +471,15 @@ impl WorktreePanel {
                     },
                     is_active: open.is_some_and(|open| &open.workspace == active),
                     workspace: open.map(|open| open.workspace.clone()),
+                    pull_request: plan.branch.as_ref().and_then(|branch| {
+                        pull_requests?.get(branch).copied()
+                    }),
+                    agents: plan
+                        .root
+                        .as_deref()
+                        .zip(tracker.as_ref())
+                        .map(|(root, tracker)| tracker.read(cx).summary_for(root))
+                        .unwrap_or_default(),
                     root: plan.root,
                 })
             })
@@ -371,31 +519,110 @@ impl WorktreePanel {
     /// scanned or being scanned is skipped, so each one costs a single
     /// `git worktree list`.
     fn discover(&mut self, roots: &[PathBuf], cx: &mut Context<Self>) {
-        self.discovered.retain(|root, _| roots.contains(root));
-
         let Some(fs) = self.fs(cx) else {
             return;
         };
         for root in roots {
-            if self.discovered.contains_key(root) {
-                continue;
+            match cx.default_global::<ProjectScans>().discovered.get(root) {
+                Some(Discovery::Pending { .. }) => continue,
+                Some(Discovery::Found { at, .. }) if at.elapsed() < DISCOVERY_REFRESH => continue,
+                _ => {}
             }
+
             let scan = cx.spawn({
                 let fs = fs.clone();
                 let root = root.clone();
-                async move |this, cx| {
+                async move |_, cx| {
                     let found = cx
                         .background_spawn(worktrees_on_disk(fs, root.clone()))
                         .await;
-                    this.update(cx, |this, cx| {
-                        this.discovered.insert(root, Discovery::Found(found));
-                        cx.notify();
-                    })
-                    .ok();
+                    cx.update(|cx| {
+                        record_scan(cx, |scans| {
+                            scans.discovered.insert(
+                                root,
+                                Discovery::Found {
+                                    worktrees: found,
+                                    at: Instant::now(),
+                                },
+                            );
+                        });
+                    });
                 }
             });
-            self.discovered
+            cx.default_global::<ProjectScans>()
+                .discovered
                 .insert(root.clone(), Discovery::Pending { _scan: scan });
+        }
+    }
+
+    /// Forgets what git said about a project, so that the next draw asks
+    /// again. Used when Bench itself has just changed a project's worktrees.
+    fn rediscover(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        let Some(root) = root else {
+            return;
+        };
+        cx.default_global::<ProjectScans>().discovered.remove(&root);
+        cx.notify();
+    }
+
+    fn scan_pull_requests(&mut self, roots: &[PathBuf], cx: &mut Context<Self>) {
+        for root in roots {
+            match cx.default_global::<ProjectScans>().pull_requests.get(root) {
+                Some(PullRequestScan::Pending { .. }) => continue,
+                Some(PullRequestScan::Found { at, _refresh, .. })
+                    if _refresh.is_some() || at.elapsed() < PULL_REQUEST_REFRESH =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+
+            let scan = cx.spawn({
+                let root = root.clone();
+                async move |_, cx| {
+                    let found = cx
+                        .background_spawn(pull_requests_by_branch(root.clone()))
+                        .await;
+                    cx.update(|cx| {
+                        record_scan(cx, |scans| {
+                            scans.pull_requests.insert(
+                                root,
+                                PullRequestScan::Found {
+                                    by_branch: found,
+                                    at: Instant::now(),
+                                    _refresh: None,
+                                },
+                            );
+                        });
+                    });
+                }
+            });
+
+            let scans = cx.default_global::<ProjectScans>();
+            match scans.pull_requests.get_mut(root) {
+                Some(PullRequestScan::Found { _refresh, .. }) => *_refresh = Some(scan),
+                _ => {
+                    scans
+                        .pull_requests
+                        .insert(root.clone(), PullRequestScan::Pending { _scan: scan });
+                }
+            }
+        }
+    }
+
+    /// What is known about the pull requests of one project's branches.
+    fn scanned_pull_requests<'a>(
+        &self,
+        key: &ProjectGroupKey,
+        cx: &'a App,
+    ) -> Option<&'a HashMap<SharedString, PullRequestState>> {
+        match cx
+            .try_global::<ProjectScans>()?
+            .pull_requests
+            .get(&project_root(key)?)
+        {
+            Some(PullRequestScan::Found { by_branch, .. }) => Some(by_branch),
+            Some(PullRequestScan::Pending { .. }) | None => None,
         }
     }
 
@@ -592,67 +819,64 @@ impl WorktreePanel {
         });
     }
 
-    /// Keeps every worktree's panel the same width.
+    /// Keeps this worktree's panel at the width every worktree shares.
     ///
-    /// Dock sizes belong to a workspace, and Bench has one workspace per
-    /// worktree, so left to itself the panel is a different width in each —
-    /// switching worktree makes the panel jump. This is the panel's width, not
-    /// this worktree's, so a resize in one is copied to the others and
-    /// persisted for each.
+    /// Checked on every draw rather than once, because a panel is drawn again
+    /// each time its worktree comes forward and that is exactly when it must
+    /// agree with the one you just left. Doing it once — when the panel is
+    /// first built — misses every drag that happens afterwards, which is most
+    /// of them.
     ///
-    /// Deferred and without `&mut Self`, per [`Self::activate`]: reading a
-    /// dock's panel entries is the read this panel must not be holding a lease
-    /// across.
-    fn share_width_across_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let multi_workspace = self.multi_workspace.clone();
-        let resized = cx.entity_id();
-        window.defer(cx, move |_window, cx| {
-            let Some(multi_workspace) = multi_workspace.upgrade() else {
-                return;
-            };
-            let workspaces: Vec<Entity<Workspace>> =
-                multi_workspace.read(cx).workspaces().cloned().collect();
-
-            // Every workspace's own panel, with the dock it sits in.
-            let panels: Vec<(Entity<Workspace>, Entity<WorktreePanel>)> = workspaces
-                .into_iter()
-                .filter_map(|workspace| {
-                    let panel = workspace.read(cx).panel::<WorktreePanel>(cx)?;
-                    Some((workspace, panel))
-                })
-                .collect();
-
-            let Some(width) = panels.iter().find_map(|(workspace, panel)| {
-                (panel.entity_id() == resized).then(|| {
-                    workspace
-                        .read(cx)
-                        .dock_at_position(DockPosition::Left)
-                        .read(cx)
-                        .stored_panel_size_state(panel)
-                })?
-            }) else {
-                return;
-            };
-
-            for (workspace, panel) in panels {
-                if panel.entity_id() == resized {
-                    continue;
-                }
-                let dock = workspace
-                    .read(cx)
-                    .dock_at_position(DockPosition::Left)
-                    .clone();
-                dock.update(cx, |dock, cx| {
-                    dock.set_panel_size_state(&panel, width, cx);
-                });
-                // Setting it lasts until the window closes; persisting is what
-                // survives a restart, which is where the widths drifted apart
-                // in the first place.
-                workspace.update(cx, |workspace, cx| {
-                    workspace.persist_panel_size_state(WorktreePanel::panel_key(), width, cx);
-                });
+    /// It costs a comparison: the shared width is held in memory, and the
+    /// dock's own is a field read. Nothing is written unless they differ.
+    fn match_shared_width(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mine = self.my_width(cx);
+        let Some(shared) = shared_width(cx) else {
+            // Nothing has been dragged yet, in this session or any before it.
+            // Whatever the first panel to draw is wearing becomes the width
+            // the others take, so they agree from the start rather than from
+            // the first drag.
+            if let Some(mine) = mine {
+                set_shared_width(mine, cx);
             }
+            return;
+        };
+        if mine == Some(shared) {
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        let panel = cx.entity();
+        // Deferred, per `activate`: this runs inside a draw, and a dock cannot
+        // be updated while it is being rendered.
+        window.defer(cx, move |_window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            let dock = workspace
+                .read(cx)
+                .dock_at_position(DockPosition::Left)
+                .clone();
+            dock.update(cx, |dock, cx| {
+                dock.set_panel_size_state(&panel, shared, cx);
+            });
+            // Persisted for this workspace too, so the next session starts at
+            // the shared width rather than flickering to it on the first draw.
+            workspace.update(cx, |workspace, cx| {
+                workspace.persist_panel_size_state(WorktreePanel::panel_key(), shared, cx);
+            });
         });
+    }
+
+    /// What this worktree's panel is currently wearing.
+    fn my_width(&self, cx: &Context<Self>) -> Option<PanelSizeState> {
+        let workspace = self.workspace.upgrade()?;
+        let dock = workspace
+            .read(cx)
+            .dock_at_position(DockPosition::Left)
+            .clone();
+        let width = dock.read(cx).stored_panel_size_state(&cx.entity());
+        width
     }
 
     /// Creates a worktree of one repository: asks for a name, and that name is
@@ -731,6 +955,7 @@ impl WorktreePanel {
 
             match created {
                 Ok(()) => this.update_in(cx, |this, window, cx| {
+                    this.rediscover(project_root(&key), cx);
                     this.open_worktree(Some(from), key, path, name, window, cx);
                 })?,
                 Err(refused) => {
@@ -770,6 +995,9 @@ impl WorktreePanel {
         cx: &mut Context<Self>,
     ) {
         let multi_workspace = self.multi_workspace.clone();
+        // The project git will be asked about again once this worktree is
+        // gone; see `rediscover`.
+        let project = repository_anchor(&repository, cx);
         let confirmed = window.prompt(
             gpui::PromptLevel::Warning,
             &format!("Delete the worktree “{name}”?"),
@@ -778,7 +1006,7 @@ impl WorktreePanel {
             cx,
         );
 
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             if confirmed.await? != 0 {
                 return anyhow::Ok(());
             }
@@ -825,18 +1053,23 @@ impl WorktreePanel {
             repository
                 .update(cx, |repository, _| repository.remove_worktree(root, true))
                 .await??;
+            this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
+                .ok();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
     }
 
     fn toggle_collapsed(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
-        match self.collapsed.iter().position(|held| held.matches(key)) {
+        let view = cx.default_global::<PanelView>();
+        match view.collapsed.iter().position(|held| held.matches(key)) {
             Some(index) => {
-                self.collapsed.remove(index);
+                view.collapsed.remove(index);
             }
-            None => self.collapsed.push(key.clone()),
+            None => view.collapsed.push(key.clone()),
         }
+        // Only the project that was clicked turns, and only from now.
+        view.turning = Some((key.clone(), Instant::now()));
         cx.notify();
     }
 
@@ -860,8 +1093,55 @@ impl WorktreePanel {
                 .is_some_and(|panel| panel.persistent_name() == Self::persistent_name())
     }
 
-    fn is_collapsed(&self, key: &ProjectGroupKey) -> bool {
-        self.collapsed.iter().any(|held| held.matches(key))
+    /// Whether any *other* worktree of the window has the panel out.
+    ///
+    /// Every workspace but this panel's own: this one is the one being built —
+    /// [`Panel::starts_open`] is asked while the workspace is mid-update — so
+    /// reading it here is a double lease and a panic. It is also the one with
+    /// nothing to say, since the question is what the rest of the window is
+    /// doing.
+    fn showing_in_another_worktree(&self, cx: &App) -> bool {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return false;
+        };
+        let own = self.workspace.entity_id();
+        let workspaces: Vec<Entity<Workspace>> = multi_workspace
+            .read(cx)
+            .workspaces()
+            .filter(|workspace| workspace.entity_id() != own)
+            .cloned()
+            .collect();
+        workspaces.into_iter().any(|workspace| {
+            let dock = workspace
+                .read(cx)
+                .dock_at_position(DockPosition::Left)
+                .clone();
+            let dock = dock.read(cx);
+            dock.is_open()
+                && dock
+                    .active_panel()
+                    .is_some_and(|panel| panel.persistent_name() == Self::persistent_name())
+        })
+    }
+
+    /// What the filter box says, trimmed and lowercased, or nothing when it is
+    /// empty.
+    fn filter(&self, cx: &App) -> Option<String> {
+        let filter = self.filter.text(cx).trim().to_lowercase();
+        (!filter.is_empty()).then_some(filter)
+    }
+
+    fn is_collapsed(&self, key: &ProjectGroupKey, cx: &App) -> bool {
+        cx.try_global::<PanelView>()
+            .is_some_and(|view| view.collapsed.iter().any(|held| held.matches(key)))
+    }
+
+    /// Whether this project's chevron should be drawn mid-turn, which is true
+    /// only just after it was clicked.
+    fn is_turning(&self, key: &ProjectGroupKey, cx: &App) -> bool {
+        cx.try_global::<PanelView>()
+            .and_then(|view| view.turning.as_ref())
+            .is_some_and(|(turning, at)| turning.matches(key) && at.elapsed() < CHEVRON_TURN)
     }
 
     fn render_repository(
@@ -870,7 +1150,8 @@ impl WorktreePanel {
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let collapsed = self.is_collapsed(&row.key);
+        let collapsed = self.is_collapsed(&row.key, cx);
+        let turning = self.is_turning(&row.key, cx);
         let key = row.key.clone();
         // Any workspace of this repository will do to create against: it only
         // needs the project, and every worktree of one repository shares it.
@@ -885,12 +1166,15 @@ impl WorktreePanel {
 
         ListItem::new(("repository", index))
             .spacing(ListItemSpacing::Sparse)
+            .height(ROW_HEIGHT)
             .start_slot(
                 h_flex()
                     .gap_1()
-                    .child(render_chevron(index, collapsed, cx))
+                    .child(render_chevron(index, collapsed, turning, cx))
+                    // A project is a directory; a worktree is a branch. The
+                    // rows are told apart by their icons before they are read.
                     .child(
-                        Icon::new(IconName::GitBranch)
+                        Icon::new(IconName::Folder)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     ),
@@ -966,34 +1250,51 @@ impl WorktreePanel {
         let open_name = row.name.clone();
         ListItem::new(("worktree", index))
             .spacing(ListItemSpacing::Sparse)
+            .height(ROW_HEIGHT)
             .indent_level(1)
             .indent_step_size(px(12.))
             .selectable(true)
             .toggle_state(row.is_active)
-            .start_slot(Indicator::dot().color(if row.is_active {
-                Color::Accent
-            } else if is_open {
-                Color::Muted
-            } else {
-                // A worktree that exists but is not open in this window: the
-                // row is there to be clicked, and should not read as one of
-                // the window's own.
-                Color::Ignored
-            }))
+            .start_slot(
+                Icon::new(IconName::GitBranch)
+                    .size(IconSize::Small)
+                    // What became of the branch outranks which worktree you
+                    // are in: the row you are in is already the tinted one,
+                    // and a pull request is the thing you cannot see from
+                    // here. Green while it is open, purple once it is merged.
+                    .color(match row.pull_request {
+                        Some(state) => pull_request_color(state),
+                        // The worktree the window is showing. One accented
+                        // icon says which of them you are in from across the
+                        // tree.
+                        None if row.is_active => Color::Accent,
+                        None if is_open => Color::Muted,
+                        // A worktree that exists but is not open in this
+                        // window: the row is there to be clicked, and should
+                        // not read as one of the window's own.
+                        None => Color::Ignored,
+                    }),
+            )
             .child(
-                h_flex().w_full().min_w_0().gap_1p5().child(
-                    // Both of these truncate: a worktree named after a long
-                    // branch would otherwise widen the row past the panel
-                    // and carry the delete button off the edge with it.
-                    Label::new(row.name.clone())
-                        .single_line()
-                        .truncate()
-                        .color(if is_open {
-                            Color::Default
-                        } else {
-                            Color::Muted
-                        }),
-                ),
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .justify_between()
+                    .child(
+                        // Both of these truncate: a worktree named after a long
+                        // branch would otherwise widen the row past the panel
+                        // and carry the delete button off the edge with it.
+                        Label::new(row.name.clone())
+                            .single_line()
+                            .truncate()
+                            .color(if is_open {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    )
+                    .children(render_agents(index, &row.agents)),
             )
             .end_slot_on_hover(
                 h_flex().when_some(delete, |this, (repository, root, workspace)| {
@@ -1026,27 +1327,81 @@ impl WorktreePanel {
     }
 }
 
+/// The height of a row, project and worktree alike.
+///
+/// Taller than what the list item's own padding gives it, which is sized for a
+/// long list read at a glance. This one is short — a handful of projects and
+/// their worktrees — and its rows are click targets you aim at, so they are
+/// given the room. In rems, so that it follows the UI font size.
+const ROW_HEIGHT: Rems = Rems(1.875);
+
 /// How long the chevron takes to turn. Short enough that expanding still feels
 /// like a direct response to the click, long enough to be seen.
 const CHEVRON_TURN: Duration = Duration::from_millis(120);
 
+/// The agents running in a worktree: a dot for what they are doing, and a
+/// count once there is more than one of them.
+///
+/// It sits at the end of the row rather than beside the branch icon, because
+/// the branch icon already says something about the branch itself. This says
+/// what is happening in it right now.
+fn render_agents(index: usize, agents: &AgentSummary) -> Option<impl IntoElement> {
+    let state = agents.state()?;
+    let total = agents.total();
+    let summary = if agents.needs_input > 0 {
+        format!(
+            "{} of {total} waiting for you",
+            agents.needs_input
+        )
+    } else if agents.working > 0 {
+        format!("{} of {total} working", agents.working)
+    } else {
+        format!("{total} idle")
+    };
+
+    Some(
+        h_flex()
+            .id(("agents", index))
+            .gap_0p5()
+            .child(Indicator::dot().color(agent_state_color(state)))
+            .when(total > 1, |this| {
+                this.child(
+                    Label::new(total.to_string())
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+            })
+            .tooltip(Tooltip::text(format!(
+                "{total} agent{}: {summary}",
+                if total == 1 { "" } else { "s" }
+            ))),
+    )
+}
+
 /// The disclosure chevron, turning a quarter circle as the repository opens and
 /// closes.
 ///
-/// The element id carries the state, which is what makes this animate rather
-/// than jump: changing the id remounts the element, so the animation plays from
-/// the start on every toggle instead of once when the panel first drew. The
-/// direction comes from the state the row is in now — expanding turns the
-/// chevron down, collapsing turns it back.
-fn render_chevron(index: usize, collapsed: bool, cx: &App) -> impl IntoElement {
+/// It animates only when `turning` — when this project's own chevron was just
+/// clicked. Every other time it is drawn already at rest: `with_animation`
+/// replays whenever its element is mounted, and a panel is mounted afresh each
+/// time its worktree comes forward, so animating unconditionally made every
+/// chevron in the panel spin on every switch between worktrees.
+fn render_chevron(index: usize, collapsed: bool, turning: bool, cx: &App) -> AnyElement {
     // Drawn as an `svg` rather than a `ui::Icon` because rotating an `Icon`
     // needs a trait that `ui` keeps to itself, and this needs no upstream
     // change to reach.
     let size = IconSize::XSmall.rems();
-    svg()
+    let at_rest = if collapsed { 0. } else { 0.25 };
+    let chevron = svg()
         .size(size)
         .path(IconName::ChevronRight.path())
-        .text_color(Color::Muted.color(cx))
+        .text_color(Color::Muted.color(cx));
+    if !turning {
+        return chevron
+            .with_transformation(Transformation::rotate(percentage(at_rest)))
+            .into_any_element();
+    }
+    chevron
         .with_animation(
             // Two ids, one per state, so a toggle remounts the element.
             ("chevron", 2 * index + usize::from(collapsed)),
@@ -1056,6 +1411,7 @@ fn render_chevron(index: usize, collapsed: bool, cx: &App) -> impl IntoElement {
                 chevron.with_transformation(Transformation::rotate(percentage(quarter_turn)))
             },
         )
+        .into_any_element()
 }
 
 /// The path the repository's worktree names are relative to: its own checkout.
@@ -1073,6 +1429,11 @@ struct RowPlan {
     /// `None` for a row that has no worktree to take a name from, which is a
     /// workspace the repository's list did not account for.
     name: Option<SharedString>,
+    /// The branch this worktree has checked out, which is what a pull request
+    /// is keyed by. `None` for a detached head, and for a row git said nothing
+    /// about — the directory's name is not a branch name, so guessing one
+    /// would colour rows by coincidence.
+    branch: Option<SharedString>,
     root: Option<PathBuf>,
     /// Index into the group's open workspaces, when this worktree is one.
     open: Option<usize>,
@@ -1107,6 +1468,7 @@ fn plan_rows(
         .iter()
         .map(|worktree| RowPlan {
             name: Some(worktree_display_name(worktree, main.as_deref())),
+            branch: worktree_branch(worktree),
             root: Some(worktree.path.clone()),
             open: open_roots
                 .iter()
@@ -1128,6 +1490,7 @@ fn plan_rows(
         }
         plans.push(RowPlan {
             name: None,
+            branch: None,
             // The row the snapshot leaves out is the checkout the project is
             // open at, so this is where the repository's own worktree usually
             // lands — undeletable, and first in the list.
@@ -1147,6 +1510,7 @@ fn plan_rows(
     {
         plans.push(RowPlan {
             name: None,
+            branch: None,
             root: Some(anchor.to_path_buf()),
             open: None,
             is_main: true,
@@ -1370,6 +1734,84 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
     }
 }
 
+/// Where the panel's one width is kept.
+///
+/// A dock's size is stored per workspace — the key is `<workspace>:<panel>` —
+/// and Bench has one workspace per worktree, so what a worktree remembers is
+/// the width it was last left at. Drag the edge in one worktree, switch to one
+/// that was closed at the time, and the panel jumps. The width belongs to the
+/// panel, so it is kept once, here, under no workspace at all.
+const WIDTH_NAMESPACE: &str = "worktree_panel";
+const WIDTH_KEY: &str = "width";
+
+/// The width every worktree's panel is using, for as long as the app is
+/// running.
+///
+/// In memory as well as on disk because [`WorktreePanel::match_shared_width`]
+/// asks on every draw, and a panel redrawing is not a reason to read the
+/// database.
+#[derive(Clone, Copy, Default)]
+struct SharedWidth(Option<PanelSizeState>);
+
+impl Global for SharedWidth {}
+
+fn shared_width(cx: &mut App) -> Option<PanelSizeState> {
+    if let Some(width) = cx.try_global::<SharedWidth>() {
+        return width.0;
+    }
+    // First ask of the session: what the last one left behind.
+    let width = stored_width(cx);
+    cx.set_global(SharedWidth(width));
+    width
+}
+
+fn set_shared_width(width: PanelSizeState, cx: &mut App) {
+    if shared_width(cx) == Some(width) {
+        return;
+    }
+    cx.set_global(SharedWidth(Some(width)));
+    store_width(width, cx);
+}
+
+fn stored_width(cx: &App) -> Option<PanelSizeState> {
+    db::kvp::KeyValueStore::global(cx)
+        .scoped(WIDTH_NAMESPACE)
+        .read(WIDTH_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|width| serde_json::from_str::<PanelSizeState>(&width).log_err())
+}
+
+fn store_width(width: PanelSizeState, cx: &mut App) {
+    let Some(width) = serde_json::to_string(&width).log_err() else {
+        return;
+    };
+    let store = db::kvp::KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        store
+            .scoped(WIDTH_NAMESPACE)
+            .write(WIDTH_KEY.to_owned(), width)
+            .await
+            .log_err();
+    })
+    .detach();
+}
+
+/// Whether a row's name matches what was typed in the filter box.
+///
+/// A subsequence match, the same shape as every other fuzzy filter: `dh`
+/// finds `data-hub`, `fjl` finds `fix-job-log`. Scoring and ranking are what
+/// a fuzzy *picker* needs; this is a filter over a list that is already in the
+/// order the user wants, so the only question is in or out.
+fn matches_filter(name: &str, filter: &str) -> bool {
+    let name = name.to_lowercase();
+    let mut name = name.chars();
+    filter
+        .to_lowercase()
+        .chars()
+        .all(|wanted| name.any(|character| character == wanted))
+}
+
 /// The last component of a path, as a row label.
 fn directory_name(path: &Path) -> Option<SharedString> {
     Some(SharedString::from(
@@ -1421,6 +1863,60 @@ fn linked_worktrees(
 ///
 /// `directory_name` says "main worktree" there, which is a sentence rather than
 /// a name; the panel's rows are names.
+/// What `gh` says about one project's branches, as the state of each branch's
+/// pull request.
+///
+/// A project it cannot answer for — not a GitHub remote, no `gh`, not signed
+/// in — has no pull requests as far as this panel is concerned. A worktree row
+/// has nowhere to explain itself, and the git panel's Pull Requests tab is
+/// where the reason is shown; here it is logged and the icons stay plain.
+async fn pull_requests_by_branch(root: PathBuf) -> HashMap<SharedString, PullRequestState> {
+    match github_cli::pull_requests(&root, None, github_cli::DEFAULT_LIMIT).await {
+        Ok(pull_requests) => by_branch(pull_requests),
+        Err(unavailable) => {
+            log::debug!(
+                "listing the pull requests of {}: {}",
+                root.display(),
+                unavailable.message()
+            );
+            HashMap::new()
+        }
+    }
+}
+
+/// One state per branch, out of a list that can hold several for the same one.
+///
+/// `gh` answers newest first, and a branch carries every pull request ever
+/// opened from it. The newest is the one the row is about — except that an
+/// open one outranks an older merged one, because a branch with something
+/// still open on it is open.
+fn by_branch(pull_requests: Vec<PullRequest>) -> HashMap<SharedString, PullRequestState> {
+    let mut by_branch: HashMap<SharedString, PullRequestState> = HashMap::new();
+    for pull_request in pull_requests {
+        let first = !by_branch.contains_key(&pull_request.head_ref);
+        let still_open = matches!(
+            pull_request.state,
+            PullRequestState::Open | PullRequestState::Draft
+        );
+        if first || still_open {
+            by_branch.insert(pull_request.head_ref, pull_request.state);
+        }
+    }
+    by_branch
+}
+
+/// The branch a worktree has checked out, as a pull request names it.
+///
+/// `refs/heads/feature/thing` is the branch `feature/thing`: the ref is what
+/// git reports and the short name is what a pull request's head is. A worktree
+/// with a detached head has no branch, and so can have no pull request.
+fn worktree_branch(worktree: &GitWorktree) -> Option<SharedString> {
+    let ref_name = worktree.ref_name.as_ref()?;
+    Some(SharedString::from(
+        ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name).to_string(),
+    ))
+}
+
 fn worktree_display_name(worktree: &GitWorktree, main: Option<&Path>) -> SharedString {
     if worktree.is_main {
         return "main".into();
@@ -1429,10 +1925,15 @@ fn worktree_display_name(worktree: &GitWorktree, main: Option<&Path>) -> SharedS
 }
 
 impl Render for WorktreePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.match_shared_width(window, cx);
+
         let closed = self.closed_project_roots(cx);
         self.discover(&closed, cx);
         let tree = self.tree(cx);
+        let filter = self.filter(cx);
+        let roots: Vec<PathBuf> = tree.iter().filter_map(|row| project_root(&row.key)).collect();
+        self.scan_pull_requests(&roots, cx);
         let mut worktree_index = 0;
 
         v_flex()
@@ -1445,9 +1946,20 @@ impl Render for WorktreePanel {
                     .w_full()
                     .px_1p5()
                     .py_1()
-                    .justify_end()
+                    .gap_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border_variant)
+                    .child(
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.filter.render(window, cx)),
+                    )
                     .child(
                         IconButton::new("add-project", IconName::FolderAdd)
                             .icon_size(IconSize::Small)
@@ -1467,12 +1979,26 @@ impl Render for WorktreePanel {
                 )
             })
             .children(tree.iter().enumerate().map(|(index, row)| {
-                let collapsed = self.is_collapsed(&row.key);
+                let project_matches = filter
+                    .as_ref()
+                    .is_none_or(|filter| matches_filter(&row.name, filter));
+                // While filtering, a project is shown open whatever its
+                // collapsed state: hiding a match behind a chevron makes the
+                // filter say a thing exists and then refuse to show it.
+                let collapsed = filter.is_none() && self.is_collapsed(&row.key, cx);
                 let worktrees: Vec<_> = if collapsed {
                     Vec::new()
                 } else {
                     row.worktrees
                         .iter()
+                        .filter(|worktree| match &filter {
+                            // A project whose own name matches keeps all of
+                            // its worktrees: you asked for the project.
+                            Some(filter) => {
+                                project_matches || matches_filter(&worktree.name, filter)
+                            }
+                            None => true,
+                        })
                         .map(|worktree| {
                             let element = self.render_worktree(worktree, worktree_index, cx);
                             worktree_index += 1;
@@ -1480,9 +2006,15 @@ impl Render for WorktreePanel {
                         })
                         .collect()
                 };
+                // A project with nothing left under it is only in the way,
+                // unless it is itself what was asked for.
+                if !project_matches && worktrees.is_empty() && filter.is_some() {
+                    return div().into_any_element();
+                }
                 v_flex()
                     .child(self.render_repository(row, index, cx))
                     .children(worktrees)
+                    .into_any_element()
             }))
     }
 }
@@ -1524,9 +2056,58 @@ impl Panel for WorktreePanel {
         px(240.)
     }
 
-    /// The dock calls this when the user has finished resizing.
+    /// The shared width, applied before the panel's first draw rather than
+    /// after it. Correcting the width a frame later is a flicker on every
+    /// switch into a worktree whose panel is new.
+    fn initial_size_state(&self, _window: &Window, cx: &App) -> PanelSizeState {
+        cx.try_global::<SharedWidth>()
+            .and_then(|shared| shared.0)
+            .or_else(|| stored_width(cx))
+            .unwrap_or_default()
+    }
+
+    /// The dock calls this when the user has finished resizing. The width
+    /// they chose becomes the width every worktree uses; see
+    /// [`Self::match_shared_width`].
+    ///
+    /// Deferred, and this one is not optional: the dock calls it from inside
+    /// its own update, so reading the dock here — which is the only way to
+    /// learn the width it just settled on — is a double lease and a panic. It
+    /// crashed on every drag.
     fn size_state_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.share_width_across_worktrees(window, cx);
+        let workspace = self.workspace.clone();
+        let panel = cx.entity();
+        window.defer(cx, move |_window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            let dock = workspace
+                .read(cx)
+                .dock_at_position(DockPosition::Left)
+                .clone();
+            let Some(width) = dock.read(cx).stored_panel_size_state(&panel) else {
+                return;
+            };
+            set_shared_width(width, cx);
+        });
+    }
+
+    /// Whether the dock opens on this panel as the workspace is built, which is
+    /// what keeps the panel on screen across a switch of worktree.
+    ///
+    /// A dock's open state belongs to a workspace, and Bench has one workspace
+    /// per worktree, so a worktree the window has not held before starts with
+    /// every dock shut. That is the panel disappearing at the moment it is
+    /// used: creating a worktree from the panel, or clicking a worktree that
+    /// has never been open, ends in a window with no panel in it.
+    ///
+    /// So it follows the window rather than the worktree — out in one worktree
+    /// is out in the next, which is the same reason a resize in one is copied
+    /// to the others; see [`Self::share_width_across_worktrees`]. A panel the
+    /// user has closed everywhere stays closed, and the first worktree of a
+    /// fresh window has no sibling to take after, so neither case is disturbed.
+    fn starts_open(&self, _window: &Window, cx: &App) -> bool {
+        self.showing_in_another_worktree(cx)
     }
 
     fn icon(&self, _window: &Window, cx: &App) -> Option<IconName> {
@@ -1621,6 +2202,9 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            // The filter box is an `InputField`, which needs the editor the
+            // application registers at startup; see `editor::init`.
+            editor::init(cx);
             ProjectSettings::register(cx);
             WorktreeSettings::register(cx);
         });
@@ -1666,8 +2250,14 @@ mod tests {
             workspaces
                 .iter()
                 .map(|workspace| {
-                    let panel =
-                        cx.new(|cx| WorktreePanel::new(multi_workspace.downgrade(), window, cx));
+                    let panel = cx.new(|cx| {
+                        WorktreePanel::new(
+                            workspace.downgrade(),
+                            multi_workspace.downgrade(),
+                            window,
+                            cx,
+                        )
+                    });
                     workspace.update(cx, |workspace, cx| {
                         workspace.add_panel(panel.clone(), window, cx);
                         workspace.open_panel::<WorktreePanel>(window, cx);
@@ -1699,6 +2289,85 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(icon(&mut cx), Some(IconName::ThreadsSidebarLeftClosed));
+    }
+
+    /// Opening a worktree the window has not held before builds a workspace,
+    /// and a workspace is built with its docks shut — so the panel the user
+    /// opened the worktree *from* was gone the moment they used it, which is
+    /// worst for the one route that always lands in a new workspace: creating
+    /// a worktree.
+    #[gpui::test]
+    async fn a_worktree_opened_next_keeps_the_panel_out(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, _panels, mut cx) = worktree_panels(cx, 1).await;
+
+        let opened = open_worktree_workspace(&fs, &multi_workspace, &mut cx).await;
+
+        opened.read_with(&mut cx, |workspace, cx| {
+            let dock = workspace.dock_at_position(DockPosition::Left).read(cx);
+            assert!(dock.is_open(), "the new worktree opens with the panel out");
+            assert!(
+                dock.active_panel().is_some_and(
+                    |panel| panel.persistent_name() == WorktreePanel::persistent_name()
+                ),
+                "and it is this panel that is out, not another of the dock's"
+            );
+        });
+    }
+
+    /// The other half of it: the panel follows the window, so a user who has
+    /// closed it is not given it back by opening a worktree.
+    #[gpui::test]
+    async fn a_worktree_opened_next_keeps_the_panel_closed(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, workspaces, _panels, mut cx) = worktree_panels(cx, 1).await;
+        workspaces[0].update_in(&mut cx, |workspace, window, cx| {
+            workspace.close_panel::<WorktreePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let opened = open_worktree_workspace(&fs, &multi_workspace, &mut cx).await;
+
+        opened.read_with(&mut cx, |workspace, cx| {
+            assert!(
+                !workspace
+                    .dock_at_position(DockPosition::Left)
+                    .read(cx)
+                    .is_open(),
+                "the panel is closed in the window, so it stays closed"
+            );
+        });
+    }
+
+    /// A worktree opened as another workspace of the window, panel added the
+    /// way `initialize_panels` adds it — added, and nothing more. Whether the
+    /// dock then opens is the panel's own answer, which is what is under test.
+    async fn open_worktree_workspace(
+        fs: &Arc<FakeFs>,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<Workspace> {
+        fs.create_dir("/opened".as_ref()).await.expect("worktree dir");
+        fs.insert_file("/opened/file.txt", b"hi".to_vec()).await;
+        let project = Project::test(fs.clone(), ["/opened".as_ref()], cx).await;
+
+        let workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project, window, cx)
+        });
+        cx.update(|window, cx| {
+            let panel = cx.new(|cx| {
+                WorktreePanel::new(
+                    workspace.downgrade(),
+                    multi_workspace.downgrade(),
+                    window,
+                    cx,
+                )
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_panel(panel, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        workspace
     }
 
     /// Before anything is opened, the window holds a workspace with no folder
@@ -1822,6 +2491,232 @@ mod tests {
         });
     }
 
+    /// A branch keeps every pull request ever opened from it, so the rows have
+    /// to pick one. The newest wins, unless an older one is still open.
+    #[gpui::test]
+    fn an_open_pull_request_outranks_an_older_merged_one() {
+        // Newest first, as `gh` answers.
+        let states = by_branch(vec![
+            pull_request("feature/reopened", PullRequestState::Merged),
+            pull_request("feature/reopened", PullRequestState::Open),
+            pull_request("feature/done", PullRequestState::Merged),
+            pull_request("feature/done", PullRequestState::Closed),
+            pull_request("feature/draft", PullRequestState::Draft),
+        ]);
+
+        assert_eq!(
+            states.get("feature/reopened"),
+            Some(&PullRequestState::Open),
+            "a branch with something still open on it is open"
+        );
+        assert_eq!(
+            states.get("feature/done"),
+            Some(&PullRequestState::Merged),
+            "otherwise the newest is the one the row is about"
+        );
+        assert_eq!(states.get("feature/draft"), Some(&PullRequestState::Draft));
+        assert_eq!(states.get("feature/never"), None);
+    }
+
+    /// A panel takes the shared width every time it draws, not once when it is
+    /// built: a worktree comes forward long after its panel was made, and that
+    /// is exactly the moment it has to agree with the one you just left.
+    #[gpui::test]
+    async fn a_panel_matches_the_shared_width_on_every_draw(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 1).await;
+
+        let width_of = |cx: &mut VisualTestContext| {
+            workspaces[0].read_with(cx, |workspace, cx| {
+                workspace
+                    .dock_at_position(DockPosition::Left)
+                    .read(cx)
+                    .stored_panel_size_state(&panels[0])
+                    .and_then(|state| state.size)
+            })
+        };
+
+        // The panel has drawn once already, which is what seeds the shared
+        // width from whatever the first worktree was wearing.
+        let seeded = cx.update(|_window, cx| shared_width(cx));
+        assert!(seeded.is_some(), "the first draw sets the width the rest take");
+
+        // As if the user had dragged another worktree's panel wider.
+        let wider = PanelSizeState {
+            size: Some(px(420.)),
+            flex: None,
+        };
+        cx.update(|_window, cx| set_shared_width(wider, cx));
+        cx.run_until_parked();
+
+        assert_ne!(width_of(&mut cx), Some(px(420.)), "nothing has drawn yet");
+
+        cx.update(|window, cx| {
+            panels[0].update(cx, |panel, cx| {
+                panel.match_shared_width(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            width_of(&mut cx),
+            Some(px(420.)),
+            "drawing again is what makes this worktree agree with the others"
+        );
+    }
+
+    /// The dock calls `size_state_changed` from inside its own update, so
+    /// anything that reads the dock there is a double lease — which is a
+    /// panic, and was a crash on every drag of the panel's edge.
+    #[gpui::test]
+    async fn resizing_does_not_read_the_dock_that_is_resizing(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, workspaces, _panels, mut cx) = worktree_panels(cx, 1).await;
+
+        // The real drag: the dock resizes its active panel, which calls back
+        // into the panel while the dock is still being updated.
+        cx.update(|window, cx| {
+            let dock = workspaces[0]
+                .read(cx)
+                .dock_at_position(DockPosition::Left)
+                .clone();
+            dock.update(cx, |dock, cx| {
+                dock.resize_panel_sizes(Some(px(360.)), None, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_window, cx| shared_width(cx)).and_then(|width| width.size),
+            Some(px(360.)),
+            "the width the drag ended at is the one every worktree takes"
+        );
+    }
+
+    /// Dragging the edge publishes that width to every other worktree.
+    #[gpui::test]
+    async fn resizing_the_panel_sets_the_width_every_worktree_takes(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 1).await;
+
+        let wider = PanelSizeState {
+            size: Some(px(400.)),
+            flex: None,
+        };
+        cx.update(|window, cx| {
+            let dock = workspaces[0]
+                .read(cx)
+                .dock_at_position(DockPosition::Left)
+                .clone();
+            dock.update(cx, |dock, cx| {
+                dock.set_panel_size_state(&panels[0], wider, cx);
+            });
+            panels[0].update(cx, |panel, cx| {
+                panel.size_state_changed(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            cx.update(|_window, cx| shared_width(cx)),
+            Some(wider),
+            "the width the user chose is the one every worktree now takes"
+        );
+    }
+
+    #[gpui::test]
+    fn the_filter_matches_the_way_every_other_fuzzy_filter_does() {
+        assert!(matches_filter("data-hub", "dh"), "initials of the words");
+        assert!(matches_filter("data-hub", "hub"), "a run of characters");
+        assert!(matches_filter("data-hub", "DATA"), "case is ignored");
+        assert!(
+            matches_filter("fix-inefficient-job-log-insertion", "fjli"),
+            "letters in order, anywhere"
+        );
+        assert!(matches_filter("anything", ""), "an empty filter is no filter");
+
+        assert!(!matches_filter("data-hub", "hd"), "order matters");
+        assert!(!matches_filter("data-hub", "datax"));
+    }
+
+    /// The colour comes off the worktree's *branch*, not the name in the row:
+    /// a worktree's directory and its branch need not agree — Bench flattens a
+    /// slash when it names a directory, and a worktree made by hand can be
+    /// called anything — so matching on the row's name would colour by
+    /// coincidence. Here the row says `closed-fix` and the branch is `fix`.
+    #[gpui::test]
+    async fn a_worktree_is_coloured_by_its_branchs_pull_request(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 1).await;
+        fs.create_dir("/closed".as_ref()).await.expect("repo dir");
+        fs.create_dir("/closed/.git".as_ref()).await.expect(".git");
+        fs.add_linked_worktree_for_repo(
+            Path::new("/closed/.git"),
+            false,
+            worktree("/closed-fix", "fix", false),
+        )
+        .await;
+
+        let closed = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/closed")]));
+        multi_workspace.update(&mut cx, |multi_workspace, _| {
+            multi_workspace.test_add_project_group(ProjectGroup {
+                key: closed,
+                workspaces: Vec::new(),
+                expanded: true,
+            });
+        });
+
+        let panel = panels[0].clone();
+        panel.update(&mut cx, |panel, cx| {
+            let roots = panel.closed_project_roots(cx);
+            panel.discover(&roots, cx);
+        });
+        cx.run_until_parked();
+
+        // What a scan of the project would have left behind.
+        cx.update(|_window, cx| {
+            record_scan(cx, |scans| {
+                scans.pull_requests.insert(
+                    PathBuf::from("/closed"),
+                    PullRequestScan::Found {
+                        by_branch: HashMap::from_iter([(
+                            SharedString::from("fix"),
+                            PullRequestState::Merged,
+                        )]),
+                        at: Instant::now(),
+                        _refresh: None,
+                    },
+                );
+            });
+        });
+
+        let states = panel.read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .map(|worktree| (worktree.name.to_string(), worktree.pull_request))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            states,
+            vec![
+                ("main".to_owned(), None),
+                ("closed-fix".to_owned(), Some(PullRequestState::Merged)),
+                ("main".to_owned(), None),
+            ],
+            "only the worktree on the branch with the pull request is coloured"
+        );
+    }
+
+    fn pull_request(head_ref: &str, state: PullRequestState) -> PullRequest {
+        PullRequest {
+            number: 1,
+            title: "Add the thing".into(),
+            url: "https://github.com/o/r/pull/1".into(),
+            state,
+            author: "octocat".into(),
+            head_ref: head_ref.to_owned().into(),
+        }
+    }
+
     fn worktree(path: &str, branch: &str, is_main: bool) -> GitWorktree {
         GitWorktree {
             path: PathBuf::from(path),
@@ -1857,11 +2752,10 @@ mod tests {
         assert_eq!(plans[2].open, None);
     }
 
-    /// A dock's size belongs to its workspace, and Bench has a workspace per
-    /// worktree, so without this the panel is a different width in every one
-    /// and switching worktree makes it jump.
+    /// The end-to-end shape of it: two worktrees, a drag in one, a draw in the
+    /// other. Together these are what stops the panel jumping on a switch.
     #[gpui::test]
-    async fn resizing_the_panel_resizes_it_in_every_worktree(cx: &mut TestAppContext) {
+    async fn a_drag_in_one_worktree_reaches_the_other(cx: &mut TestAppContext) {
         let (_fs, _multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 2).await;
 
         // As if the user had dragged the first worktree's panel wider.
@@ -1878,7 +2772,16 @@ mod tests {
                 dock.set_panel_size_state(&panels[0], wider, cx);
             });
             panels[0].update(cx, |panel, cx| {
-                panel.share_width_across_worktrees(window, cx);
+                panel.size_state_changed(window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        // Switching to the second worktree draws its panel, which is where it
+        // takes the width.
+        cx.update(|window, cx| {
+            panels[1].update(cx, |panel, cx| {
+                panel.match_shared_width(window, cx);
             });
         });
         cx.run_until_parked();

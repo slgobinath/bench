@@ -15,12 +15,19 @@ doctest = false
 [dependencies]
 db.workspace = true
 anyhow.workspace = true
+# The agents running in this worktree's terminals.
+agent_tracker.workspace = true
 git.workspace = true
+# The one place the colour of a pull request's state is decided.
+git_ui_core.workspace = true
+# Asking the GitHub CLI what pull requests a branch has.
+github_cli.workspace = true
 gpui.workspace = true
 log.workspace = true
 menu.workspace = true
 project.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 settings.workspace = true
 theme.workspace = true
 ui.workspace = true
@@ -33,7 +40,13 @@ workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
+# The filter box needs the erased editor the application registers at startup.
+editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+# Not used here: `git_ui_core` reaches `remote_connection`, whose own code only
+# handles the mock connection its test-support feature adds, and the dev
+# dependencies below turn that feature on across the build.
+remote_connection = { workspace = true, features = ["test-support"] }
 theme_settings.workspace = true
 project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
