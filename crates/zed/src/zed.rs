@@ -77,7 +77,6 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
-use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
 
@@ -500,7 +499,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
-        let window_handle = window.window_handle();
         let multi_workspace_handle = cx.entity();
         cx.subscribe_in(
             &multi_workspace_handle,
@@ -534,17 +532,13 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         )
         .detach();
 
-        cx.defer(move |cx| {
-            window_handle
-                .update(cx, |_, window, cx| {
-                    let sidebar =
-                        cx.new(|cx| Sidebar::new(multi_workspace_handle.clone(), window, cx));
-                    multi_workspace_handle.update(cx, |multi_workspace, cx| {
-                        multi_workspace.register_sidebar(sidebar, cx);
-                    });
-                })
-                .ok();
-        });
+        // Bench does not register the threads sidebar. The window still holds
+        // one workspace per worktree — that is `MultiWorkspace`, and it is
+        // independent of the sidebar — but the list of them is the worktree
+        // panel's job, and the threads the sidebar exists to show are the
+        // agent's. A `MultiWorkspace` with no sidebar draws none, and every
+        // caller of `sidebar()` already handles its absence; the status bar
+        // hides its toggle for the same reason. Restore this to get it back.
     })
     .detach();
 
@@ -853,12 +847,26 @@ fn setup_or_teardown_ai_panel<P: Panel>(
     }
 }
 
+/// Whether the agent panel is one of the window's docked panels.
+///
+/// It is not, in Bench. The docks are for the panel Bench is built around and
+/// the ones Zed already had; the agent's own panel is neither, and the threads
+/// sidebar that used to host it is not registered either. AI itself is
+/// untouched — inline assist, edit predictions and the rest are not the panel —
+/// and the actions that open it are still registered, so restoring this is the
+/// whole of getting it back.
+const AGENT_PANEL: bool = false;
+
 fn ensure_agent_panel_for_workspace(
     workspace: &mut Workspace,
     source_workspace: Option<WeakEntity<Workspace>>,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Task<anyhow::Result<()>> {
+    if !AGENT_PANEL {
+        return Task::ready(Ok(()));
+    }
+
     let task = setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
         agent_ui::AgentPanel::load(workspace, cx)
     });
