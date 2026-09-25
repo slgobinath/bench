@@ -77,6 +77,12 @@ pub(crate) fn commit_context_menu(
                     );
                 }
             })
+            .action(
+                "Send to Agent",
+                Box::new(zed_actions::claude::SendCommit {
+                    sha: sha.to_string(),
+                }),
+            )
             .entry(
                 "Copy SHA",
                 Some(CopyCommitSha.boxed_clone()),

@@ -61,7 +61,7 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
-use zed_actions::agent::AddSelectionToThread;
+use zed_actions::claude::SendSelection;
 
 struct ImeState {
     marked_text: String,
@@ -662,7 +662,7 @@ impl TerminalView {
                         menu.separator().when(
                             has_selection && self.shows_workspace_actions(),
                             |menu| {
-                                menu.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                                menu.action("Send to Agent", Box::new(SendSelection))
                             },
                         )
                     },

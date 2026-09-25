@@ -5,6 +5,7 @@ mod agent_model_selector;
 mod agent_panel;
 mod agent_registry_ui;
 mod buffer_codegen;
+mod claude_terminal;
 mod completion_provider;
 mod config_options;
 mod context;
@@ -620,6 +621,7 @@ pub fn init(
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
+    claude_terminal::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             move |workspace: &mut Workspace,
@@ -825,6 +827,7 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.hide_namespace("agent");
             filter.hide_namespace("agents");
             filter.hide_namespace("assistant");
+            filter.hide_namespace("claude");
             filter.hide_namespace("copilot");
             filter.hide_namespace("zed_predict_onboarding");
             filter.hide_namespace("edit_prediction");
@@ -836,10 +839,12 @@ fn update_command_palette_filter(cx: &mut App) {
                 filter.show_namespace("agent");
                 filter.show_namespace("agents");
                 filter.show_namespace("assistant");
+                filter.show_namespace("claude");
             } else {
                 filter.hide_namespace("agent");
                 filter.hide_namespace("agents");
                 filter.hide_namespace("assistant");
+                filter.hide_namespace("claude");
             }
 
             match edit_prediction_provider {

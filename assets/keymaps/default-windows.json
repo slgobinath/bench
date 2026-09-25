@@ -136,7 +136,7 @@
       "ctrl-k z": "editor::ToggleSoftWrap",
       "ctrl-f": "buffer_search::Deploy",
       "ctrl-h": "buffer_search::DeployReplace",
-      "ctrl-shift-.": "agent::AddSelectionToThread",
+      "ctrl-shift-.": "claude::SendSelection",
       "shift-alt-e": "editor::SelectEnclosingSymbol",
       "ctrl-shift-backspace": "editor::GoToPreviousChange",
       "ctrl-shift-alt-backspace": "editor::GoToNextChange",
@@ -1343,7 +1343,7 @@
       "ctrl-alt-r": "terminal::RerunTask",
       "alt-t": "terminal::RerunTask",
       "ctrl-shift-5": "pane::SplitRight",
-      "ctrl-shift-.": "agent::AddSelectionToThread",
+      "ctrl-shift-.": "claude::SendSelection",
     },
   },
   {

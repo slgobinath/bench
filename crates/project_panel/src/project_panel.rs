@@ -1175,6 +1175,8 @@ impl ProjectPanel {
                 (has_git_repo, has_history)
             };
 
+            // Only files: a directory has no mention the agent can read.
+            let send_to_agent_path = (!is_dir).then(|| worktree.absolutize(&entry.path));
             let has_pasteable_content = self.has_pasteable_content(cx);
             let context_menu = ContextMenu::build(window, cx, |menu, _, _| {
                 menu.context(self.focus_handle.clone()).map(|menu| {
@@ -1231,6 +1233,14 @@ impl ProjectPanel {
                             .when(is_remote, |menu| {
                                 menu.separator()
                                     .action("Download...", Box::new(DownloadFromRemote))
+                            })
+                            .when_some(send_to_agent_path.clone(), |menu, abs_path| {
+                                menu.separator().action(
+                                    "Send to Agent",
+                                    Box::new(zed_actions::claude::SendFile {
+                                        path: abs_path.to_string_lossy().into_owned(),
+                                    }),
+                                )
                             })
                             .separator()
                             .action("Copy Path", Box::new(zed_actions::workspace::CopyPath))

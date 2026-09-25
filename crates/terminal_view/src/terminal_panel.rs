@@ -158,6 +158,10 @@ impl TerminalPanel {
                                             "New Terminal",
                                             workspace::NewTerminal::default().boxed_clone(),
                                         )
+                                        .action(
+                                            "New Claude Terminal",
+                                            zed_actions::claude::NewTerminal.boxed_clone(),
+                                        )
                                         // We want the focus to go back to terminal panel once task modal is dismissed,
                                         // hence we focus that first. Otherwise, we'd end up without a focused element, as
                                         // context menu will be gone the moment we spawn the modal.
@@ -779,40 +783,39 @@ impl TerminalPanel {
             return Vec::new();
         };
 
-        let pane_terminal_views = |pane: Entity<Pane>| {
-            pane.read(cx)
-                .items()
-                .enumerate()
-                .filter_map(|(index, item)| Some((index, item.act_as::<TerminalView>(cx)?)))
-                .filter_map(|(index, terminal_view)| {
-                    let task_state = terminal_view.read(cx).terminal().read(cx).task()?;
-                    if &task_state.spawned_task.full_label == label {
-                        Some((index, terminal_view))
-                    } else {
-                        None
-                    }
-                })
-                .map(move |(index, terminal_view)| (index, pane.clone(), terminal_view))
-        };
-
-        self.center
-            .panes()
+        self.terminal_views(cx)
             .into_iter()
-            .cloned()
-            .flat_map(pane_terminal_views)
             .chain(
                 workspace
                     .read(cx)
                     .panes()
                     .iter()
-                    .cloned()
-                    .flat_map(pane_terminal_views),
+                    .flat_map(|pane| terminal_views_in_pane(pane, cx)),
             )
+            .filter(|(_, _, terminal_view)| {
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .task()
+                    .is_some_and(|task_state| &task_state.spawned_task.full_label == label)
+            })
             .sorted_by_key(|(_, _, terminal_view)| terminal_view.entity_id())
             .collect()
     }
 
-    fn activate_terminal_view(
+    /// The terminals in the panel's own panes, with the pane and item index
+    /// needed to activate one. Reads no other entity, so callers that already
+    /// hold the workspace can use it while the workspace is being updated.
+    pub fn terminal_views(&self, cx: &App) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
+        self.center
+            .panes()
+            .into_iter()
+            .flat_map(|pane| terminal_views_in_pane(pane, cx))
+            .collect()
+    }
+
+    pub fn activate_terminal_view(
         &self,
         pane: &Entity<Pane>,
         item_index: usize,
@@ -922,7 +925,7 @@ impl TerminalPanel {
         })
     }
 
-    fn add_terminal_shell(
+    pub fn add_terminal_shell(
         &mut self,
         force_local: bool,
         cwd: Option<PathBuf>,
@@ -1271,6 +1274,19 @@ impl TerminalPanel {
             cx.notify();
         }
     }
+}
+
+fn terminal_views_in_pane(
+    pane: &Entity<Pane>,
+    cx: &App,
+) -> Vec<(usize, Entity<Pane>, Entity<TerminalView>)> {
+    pane.read(cx)
+        .items()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            Some((index, pane.clone(), item.act_as::<TerminalView>(cx)?))
+        })
+        .collect()
 }
 
 /// Prepares a `SpawnInTerminal` by computing the command, args, and command_label

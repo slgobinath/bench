@@ -693,6 +693,41 @@ pub mod assistant {
     }
 }
 
+pub mod claude {
+    use gpui::{Action, actions};
+    use schemars::JsonSchema;
+    use serde::Deserialize;
+
+    actions!(
+        claude,
+        [
+            /// Opens a terminal running Claude Code in the active worktree.
+            NewTerminal,
+            /// Sends the current selection to the Claude Code terminal for the
+            /// active worktree, starting one if none is running there.
+            SendSelection,
+        ]
+    );
+
+    /// Sends a file to the agent terminal for the active worktree.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendFile {
+        /// Absolute path of the file to mention.
+        pub path: String,
+    }
+
+    /// Sends a commit to the agent terminal for the active worktree.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendCommit {
+        /// The commit to mention, as a full SHA.
+        pub sha: String,
+    }
+}
+
 /// Opens the recent projects interface.
 #[derive(PartialEq, Clone, Deserialize, Default, JsonSchema, Action)]
 #[action(namespace = projects)]

@@ -720,7 +720,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-fn format_selection_for_terminal(
+pub(crate) fn format_selection_for_terminal(
     selection: &AgentContextSelection,
     project: &Entity<Project>,
     working_directory: Option<&std::path::Path>,

@@ -30,7 +30,7 @@ use workspace::item::ItemBufferKind;
 use workspace::{
     ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, Workspace, item::ItemHandle,
 };
-use zed_actions::{agent::AddSelectionToThread, outline::ToggleOutline};
+use zed_actions::{claude::SendSelection, outline::ToggleOutline};
 
 const MAX_CODE_ACTION_MENU_LINES: u32 = 16;
 
@@ -281,8 +281,8 @@ impl Render for QuickActionBar {
                             .when(!disable_ai, |this| {
                                 this.separator().action_disabled_when(
                                     !has_selection,
-                                    "Add to Agent Thread",
-                                    Box::new(AddSelectionToThread),
+                                    "Send to Agent",
+                                    Box::new(SendSelection),
                                 )
                             })
                             .separator()

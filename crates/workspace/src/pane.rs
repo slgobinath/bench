@@ -3320,6 +3320,14 @@ impl Pane {
                             let entry_id = entry.to_proto();
 
                             menu = menu
+                                .when_some(entry_abs_path.clone(), |menu, abs_path| {
+                                    menu.separator().action(
+                                        "Send to Agent",
+                                        Box::new(zed_actions::claude::SendFile {
+                                            path: abs_path.to_string_lossy().into_owned(),
+                                        }),
+                                    )
+                                })
                                 .separator()
                                 .when_some(entry_abs_path, |menu, abs_path| {
                                     menu.entry(
