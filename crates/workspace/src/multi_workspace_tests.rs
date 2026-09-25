@@ -47,6 +47,25 @@ fn setup_multi_workspace<'a>(
 }
 
 #[gpui::test]
+async fn test_unregistered_sidebar_is_never_rendered_open(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    multi_workspace.update_in(cx, |mw, _window, cx| mw.open_sidebar(cx));
+
+    multi_workspace.read_with(cx, |mw, cx| {
+        assert!(mw.sidebar_open());
+        assert!(
+            !mw.sidebar_render_state(cx).open,
+            "a window without a sidebar must keep room for its window controls"
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

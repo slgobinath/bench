@@ -333,7 +333,12 @@ impl MultiWorkspace {
 
     pub fn sidebar_render_state(&self, cx: &App) -> SidebarRenderState {
         SidebarRenderState {
-            open: self.sidebar_open() && self.multi_workspace_enabled(cx),
+            // Bench registers no sidebar, but a restored session or an action
+            // can still mark it open. Reporting that would make the title bar
+            // leave the traffic lights to a sidebar that is never drawn.
+            open: self.sidebar.is_some()
+                && self.sidebar_open()
+                && self.multi_workspace_enabled(cx),
             side: self.sidebar_side(cx),
         }
     }
