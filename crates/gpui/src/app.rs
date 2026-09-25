@@ -2,6 +2,7 @@ use scheduler::Instant;
 use std::{
     any::{TypeId, type_name},
     cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
+    cmp::Ordering,
     ffi::OsString,
     marker::PhantomData,
     mem,
@@ -73,6 +74,18 @@ mod visual_test_context;
 /// The duration for which native applications wait for futures returned from
 /// [Context::on_app_quit] before fully quitting.
 pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// How many times one entity may be notified while a single update's effects
+/// are flushed before that is treated as a cycle rather than as work.
+///
+/// Notifications of one entity are already coalesced — an entity can be
+/// pending only once — so reaching this count means the entity was notified,
+/// its observers ran, and something in what they did notified it again, a
+/// thousand times over. No legitimate update does that; an observer cycle
+/// does it forever. Past this count the entity's notifications are dropped
+/// for the rest of the flush, which ends the cycle and costs nothing: its
+/// observers have already run, on this same update, a thousand times.
+const MAX_NOTIFIES_PER_FLUSH: usize = 1024;
 
 /// Temporary(?) wrapper around [`RefCell<App>`] to help us debug any double borrows.
 /// Strongly consider removing after stabilization.
@@ -1778,14 +1791,48 @@ impl App {
     /// Called at the end of [`App::update`] to complete any side effects
     /// such as notifying observers, emitting events, etc. Effects can themselves
     /// cause effects, so we continue looping until all effects are processed.
+    ///
+    /// "Until all effects are processed" is only finite if the observer graph
+    /// has no cycle in it. A cycle — A observes B, B observes C, C notifies A —
+    /// re-fills the queue as fast as it drains, and the symptom is not an
+    /// error but a live-lock: one core at 100%, no further frames, and on
+    /// macOS an app the window server marks Not Responding before its first
+    /// window ever appears. [`MAX_NOTIFIES_PER_FLUSH`] is what turns that into
+    /// a log line naming the entities involved.
     fn flush_effects(&mut self) {
+        // Notifications applied to each entity during this flush, which is
+        // how a notify cycle is caught; see `MAX_NOTIFIES_PER_FLUSH`.
+        let mut notifies: FxHashMap<EntityId, usize> = FxHashMap::default();
         loop {
             self.release_dropped_entities();
             self.release_dropped_focus_handles();
             if let Some(effect) = self.pending_effects.pop_front() {
                 match effect {
                     Effect::Notify { emitter } => {
-                        self.apply_notify_effect(emitter);
+                        let notified = notifies.entry(emitter).or_default();
+                        *notified += 1;
+                        match (*notified).cmp(&MAX_NOTIFIES_PER_FLUSH) {
+                            Ordering::Less => self.apply_notify_effect(emitter),
+                            Ordering::Equal => {
+                                log::error!(
+                                    "notify cycle: entity {emitter:?} has been notified \
+                                     {MAX_NOTIFIES_PER_FLUSH} times while flushing one update, \
+                                     so some chain of `cx.observe(..)` and `cx.notify()` leads \
+                                     back to it. Dropping its notifications for the rest of this \
+                                     flush; every entity in the cycle reports itself here. \
+                                     Break the cycle by subscribing to an event instead of \
+                                     observing, on whichever edge does not need to fire on \
+                                     every redraw."
+                                );
+                                // Still clear the pending flag: leaving it set
+                                // would make `push_effect` drop this entity's
+                                // notifications for the rest of the process.
+                                self.pending_notifications.remove(&emitter);
+                            }
+                            Ordering::Greater => {
+                                self.pending_notifications.remove(&emitter);
+                            }
+                        }
                     }
 
                     Effect::Emit {
@@ -3301,7 +3348,7 @@ mod test {
 
     use crate::{
         AppContext, Context, Empty, FallbackFontClass, IntoElement, MissingGlyph, Render,
-        TestAppContext, Window,
+        TestAppContext, Window, app::MAX_NOTIFIES_PER_FLUSH,
     };
 
     struct RenderCounter(Rc<Cell<usize>>);
@@ -3312,6 +3359,58 @@ mod test {
             Empty
         }
     }
+
+    /// Two entities that notify each other forever. Before the flush counted
+    /// notifications this did not fail, it hung: the effect queue refilled as
+    /// fast as it drained and `update` never returned, which in a real app is
+    /// a window that never appears.
+    ///
+    /// The assertion is simply that this test finishes.
+    #[gpui::test]
+    fn a_notify_cycle_ends_instead_of_spinning(cx: &mut TestAppContext) {
+        let counter = Rc::new(Cell::new(0usize));
+
+        cx.update(|cx| {
+            let first = cx.new(|_| Counter);
+            let second = cx.new(|_| Counter);
+
+            cx.observe(&first, {
+                let second = second.clone();
+                let counter = counter.clone();
+                move |_, cx| {
+                    counter.set(counter.get() + 1);
+                    second.update(cx, |_, cx| cx.notify())
+                }
+            })
+            .detach();
+            cx.observe(&second, {
+                let first = first.clone();
+                let counter = counter.clone();
+                move |_, cx| {
+                    counter.set(counter.get() + 1);
+                    first.update(cx, |_, cx| cx.notify())
+                }
+            })
+            .detach();
+
+            first.update(cx, |_, cx| cx.notify());
+        });
+
+        // Each entity is notified up to the cap and then dropped, so the cycle
+        // is bounded by it rather than running on.
+        assert!(
+            counter.get() >= MAX_NOTIFIES_PER_FLUSH,
+            "the cycle should have run until the cap, but stopped at {}",
+            counter.get()
+        );
+        assert!(
+            counter.get() <= 2 * MAX_NOTIFIES_PER_FLUSH,
+            "the cycle should have been cut off at the cap, but ran {} times",
+            counter.get()
+        );
+    }
+
+    struct Counter;
 
     #[gpui::test]
     fn async_app_refresh_flushes_refresh_effect(cx: &mut TestAppContext) {
