@@ -30,6 +30,8 @@ use futures::StreamExt as _;
 use futures::channel::oneshot::Canceled;
 use git::Oid;
 use git::commit::ParsedCommitMessage;
+use github_cli::{self, PullRequest};
+use git_ui_core::pull_request_color::pull_request_color;
 use git::repository::{
     Branch, CommitData, CommitDetails, CommitOptions, CommitSummary, DiffType, FetchOptions,
     GitCommitTemplate, GitCommitter, InitialGraphCommitData, LogOrder, LogSource, PushOptions,
@@ -89,9 +91,9 @@ use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
     ButtonLike, Checkbox, Chip, ContextMenu, ContextMenuEntry, Divider, DocumentationSide,
-    ElevationIndex, IndentGuideColors, KeyBinding, PopoverMenu, PopoverMenuHandle,
-    ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar,
-    prelude::*,
+    ElevationIndex, IndentGuideColors, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
+    PopoverMenuHandle, ProjectEmptyState, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -162,6 +164,8 @@ actions!(
         ActivateChangesTab,
         /// Activates the History tab.
         ActivateHistoryTab,
+        /// Activates the Pull Requests tab.
+        ActivatePullRequestsTab,
     ]
 );
 
@@ -560,6 +564,20 @@ struct SerializedCommitMessage {
 enum GitPanelTab {
     Changes,
     History,
+    PullRequests,
+}
+
+/// The pull requests opened from the branch the panel is on; see
+/// [`git::github_cli`] for where they come from and why.
+#[derive(Debug, PartialEq, Eq, Clone)]
+enum PullRequests {
+    /// Nothing to ask about, or nothing to ask with: no repository, no branch,
+    /// no `gh`. The message is shown as-is, because in every one of those
+    /// cases the user is the one who can fix it.
+    Unavailable(SharedString),
+    Loading,
+    /// Empty means the branch has no pull request, which is a normal answer.
+    Loaded(Rc<[PullRequest]>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1158,6 +1176,13 @@ pub struct GitPanel {
     commit_history: CommitHistory,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
+    pull_requests: PullRequests,
+    /// The repository and branch [`Self::pull_requests`] was loaded for, which
+    /// is what makes the load idempotent: the tab asks on every render, so
+    /// that switching repository or branch refreshes it, and this is what
+    /// keeps that from being a `gh` process per frame.
+    pull_requests_key: Option<(Arc<Path>, SharedString)>,
+    _pull_requests_task: Option<Task<()>>,
     _commit_message_buffer_subscription: Option<Subscription>,
     _repo_subscriptions: Vec<Subscription>,
     _settings_subscription: Subscription,
@@ -1472,6 +1497,9 @@ impl GitPanel {
                 commit_history: CommitHistory::Loading,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
+                pull_requests: PullRequests::Loading,
+                pull_requests_key: None,
+                _pull_requests_task: None,
                 _commit_message_buffer_subscription: None,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
@@ -1876,6 +1904,7 @@ impl GitPanel {
             match self.active_tab {
                 GitPanelTab::Changes => dispatch_context.add("ChangesList"),
                 GitPanelTab::History => dispatch_context.add("HistoryList"),
+                GitPanelTab::PullRequests => dispatch_context.add("PullRequestsList"),
             }
         }
 
@@ -6948,12 +6977,169 @@ impl GitPanel {
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
-                active_tab != GitPanelTab::Changes,
+                active_tab == GitPanelTab::History,
                 false,
                 "History".into(),
                 GitPanelTab::History,
                 ActivateHistoryTab.boxed_clone(),
             ))
+            .child(
+                Divider::vertical()
+                    .color(ui::DividerColor::BorderFaded)
+                    .h_full(),
+            )
+            .child(tab(
+                ElementId::Name("pull-requests-tab".into()),
+                active_tab == GitPanelTab::PullRequests,
+                false,
+                "Pull Requests".into(),
+                GitPanelTab::PullRequests,
+                ActivatePullRequestsTab.boxed_clone(),
+            ))
+    }
+
+    fn render_pull_requests_tab(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let body = match &self.pull_requests {
+            PullRequests::Unavailable(message) => {
+                Self::render_pull_requests_placeholder(message.clone()).into_any_element()
+            }
+            PullRequests::Loading => {
+                Self::render_pull_requests_placeholder("Loading Pull Requests…".into())
+                    .into_any_element()
+            }
+            PullRequests::Loaded(pull_requests) if pull_requests.is_empty() => {
+                Self::render_pull_requests_placeholder("No pull requests from this branch".into())
+                    .into_any_element()
+            }
+            PullRequests::Loaded(pull_requests) => {
+                let pull_requests = pull_requests.clone();
+                // A loop rather than a `map`: each row's element borrows `cx`
+                // until it is made into an `AnyElement`, which a closure
+                // returning one cannot do.
+                let mut rows = Vec::with_capacity(pull_requests.len());
+                for (index, pull_request) in pull_requests.iter().enumerate() {
+                    rows.push(self.render_pull_request(index, pull_request, cx));
+                }
+                v_flex()
+                    .id("pull-requests")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(rows)
+                    .into_any_element()
+            }
+        };
+
+        v_flex()
+            .flex_1()
+            .size_full()
+            .overflow_hidden()
+            .child(body)
+            // The same repository and branch dropdowns the Changes tab has, so
+            // that changing either one here is the move the user already knows;
+            // the list follows, through `load_pull_requests`.
+            .children(self.render_repo_footer(window, cx))
+    }
+
+    /// One pull request: its number, its title, who opened it, and what became
+    /// of it. Clicking goes to the pull request itself, in a browser — Bench
+    /// shows that a pull request exists, and GitHub is where you read it.
+    fn render_pull_request(
+        &self,
+        index: usize,
+        pull_request: &PullRequest,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let url = pull_request.url.clone();
+        let state = pull_request.state;
+
+        ListItem::new(("pull-request", index))
+            .spacing(ListItemSpacing::Sparse)
+            .start_slot(
+                Icon::new(IconName::GitBranch)
+                    .size(IconSize::Small)
+                    .color(pull_request_color(state)),
+            )
+            .child(
+                v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .child(
+                        Label::new(pull_request.title.clone())
+                            .single_line()
+                            .truncate(),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Label::new(format!("#{}", pull_request.number))
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(state.label())
+                                    .size(LabelSize::Small)
+                                    .color(pull_request_color(state)),
+                            )
+                            .child(
+                                Label::new(pull_request.author.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .single_line()
+                                    .truncate(),
+                            ),
+                    ),
+            )
+            .tooltip(Tooltip::text(url.clone()))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.open_url(&url);
+            }))
+            .into_any_element()
+    }
+
+    /// The repository and branch dropdowns alone — [`PanelRepoFooter`] without
+    /// the commit editor the Changes tab wraps it in. Same control, same
+    /// place, so switching repository or branch is one move wherever you are.
+    fn render_repo_footer(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let active_repository = self.active_repository.clone()?;
+        let (display_name, branch, head_commit) = {
+            let repository = active_repository.read(cx);
+            (
+                SharedString::from(Arc::from(repository.display_name().trim_end_matches("/"))),
+                repository.branch.clone(),
+                repository.head_commit.clone(),
+            )
+        };
+
+        Some(
+            div()
+                .w_full()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(PanelRepoFooter::new(
+                    display_name,
+                    branch,
+                    head_commit,
+                    Some(cx.entity()),
+                )),
+        )
+    }
+
+    fn render_pull_requests_placeholder(message: SharedString) -> impl IntoElement {
+        h_flex()
+            .flex_1()
+            .p_4()
+            .justify_center()
+            .child(Label::new(message).color(Color::Muted).truncate())
     }
 
     fn render_history_tab(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7096,21 +7282,115 @@ impl GitPanel {
         self.set_active_tab(GitPanelTab::History, window, cx);
     }
 
+    fn activate_pull_requests_tab(
+        &mut self,
+        _: &ActivatePullRequestsTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_tab(GitPanelTab::PullRequests, window, cx);
+    }
+
     fn set_active_tab(&mut self, tab: GitPanelTab, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_tab == tab {
             return;
         }
         self.active_tab = tab;
         self.activation_focus_handle(cx).focus(window, cx);
+        if tab != GitPanelTab::PullRequests {
+            // Forgetting what was loaded is what makes the next visit to that
+            // tab ask again: pull requests move on GitHub rather than here, so
+            // nothing in this window would otherwise say that the list has
+            // gone stale — or that whatever `gh` refused over has since been
+            // fixed.
+            self.pull_requests_key = None;
+        }
         match tab {
             GitPanelTab::History => {
                 self.load_commit_history(cx);
+            }
+            GitPanelTab::PullRequests => {
+                self.load_pull_requests(cx);
             }
             GitPanelTab::Changes => {
                 self.set_commit_history(CommitHistory::Loading, cx);
                 self._repo_subscriptions.clear();
             }
         }
+        cx.notify();
+    }
+
+    /// Asks `gh` for the pull requests opened from the branch the panel is on,
+    /// unless that is what the list already holds.
+    ///
+    /// Called from the tab's own render as well as on activation, which is how
+    /// switching repository or branch — the two dropdowns in the footer —
+    /// refreshes it without a subscription of its own. That only works because
+    /// this is idempotent: the repository and branch it last asked about are
+    /// kept in [`Self::pull_requests_key`], and asking again for the same pair
+    /// does nothing at all.
+    fn load_pull_requests(&mut self, cx: &mut Context<Self>) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            self.set_pull_requests(None, PullRequests::Unavailable("No repository".into()), cx);
+            return;
+        };
+        let repository = active_repository.read(cx);
+        let work_directory = repository.snapshot().work_directory_abs_path;
+        let Some(branch) = repository
+            .branch
+            .as_ref()
+            .map(|branch| SharedString::from(branch.name().to_string()))
+        else {
+            self.set_pull_requests(
+                None,
+                PullRequests::Unavailable("No branch checked out".into()),
+                cx,
+            );
+            return;
+        };
+
+        let key = (work_directory.clone(), branch.clone());
+        if self.pull_requests_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.pull_requests_key = Some(key);
+        self.pull_requests = PullRequests::Loading;
+        self._pull_requests_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move {
+                    github_cli::pull_requests(
+                        &work_directory,
+                        Some(&branch),
+                        github_cli::DEFAULT_LIMIT,
+                    )
+                    .await
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.pull_requests = match loaded {
+                    Ok(pull_requests) => PullRequests::Loaded(Rc::from(pull_requests)),
+                    Err(unavailable) => PullRequests::Unavailable(unavailable.message()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Only notifies when something actually changed: this is called from
+    /// render, and a notify there would ask for another render forever.
+    fn set_pull_requests(
+        &mut self,
+        key: Option<(Arc<Path>, SharedString)>,
+        pull_requests: PullRequests,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pull_requests_key == key && self.pull_requests == pull_requests {
+            return;
+        }
+        self.pull_requests_key = key;
+        self.pull_requests = pull_requests;
+        self._pull_requests_task = None;
         cx.notify();
     }
 
@@ -8940,6 +9220,14 @@ impl GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Asked here rather than only on activation, so that the list follows
+        // the footer's two dropdowns: switching repository or branch redraws
+        // the panel, and this is what notices. It does nothing when the list
+        // already holds that repository and branch.
+        if self.active_tab == GitPanelTab::PullRequests {
+            self.load_pull_requests(cx);
+        }
+
         let project = self.project.read(cx);
         let has_entries = !self.entries.is_empty();
         let has_write_access = self.has_write_access(cx);
@@ -9025,6 +9313,7 @@ impl Render for GitPanel {
             .on_action(cx.listener(Self::reset_font_size))
             .on_action(cx.listener(Self::activate_changes_tab))
             .on_action(cx.listener(Self::activate_history_tab))
+            .on_action(cx.listener(Self::activate_pull_requests_tab))
             .size_full()
             .overflow_hidden()
             .bg(cx.theme().colors().panel_background)
@@ -9061,6 +9350,9 @@ impl Render for GitPanel {
                                 this.children(self.render_previous_commit(window, cx))
                             }),
                         GitPanelTab::History => this.child(self.render_history_tab(window, cx)),
+                        GitPanelTab::PullRequests => {
+                            this.child(self.render_pull_requests_tab(window, cx))
+                        }
                     })
                     .into_any_element(),
             )

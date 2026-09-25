@@ -1096,6 +1096,7 @@
     "bindings": {
       "cmd-1": "git_panel::ActivateChangesTab",
       "cmd-2": "git_panel::ActivateHistoryTab",
+      "cmd-3": "git_panel::ActivatePullRequestsTab",
     },
   },
   {

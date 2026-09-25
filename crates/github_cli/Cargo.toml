@@ -1,0 +1,21 @@
+[package]
+name = "github_cli"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+name = "github_cli"
+path = "src/github_cli.rs"
+doctest = false
+
+[dependencies]
+gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+util.workspace = true
+which.workspace = true

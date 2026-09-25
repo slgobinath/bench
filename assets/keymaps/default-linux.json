@@ -1037,6 +1037,7 @@
     "bindings": {
       "ctrl-1": "git_panel::ActivateChangesTab",
       "ctrl-2": "git_panel::ActivateHistoryTab",
+      "ctrl-3": "git_panel::ActivatePullRequestsTab",
     },
   },
   {
