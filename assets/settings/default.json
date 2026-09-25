@@ -1066,7 +1066,8 @@
   },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
-    "button": true,
+    // Bench: off, since Bench is a single-player editor with agents.
+    "button": false,
     // Where to dock the collaboration panel. Can be 'left' or 'right'.
     "dock": "right",
     // Default width of the collaboration panel.
