@@ -200,6 +200,9 @@ pub struct SettingsContent {
 
     pub git_panel: Option<GitPanelSettingsContent>,
 
+    /// Bench: the agents running in Bench's terminals.
+    pub agents: Option<AgentTrackingSettingsContent>,
+
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -402,7 +405,7 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        agents, call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
@@ -726,6 +729,26 @@ pub struct CallSettingsContent {
 }
 
 #[with_fallible_options]
+/// Bench: which terminal processes count as agents, and what Bench does while
+/// one of them is working.
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct AgentTrackingSettingsContent {
+    /// The command names Bench treats as coding agents when it sees one
+    /// running in a terminal.
+    ///
+    /// Default: ["claude", "codex", "gemini", "aider"]
+    pub commands: Option<Vec<String>>,
+    /// Whether to post a system notification when an agent stops to ask for
+    /// something, or finishes a turn.
+    ///
+    /// Default: true
+    pub notify: Option<bool>,
+    /// Whether to keep the machine awake while an agent is working.
+    ///
+    /// Default: true
+    pub keep_awake: Option<bool>,
+}
+
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
 pub struct GitPanelSettingsContent {
     /// Whether to show the panel button in the status bar.

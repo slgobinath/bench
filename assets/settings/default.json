@@ -1069,6 +1069,17 @@
     // Default width of the collaboration panel.
     "default_width": 240,
   },
+  // Bench: the agents running in Bench's terminals.
+  "agents": {
+    // The command names Bench treats as coding agents when it sees one
+    // running in a terminal.
+    "commands": ["claude", "codex", "gemini", "aider"],
+    // Whether to post a system notification when an agent stops to ask for
+    // something, or finishes a turn.
+    "notify": true,
+    // Whether to keep the machine awake while an agent is working.
+    "keep_awake": true
+  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,
