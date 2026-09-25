@@ -190,8 +190,10 @@ impl ProjectEnvironment {
 
     /// Returns the project environment, if possible.
     /// If the project was opened from the CLI, then the inherited CLI environment is returned.
-    /// If it wasn't opened from the CLI, and an absolute path is given, then a shell is spawned in
-    /// that directory, to get environment variables as if the user has `cd`'d there.
+    /// Otherwise the login shell environment captured at startup is used, with
+    /// the directory's own direnv applied on top; a shell the user named
+    /// explicitly is spawned in the directory instead. See
+    /// [`load_directory_shell_environment`].
     pub fn local_directory_environment(
         &mut self,
         shell: &Shell,
@@ -339,14 +341,30 @@ async fn load_directory_shell_environment(
             .into()
     };
 
-    let (shell, args) = shell.program_and_args();
-    let mut envs = util::shell_env::capture(shell.clone(), args, abs_path)
-        .await
-        .with_context(|| {
-            tx.unbounded_send("Failed to load environment variables".into())
-                .ok();
-            format!("capturing shell environment with {shell:?}")
-        })?;
+    // The login shell's environment is already captured once, at startup, in
+    // the home directory — `util::load_login_shell_environment` puts it in this
+    // process's own environment and everything Bench spawns inherits it. Running
+    // the login shell again for every directory only pays to find out what
+    // `cd`-ing there changed, and for rc files that do not hook `cd` that is
+    // nothing at all: a second or more of the user's time, per project and per
+    // worktree, for the environment the process already has. So the system
+    // shell's environment is reused rather than re-derived.
+    //
+    // A shell the user named explicitly is still captured: it need not be the
+    // one startup ran, so its environment is not one we already hold. And what
+    // is genuinely per-directory — direnv — is applied below either way.
+    let (shell_program, args) = shell.program_and_args();
+    let mut envs = if matches!(shell, Shell::System) {
+        std::env::vars().collect()
+    } else {
+        util::shell_env::capture(shell_program.clone(), args, abs_path)
+            .await
+            .with_context(|| {
+                tx.unbounded_send("Failed to load environment variables".into())
+                    .ok();
+                format!("capturing shell environment with {shell_program:?}")
+            })?
+    };
 
     if cfg!(target_os = "windows")
         && let Some(path) = envs.remove("Path")
