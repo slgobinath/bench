@@ -811,6 +811,11 @@ fn update_command_palette_filter(cx: &mut App) {
         ];
 
         let manage_skills_action = [TypeId::of::<zed_actions::assistant::ManageSkills>()];
+        let inline_assist_actions = [
+            TypeId::of::<zed_actions::assistant::InlineAssist>(),
+            TypeId::of::<CycleNextInlineAssist>(),
+            TypeId::of::<CyclePreviousInlineAssist>(),
+        ];
         let skill_creator_actions = [
             TypeId::of::<zed_actions::assistant::OpenSkillCreator>(),
             TypeId::of::<zed_actions::assistant::CreateSkillFromUrl>(),
@@ -868,6 +873,11 @@ fn update_command_palette_filter(cx: &mut App) {
         // Skills are surfaced through the settings UI now, so this command
         // should never appear in the palette.
         filter.hide_action_types(&manage_skills_action);
+
+        // Bench has no inline assistant UI, so neither it nor the actions that
+        // only apply while its prompt editor is open can be reached.
+        filter.hide_namespace("inline_assistant");
+        filter.hide_action_types(&inline_assist_actions);
         if !disable_ai {
             filter.show_action_types(skill_creator_actions.iter());
         } else {

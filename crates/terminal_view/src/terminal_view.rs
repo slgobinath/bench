@@ -61,7 +61,7 @@ use workspace::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
     },
 };
-use zed_actions::{agent::AddSelectionToThread, assistant::InlineAssist};
+use zed_actions::agent::AddSelectionToThread;
 
 struct ImeState {
     marked_text: String,
@@ -659,13 +659,12 @@ impl TerminalView {
                 .when(
                     assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
-                        menu.separator()
-                            .when(!self.read_only, |menu| {
-                                menu.action("Inline Assist", Box::new(InlineAssist::default()))
-                            })
-                            .when(has_selection && self.shows_workspace_actions(), |menu| {
+                        menu.separator().when(
+                            has_selection && self.shows_workspace_actions(),
+                            |menu| {
                                 menu.action("Add to Agent Thread", Box::new(AddSelectionToThread))
-                            })
+                            },
+                        )
                     },
                 )
                 .when(self.shows_workspace_actions(), |menu| {

@@ -38,7 +38,6 @@ use workspace::{
 };
 
 use anyhow::{Result, anyhow};
-use zed_actions::assistant::InlineAssist;
 
 const TERMINAL_PANEL_KEY: &str = "TerminalPanel";
 
@@ -124,7 +123,6 @@ impl TerminalPanel {
         terminal_pane: &Entity<Pane>,
         cx: &mut Context<Self>,
     ) {
-        let assistant_enabled = self.assistant_enabled;
         terminal_pane.update(cx, |pane, cx| {
             pane.set_render_tab_bar_buttons(cx, move |pane, window, cx| {
                 let split_context = pane
@@ -172,11 +170,6 @@ impl TerminalPanel {
                                 Some(menu)
                             }),
                     )
-                    .when(assistant_enabled, |this| {
-                        this.when_some(split_context.clone(), |this, focus_handle| {
-                            this.child(InlineAssistTabBarButton { focus_handle })
-                        })
-                    })
                     .child(
                         PopoverMenu::new("terminal-pane-tab-bar-split")
                             .trigger_with_tooltip(
@@ -1850,35 +1843,13 @@ impl workspace::TerminalProvider for TerminalProvider {
     }
 }
 
-#[derive(IntoElement)]
-struct InlineAssistTabBarButton {
-    focus_handle: FocusHandle,
-}
-
-impl RenderOnce for InlineAssistTabBarButton {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
-        let focus_handle = self.focus_handle;
-        IconButton::new("terminal_inline_assistant", IconName::ZedAssistant)
-            .icon_size(IconSize::Small)
-            .on_click({
-                let focus_handle = focus_handle.clone();
-                move |_, window, cx| {
-                    focus_handle.dispatch_action(&InlineAssist::default(), window, cx);
-                }
-            })
-            .tooltip(move |_window, cx| {
-                Tooltip::for_action_in("Inline Assist", &InlineAssist::default(), &focus_handle, cx)
-            })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZero;
 
     use super::*;
     use crate::persistence::{SerializedPane, SerializedPaneGroup};
-    use gpui::{Modifiers, TestAppContext, UpdateGlobal as _, VisualTestContext};
+    use gpui::{TestAppContext, UpdateGlobal as _, VisualTestContext};
     use pretty_assertions::assert_eq;
     use project::FakeFs;
     use settings::SettingsStore;
@@ -2827,47 +2798,6 @@ mod tests {
                 "finishing restoration must not steal focus from an active modal"
             );
         });
-    }
-
-    #[gpui::test]
-    async fn test_inline_assist_tooltip_shows_keybinding_of_active_terminal(
-        cx: &mut TestAppContext,
-    ) {
-        cx.executor().allow_parking();
-        init_test(cx);
-
-        cx.update(|cx| {
-            cx.bind_keys([gpui::KeyBinding::new(
-                "ctrl-enter",
-                InlineAssist::default(),
-                Some("Terminal"),
-            )])
-        });
-
-        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
-        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
-
-        terminal_panel.update(cx, |panel, cx| panel.set_assistant_enabled(true, cx));
-        terminal_panel
-            .update_in(cx, |panel, window, cx| {
-                panel.add_terminal_shell(false, None, RevealStrategy::Always, window, cx)
-            })
-            .await
-            .unwrap();
-        cx.run_until_parked();
-
-        let button_bounds = cx
-            .debug_bounds("ICON-ZedAssistant")
-            .expect("inline assist button should be rendered in the terminal tab bar");
-        cx.simulate_mouse_move(button_bounds.center(), None, Modifiers::default());
-
-        cx.executor().advance_clock(Duration::from_millis(600));
-        cx.run_until_parked();
-
-        assert!(
-            cx.debug_bounds("KEY_BINDING-enter").is_some(),
-            "tooltip should show the InlineAssist keybinding resolved in the terminal's context"
-        );
     }
 
     // On Windows `echo` is a shell builtin rather than an executable, so spawning it directly fails.
