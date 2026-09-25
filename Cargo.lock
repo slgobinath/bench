@@ -22448,6 +22448,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "worktree_panel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "db",
+ "git",
+ "gpui",
+ "log",
+ "menu",
+ "project",
+ "serde",
+ "settings",
+ "theme",
+ "theme_settings",
+ "ui",
+ "ui_input",
+ "util",
+ "which",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "wprcontrol"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/wprcontrol?rev=cd811f7#cd811f7d744f65291e13131b1d907fda63ed91a1"
@@ -23040,6 +23063,7 @@ dependencies = [
  "windows 0.62.2",
  "windows_resources",
  "workspace",
+ "worktree_panel",
  "zed-reqwest",
  "zed_actions",
  "zed_credentials_provider",

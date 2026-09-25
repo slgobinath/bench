@@ -79,6 +79,7 @@ use settings::{
 };
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
+use worktree_panel::WorktreePanel;
 
 use std::{
     borrow::Cow,
@@ -777,6 +778,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let channels_panel =
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
+        let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -800,6 +802,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
@@ -855,6 +858,11 @@ fn setup_or_teardown_ai_panel<P: Panel>(
 /// untouched — inline assist, edit predictions and the rest are not the panel —
 /// and the actions that open it are still registered, so restoring this is the
 /// whole of getting it back.
+///
+/// Note for whoever does: [`WorktreePanel`] takes activation priority `0`
+/// because the agent panel is not here to take it, and the left dock is where
+/// the agent panel goes by default. Two panels in one dock with the same
+/// priority is an assertion failure in debug builds — the app will not start.
 const AGENT_PANEL: bool = false;
 
 fn ensure_agent_panel_for_workspace(
@@ -5987,6 +5995,7 @@ mod tests {
                 "vim",
                 "window",
                 "workspace",
+                "worktree_panel",
                 "worktree_picker",
                 "zed",
                 "zed_actions",
@@ -6182,6 +6191,7 @@ mod tests {
             git_ui::init(cx);
             project_panel::init(cx);
             outline_panel::init(cx);
+            worktree_panel::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);
             copilot_chat::init(
