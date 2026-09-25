@@ -21,6 +21,7 @@ mod c;
 mod cpp;
 mod css;
 mod eslint;
+mod extension_manifests;
 mod go;
 mod json;
 mod package_json;
@@ -323,7 +324,10 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         Arc::from(CargoManifestProvider),
         Arc::from(PyprojectTomlManifestProvider),
     ];
-    for provider in manifest_providers {
+    for provider in manifest_providers
+        .into_iter()
+        .chain(extension_manifests::providers())
+    {
         project::ManifestProvidersStore::global(cx).register(provider);
     }
 }

@@ -67,7 +67,10 @@ pub use language_registry::{
 use lsp::{
     CodeActionKind, InitializeParams, LanguageServerBinary, LanguageServerBinaryOptions, Uri,
 };
-pub use manifest::{ManifestDelegate, ManifestName, ManifestProvider, ManifestQuery};
+pub use manifest::{
+    DART_MANIFEST, DART_MANIFESTS, JAVA_MANIFEST, JAVA_MANIFESTS, ManifestDelegate, ManifestName,
+    ManifestProvider, ManifestQuery, default_manifest_name,
+};
 pub use modeline::{ModelineSettings, parse_modeline};
 use parking_lot::Mutex;
 use regex::Regex;

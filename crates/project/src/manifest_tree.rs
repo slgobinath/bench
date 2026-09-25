@@ -43,10 +43,36 @@ impl WorktreeRoots {
             _worktree_subscription: cx.subscribe(&worktree, |this: &mut Self, _, event, cx| {
                 match event {
                     WorktreeEvent::UpdatedEntries(changes) => {
+                        // What a root lookup answered is only true of the tree
+                        // it was answered over. A manifest going makes the
+                        // answers under it wrong; so does one arriving, and
+                        // that half matters more than it looks: a worktree is
+                        // scanned over time, so a file opened early can be
+                        // asked about before the manifest beside it has been
+                        // seen. The `KnownAbsent` that records is never asked
+                        // again — it makes the lookup skip the search — so
+                        // without this the server is rooted at the worktree for
+                        // as long as the worktree lives.
+                        let manifests = ManifestProvidersStore::global(cx).manifest_file_names();
                         for (path, _, kind) in changes.iter() {
                             if kind == &worktree::PathChange::Removed {
                                 let path = TriePath::from(path.as_ref());
                                 this.roots.remove(&path);
+                            } else if path
+                                .file_name()
+                                .is_some_and(|name| manifests.contains(name))
+                            {
+                                match path.parent() {
+                                    // Everything below the directory the
+                                    // manifest is in may root at it now.
+                                    Some(directory) if !directory.is_empty() => {
+                                        this.roots.remove(&TriePath::from(directory));
+                                    }
+                                    // A manifest at the worktree root is above
+                                    // every answer there is, and the trie has
+                                    // no node to remove for it.
+                                    _ => this.roots = RootPathTrie::new(),
+                                }
                             }
                         }
                     }

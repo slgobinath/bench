@@ -1354,6 +1354,113 @@ async fn test_fallback_to_single_worktree_tasks(cx: &mut gpui::TestAppContext) {
     );
 }
 
+/// A worktree is scanned over time, so a file can be opened before the manifest
+/// beside it has been seen — the common case being a large directory git
+/// ignores, which is scanned last. The lookup that records "no project root
+/// here" must not outlive the manifest's arrival: nothing asks again once it is
+/// recorded, so the server would stay rooted at the worktree for as long as the
+/// worktree lives.
+#[gpui::test]
+async fn test_a_manifest_that_arrives_after_the_lookup_reroots_the_server(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct PyprojectTomlManifestProvider;
+
+    impl ManifestProvider for PyprojectTomlManifestProvider {
+        fn name(&self) -> ManifestName {
+            SharedString::new_static("pyproject.toml").into()
+        }
+
+        fn search(
+            &self,
+            ManifestQuery {
+                path,
+                depth,
+                delegate,
+            }: ManifestQuery,
+        ) -> Option<Arc<RelPath>> {
+            path.ancestors()
+                .take(depth)
+                .find(|path| delegate.exists(&path.join(rel_path("pyproject.toml")), Some(false)))
+                .map(Arc::from)
+        }
+    }
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    // The project's manifest is deliberately missing: this is the worktree as
+    // it looks to a lookup that happens mid-scan.
+    fs.insert_tree(
+        path!("/the-root"),
+        json!({
+            "project-a": {
+                "file.py": ""
+            }
+        }),
+    )
+    .await;
+    cx.update(|cx| {
+        ManifestProvidersStore::global(cx).register(Arc::new(PyprojectTomlManifestProvider))
+    });
+
+    let project = Project::test(fs.clone(), [path!("/the-root").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let _fake_python_server = language_registry.register_fake_lsp(
+        "Python",
+        FakeLspAdapter {
+            name: "ty",
+            ..Default::default()
+        },
+    );
+    language_registry.add(python_lang(fs.clone()));
+
+    let roots_of = |project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut gpui::TestAppContext| {
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    lsp_store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .flat_map(|(_, server)| server.workspace_folders())
+                        .collect::<BTreeSet<_>>()
+                })
+            })
+        })
+    };
+
+    let (buffer, handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/project-a/file.py"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(
+        roots_of(&project, &buffer, cx),
+        BTreeSet::from_iter([Uri::from_file_path(path!("/the-root")).unwrap()]),
+        "with no manifest to find, the worktree is the only root there is"
+    );
+
+    // The scan reaches the manifest.
+    fs.insert_file(path!("/the-root/project-a/pyproject.toml"), Vec::new())
+        .await;
+    cx.executor().run_until_parked();
+
+    drop(handle);
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/the-root/project-a/file.py"), cx)
+        })
+        .await
+        .unwrap();
+    cx.executor().run_until_parked();
+
+    assert!(
+        roots_of(&project, &buffer, cx)
+            .contains(&Uri::from_file_path(path!("/the-root/project-a")).unwrap()),
+        "the manifest arrived, so the project is a root now"
+    );
+}
+
 #[gpui::test]
 async fn test_running_multiple_instances_of_a_single_server_in_one_worktree(
     cx: &mut gpui::TestAppContext,

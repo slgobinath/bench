@@ -705,13 +705,21 @@ impl LanguageRegistry {
                     .spawn(async move {
                         let language = async {
                             let loaded_language = (language_load)().await?;
+                            // A language that declares no manifest — every
+                            // language an extension provides — may still have
+                            // one Bench knows; see `default_manifest_name`.
+                            let manifest_name = loaded_language.manifest_name.clone().or_else(
+                                || {
+                                    crate::default_manifest_name(&loaded_language.config.name.0)
+                                },
+                            );
                             if let Some(grammar) = loaded_language.config.grammar.clone() {
                                 let grammar = Some(this.get_or_load_grammar(grammar).await?);
 
                                 Language::new_with_id(language_id, loaded_language.config, grammar)
                                     .with_context_provider(loaded_language.context_provider)
                                     .with_toolchain_lister(loaded_language.toolchain_provider)
-                                    .with_manifest(loaded_language.manifest_name)
+                                    .with_manifest(manifest_name)
                                     .with_queries(loaded_language.queries)
                             } else {
                                 Ok(
@@ -721,7 +729,7 @@ impl LanguageRegistry {
                                         None,
                                     )
                                     .with_context_provider(loaded_language.context_provider)
-                                    .with_manifest(loaded_language.manifest_name)
+                                    .with_manifest(manifest_name)
                                     .with_toolchain_lister(loaded_language.toolchain_provider),
                                 )
                             }
