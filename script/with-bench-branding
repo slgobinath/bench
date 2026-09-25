@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+
+# The Bench name and icon live in branding/bench.patch rather than in the tree,
+# so that merges from upstream Zed never conflict with them. This applies the
+# patch, runs the given command (usually a build), and reverts the patch again.
+#
+#   script/with-bench-branding script/bundle-mac
+#
+# To change the branding, or to refresh the patch after upstream moves the
+# lines it touches:
+#
+#   git apply --3way branding/bench.patch   # resolve any conflicts, then
+#   git reset -q                            # unstage what --3way staged
+#   # ...edit...
+#   git diff --binary HEAD -- . ":!branding" > branding/bench.patch.new \
+#       && mv branding/bench.patch.new branding/bench.patch
+#   git apply -R branding/bench.patch        # back to upstream
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+patch=branding/bench.patch
+
+if [[ $# -eq 0 ]]; then
+    echo "usage: $0 <command> [args...]" >&2
+    exit 1
+fi
+
+if ! git apply --check "$patch" 2>/dev/null; then
+    echo "error: $patch no longer applies cleanly." >&2
+    echo "Refresh it with the steps at the top of $0." >&2
+    git apply --check "$patch"
+    exit 1
+fi
+
+git apply "$patch"
+trap 'git apply -R "$patch"' EXIT
+
+"$@"
