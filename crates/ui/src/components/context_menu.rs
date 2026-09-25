@@ -1,6 +1,6 @@
 use crate::{
-    ButtonCommon, ButtonStyle, IconButtonShape, KeyBinding, List, ListItem, ListSeparator,
-    ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
+    ButtonCommon, ButtonStyle, IconButtonShape, KeyBinding, List, ListItem, ListItemSpacing,
+    ListSeparator, ListSubHeader, Tooltip, prelude::*, utils::WithRemSize,
 };
 use gpui::{
     Action, Anchor, AnyElement, App, Bounds, DismissEvent, Entity, EventEmitter, FocusHandle,
@@ -16,6 +16,11 @@ use std::{
 };
 use theme::BufferLineHeight;
 use web_time::Instant;
+
+/// Menu rows are padded rather than sized to their text, which is dense enough
+/// to read as one block in a long menu. Shared with the menus the editor draws
+/// itself, such as completions and code actions, so every menu matches.
+pub const MENU_ITEM_SPACING: ListItemSpacing = ListItemSpacing::Sparse;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum SubmenuOpenTrigger {
@@ -1433,6 +1438,7 @@ impl ContextMenu {
             }
             ContextMenuItem::Label(label) => ListItem::new(ix)
                 .inset(true)
+                .spacing(MENU_ITEM_SPACING)
                 .disabled(true)
                 .child(Label::new(label.clone()))
                 .into_any_element(),
@@ -1485,6 +1491,7 @@ impl ContextMenu {
                     .child(
                         ListItem::new(ix)
                             .inset(true)
+                            .spacing(MENU_ITEM_SPACING)
                             .when(selectable, |item| item.aria_role(Role::MenuItem))
                             .when(is_active_descendant(selectable), |item| {
                                 item.aria_active_descendant()
@@ -1572,6 +1579,7 @@ impl ContextMenu {
             .child(
                 ListItem::new(ix)
                     .inset(true)
+                    .spacing(MENU_ITEM_SPACING)
                     .aria_role(Role::MenuItem)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
@@ -1907,6 +1915,7 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .group_name("label_container")
                     .inset(true)
+                    .spacing(MENU_ITEM_SPACING)
                     .disabled(*disabled)
                     .aria_role(if toggle.is_some() {
                         Role::MenuItemCheckBox

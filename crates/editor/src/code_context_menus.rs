@@ -29,8 +29,8 @@ use std::{
 };
 use task::ResolvedTask;
 use ui::{
-    Divider, ListItem, ListSubHeader, Popover, ScrollAxes, Scrollbars, Tooltip, WithScrollbar,
-    prelude::*,
+    Divider, ListItem, ListSubHeader, MENU_ITEM_SPACING, Popover, ScrollAxes, Scrollbars, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::ResultExt;
 
@@ -1160,6 +1160,7 @@ impl CompletionsMenu {
                             .child(
                                 ListItem::new(mat.candidate_id)
                                     .inset(true)
+                                    .spacing(MENU_ITEM_SPACING)
                                     .toggle_state(item_ix == selected_item)
                                     .on_click(cx.listener(move |editor, _event, window, cx| {
                                         cx.stop_propagation();
@@ -2072,6 +2073,7 @@ impl CodeActionsMenu {
 
                         ListItem::new(item_ix)
                             .inset(true)
+                            .spacing(MENU_ITEM_SPACING)
                             .toggle_state(selected)
                             .overflow_x()
                             .child(
