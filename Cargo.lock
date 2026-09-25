@@ -18351,6 +18351,7 @@ dependencies = [
  "settings",
  "sysinfo 0.39.6",
  "task",
+ "terminal_host",
  "theme",
  "theme_settings",
  "thiserror 2.0.17",
@@ -18360,6 +18361,21 @@ dependencies = [
  "util_macros",
  "vte",
  "windows 0.62.2",
+]
+
+[[package]]
+name = "terminal_host"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "libc",
+ "log",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "uuid",
+ "vte",
 ]
 
 [[package]]
@@ -18404,6 +18420,7 @@ dependencies = [
  "shlex 1.3.0",
  "task",
  "terminal",
+ "terminal_host",
  "theme",
  "theme_settings",
  "ui",
@@ -23076,6 +23093,7 @@ dependencies = [
  "telemetry",
  "telemetry_events",
  "tempfile",
+ "terminal_host",
  "terminal_view",
  "theme",
  "theme_extension",

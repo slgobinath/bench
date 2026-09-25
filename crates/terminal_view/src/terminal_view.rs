@@ -48,6 +48,7 @@ use ui::{
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
+use anyhow::Context as _;
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
@@ -109,9 +110,48 @@ pub fn init(cx: &mut App) {
     terminal_panel::init(cx);
 
     register_serializable_item::<TerminalView>(cx);
+    end_orphaned_sessions(cx);
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(TerminalView::deploy);
+    })
+    .detach();
+}
+
+/// Ends persistent sessions that no saved terminal will reattach to, such as
+/// one whose terminal was opened moments before a crash and never saved.
+/// Waits first, so the terminals being restored now have attached.
+fn end_orphaned_sessions(cx: &mut App) {
+    let Some(host) = terminal_host::host() else {
+        return;
+    };
+    let db = TerminalDb::global(cx);
+    let started_at = std::time::SystemTime::now();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(Duration::from_secs(30))
+            .await;
+        cx.background_spawn(async move {
+            let started_at = started_at
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let saved = db
+                .get_all_session_ids()?
+                .into_iter()
+                .collect::<collections::HashSet<_>>();
+            for session in host.sessions()? {
+                if !session.attached
+                    && session.created_at < started_at
+                    && !saved.contains(&session.id)
+                {
+                    host.kill(&session.id, None)?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("ending orphaned terminal sessions")
+        .log_err();
     })
     .detach();
 }
@@ -277,7 +317,9 @@ impl TerminalView {
             focus_out,
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
+            cx.on_release(Self::end_closed_session),
         ];
+        let is_persistent = terminal.read(cx).persistent_session().is_some();
 
         Self {
             terminal,
@@ -299,7 +341,9 @@ impl TerminalView {
             block_below_cursor: None,
             scroll_top: Pixels::ZERO,
             scroll_handle,
-            needs_serialize: false,
+            // A persistent terminal's session id has to reach the database
+            // before a restart can find its shell again.
+            needs_serialize: is_persistent,
             custom_title: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
@@ -308,6 +352,39 @@ impl TerminalView {
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
+    }
+
+    /// Ends the persistent session behind a terminal whose tab was closed.
+    ///
+    /// Moving a tab between panes keeps this view alive, and quitting or
+    /// closing the window releases the workspace along with it, so a release
+    /// while the workspace is still around means the user closed the tab.
+    fn end_closed_session(&mut self, cx: &mut App) {
+        let terminal = self.terminal.read(cx);
+        let Some(session) = terminal.persistent_session() else {
+            return;
+        };
+        let session_id = session.id.clone();
+        let attach_pid = terminal
+            .pid_getter()
+            .map(|pid_getter| pid_getter.fallback_pid().as_u32());
+        let terminal = self.terminal.downgrade();
+        let workspace = self.workspace.clone();
+        cx.defer(move |cx| {
+            // Another view may still be showing this terminal.
+            if terminal.upgrade().is_some() || workspace.upgrade().is_none() {
+                return;
+            }
+            let Some(host) = terminal_host::host() else {
+                return;
+            };
+            cx.background_spawn(async move {
+                host.kill(&session_id, attach_pid)
+                    .context("ending a closed terminal's session")
+                    .log_err();
+            })
+            .detach();
+        });
     }
 
     /// Enable 'embedded' mode where the terminal displays the full content with an optional limit of lines.
@@ -1949,6 +2026,9 @@ impl SerializableItem for TerminalView {
 
         let workspace_id = self.workspace_id?;
         let cwd = terminal.working_directory();
+        let session_id = terminal
+            .persistent_session()
+            .map(|session| session.id.clone());
         let custom_title = self.custom_title.clone();
         self.needs_serialize = false;
 
@@ -1959,6 +2039,8 @@ impl SerializableItem for TerminalView {
                     .await?;
             }
             db.save_custom_title(item_id, workspace_id, custom_title)
+                .await?;
+            db.save_session_id(item_id, workspace_id, session_id)
                 .await?;
             Ok(())
         }))
@@ -1977,7 +2059,7 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<Entity<Self>>> {
         window.spawn(cx, async move |cx| {
-            let (cwd, custom_title) = cx
+            let (cwd, custom_title, session_id) = cx
                 .update(|_window, cx| {
                     let db = TerminalDb::global(cx);
                     let from_db = db
@@ -1999,13 +2081,19 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    (cwd, custom_title)
+                    let session_id = db
+                        .get_session_id(item_id, workspace_id)
+                        .log_err()
+                        .flatten();
+                    (cwd, custom_title, session_id)
                 })
                 .ok()
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             let terminal = project
-                .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
+                .update(cx, |project, cx| {
+                    project.restore_terminal_shell(cwd, session_id, cx)
+                })
                 .await?;
             cx.update(|window, cx| {
                 cx.new(|cx| {

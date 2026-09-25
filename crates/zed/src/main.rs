@@ -217,6 +217,21 @@ fn main() {
         return;
     }
 
+    // `zed --terminal-host` runs the daemon that keeps persistent terminals'
+    // shells alive, and `zed --terminal-attach` is what those terminals run.
+    #[cfg(unix)]
+    if let Some(socket) = &args.terminal_host {
+        if let Err(error) = terminal_host::run_daemon(socket) {
+            eprintln!("terminal host failed: {error:#}");
+            process::exit(1);
+        }
+        return;
+    }
+    #[cfg(unix)]
+    if let Some([socket, session_id]) = args.terminal_attach.as_deref() {
+        process::exit(terminal_host::run_attach(Path::new(socket), session_id));
+    }
+
     // `zed --crash-handler` Makes zed operate in minidump crash handler mode
     if let Some(socket) = &args.crash_handler {
         crashes::crash_server(socket.as_path(), paths::logs_dir().clone());
@@ -266,6 +281,15 @@ fn main() {
     } else {
         Vec::new()
     };
+
+    #[cfg(unix)]
+    match std::env::current_exe() {
+        Ok(executable) => terminal_host::init(
+            executable,
+            paths::data_dir().join(terminal_host::SOCKET_FILE_NAME),
+        ),
+        Err(error) => eprintln!("persistent terminals are unavailable: {error}"),
+    }
 
     #[cfg(target_os = "windows")]
     match util::get_zed_cli_path() {
@@ -1772,6 +1796,18 @@ struct Args {
 
     #[arg(long, hide = true)]
     dump_all_actions: bool,
+
+    /// Run the daemon that keeps persistent terminal sessions alive,
+    /// listening on this Unix socket.
+    #[cfg(unix)]
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    terminal_host: Option<PathBuf>,
+
+    /// Relay this terminal to a persistent session, given the terminal host's
+    /// socket and the session id.
+    #[cfg(unix)]
+    #[arg(long, hide = true, num_args = 2, value_names = ["SOCKET", "SESSION"])]
+    terminal_attach: Option<Vec<String>>,
 
     /// Output current environment variables as JSON to stdout
     #[arg(long, hide = true)]

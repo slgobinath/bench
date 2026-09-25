@@ -942,6 +942,11 @@ pub enum MouseInputMode {
 
 enum TerminalModeKind {
     Interactive,
+    /// An interactive shell hosted by `terminal_host`, so it survives Bench
+    /// restarting. Reattaches to `session_id` while it is still running.
+    Persistent {
+        session_id: Option<String>,
+    },
     InteractiveWithCompletion(Sender<Option<ExitStatus>>),
     Task {
         state: TaskState,
@@ -953,6 +958,13 @@ impl TerminalMode {
     /// Creates a terminal for an interactive shell.
     pub fn interactive() -> Self {
         Self(TerminalModeKind::Interactive)
+    }
+
+    /// Creates an interactive terminal whose shell outlives Bench, reattaching
+    /// to `session_id` if that session is still running. Falls back to
+    /// [`TerminalMode::interactive`] when persistent terminals are unavailable.
+    pub fn persistent(session_id: Option<String>) -> Self {
+        Self(TerminalModeKind::Persistent { session_id })
     }
 
     /// Creates an interactive terminal that reports when its shell exits.
@@ -1022,6 +1034,7 @@ impl TerminalBuilder {
             task: None,
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
+            persistent_session: None,
             completion_tx: None,
             term,
             term_config: config,
@@ -1113,8 +1126,13 @@ impl TerminalBuilder {
             Err(error) => return Task::ready(Err(error)),
         };
         let fut = async move {
+            let mut persistent_session_id = None;
             let (task, completion_tx) = match mode.0 {
                 TerminalModeKind::Interactive => (None, None),
+                TerminalModeKind::Persistent { session_id } => {
+                    persistent_session_id = Some(session_id);
+                    (None, None)
+                }
                 TerminalModeKind::InteractiveWithCompletion(completion_tx) => {
                     (None, Some(completion_tx))
                 }
@@ -1211,6 +1229,31 @@ impl TerminalBuilder {
             };
             let config = pty_term_config(scrolling_history, cursor_shape);
 
+            let persistent_session = persistent_session_id
+                .filter(|_| !no_pty && !is_remote_terminal)
+                .and_then(|session_id| {
+                    open_persistent_session(
+                        session_id,
+                        shell_params.as_ref().map(|params| {
+                            (
+                                params.program.clone(),
+                                params.args.clone().unwrap_or_default(),
+                            )
+                        }),
+                        working_directory.clone(),
+                        &env,
+                    )
+                });
+            // A reattached shell already ran its activation script.
+            let activation_script = if persistent_session
+                .as_ref()
+                .is_some_and(|(session, _)| session.restored)
+            {
+                Vec::new()
+            } else {
+                activation_script
+            };
+
             //Spawn a task so the Alacritty EventLoop (or the subprocess reader) can communicate with us
             //TODO: Remove with a bounded sender which can be dispatched on &self
             let (events_tx, events_rx) = unbounded();
@@ -1255,12 +1298,15 @@ impl TerminalBuilder {
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
             } else {
-                let alacritty_shell = shell_params.as_ref().map(|params| {
-                    (
-                        params.program.clone(),
-                        params.args.clone().unwrap_or_default(),
-                    )
-                });
+                let alacritty_shell = match &persistent_session {
+                    Some((_, attach_command)) => Some(attach_command.clone()),
+                    None => shell_params.as_ref().map(|params| {
+                        (
+                            params.program.clone(),
+                            params.args.clone().unwrap_or_default(),
+                        )
+                    }),
+                };
                 let pty_options = pty_options(
                     alacritty_shell,
                     working_directory.clone(),
@@ -1289,7 +1335,10 @@ impl TerminalBuilder {
                     }
                 };
 
-                let pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
+                let mut pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
+                if let Some((session, _)) = &persistent_session {
+                    pty_info = pty_info.with_session_leader(sysinfo::Pid::from_u32(session.leader_pid));
+                }
 
                 //And connect them together
                 let pty_tx =
@@ -1307,6 +1356,7 @@ impl TerminalBuilder {
             let no_task = task.is_none();
             let terminal = Terminal {
                 task,
+                persistent_session: persistent_session.map(|(session, _)| session),
                 terminal_type,
                 subprocess,
                 completion_tx,
@@ -1509,6 +1559,7 @@ pub struct Terminal {
     /// Set for non-PTY terminals (see [`HeadlessTerminal`]); owns the spawned
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
+    persistent_session: Option<PersistentSession>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
@@ -3111,6 +3162,12 @@ impl Terminal {
         }
     }
 
+    /// The `terminal_host` session this terminal shows, if its shell is
+    /// hosted there rather than owned by this process.
+    pub fn persistent_session(&self) -> Option<&PersistentSession> {
+        self.persistent_session.as_ref()
+    }
+
     pub fn pid_getter(&self) -> Option<&ProcessIdGetter> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => Some(info.pid_getter()),
@@ -3214,9 +3271,16 @@ impl Terminal {
 
     pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {
         let working_directory = self.working_directory().or_else(|| cwd);
+        // Cloning a persistent terminal must start a session of its own, not
+        // attach a second view to this one.
+        let mode = if self.persistent_session.is_some() {
+            TerminalMode::persistent(None)
+        } else {
+            TerminalMode::interactive()
+        };
         TerminalBuilder::new(
             working_directory,
-            TerminalMode::interactive(),
+            mode,
             self.template.shell.clone(),
             self.template.env.clone(),
             self.template.cursor_shape,
@@ -3231,6 +3295,61 @@ impl Terminal {
             self.path_style,
         )
     }
+}
+
+/// A shell hosted by `terminal_host` that this terminal is attached to.
+#[derive(Clone, Debug)]
+pub struct PersistentSession {
+    pub id: String,
+    pub leader_pid: u32,
+    /// Whether this terminal reattached to a session that was already running.
+    pub restored: bool,
+}
+
+/// Finds or starts the session a persistent terminal shows, and the command
+/// that attaches to it. `None` means the terminal runs its shell directly.
+fn open_persistent_session(
+    session_id: Option<String>,
+    shell: Option<(String, Vec<String>)>,
+    working_directory: Option<PathBuf>,
+    env: &HashMap<String, String>,
+) -> Option<(PersistentSession, (String, Vec<String>))> {
+    let host = terminal_host::host()?;
+    let session = util::maybe!({
+        if let Some(session_id) = session_id
+            && let Some(running) = host
+                .sessions()?
+                .into_iter()
+                .find(|session| session.id == session_id)
+        {
+            return anyhow::Ok(PersistentSession {
+                id: running.id,
+                leader_pid: running.pid,
+                restored: true,
+            });
+        }
+        let (program, args) = match shell {
+            Some((program, args)) => (Some(program), args),
+            None => (None, Vec::new()),
+        };
+        let created = host.create(terminal_host::CreateSession {
+            cwd: working_directory,
+            program,
+            args,
+            env: env.clone().into_iter().collect(),
+            cols: 80,
+            rows: 24,
+        })?;
+        Ok(PersistentSession {
+            id: created.id,
+            leader_pid: created.pid,
+            restored: false,
+        })
+    })
+    .context("opening a persistent terminal session")
+    .log_err()?;
+    let attach_command = host.attach_command(&session.id);
+    Some((session, attach_command))
 }
 
 const TASK_DELIMITER: &str = "⏵ ";

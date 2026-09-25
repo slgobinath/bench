@@ -77,6 +77,10 @@ pub(crate) struct PtyProcessInfo {
     system: RwLock<System>,
     refresh_kind: ProcessRefreshKind,
     pid_getter: ProcessIdGetter,
+    /// For a terminal attached to a persistent session, the session's shell.
+    /// The terminal's own child is only the attach client, so the process the
+    /// user is running is found from the shell's foreground process group.
+    session_leader: Option<Pid>,
     last_foreground_pid: Mutex<Option<Pid>>,
     pub(crate) current: RwLock<Option<ProcessInfo>>,
     task: Mutex<Option<Task<()>>>,
@@ -108,18 +112,31 @@ impl PtyProcessInfo {
             system: RwLock::new(system),
             refresh_kind: process_refresh_kind,
             pid_getter,
+            session_leader: None,
             last_foreground_pid: Mutex::new(None),
             current: RwLock::new(None),
             task: Mutex::new(None),
         }
     }
 
+    pub(crate) fn with_session_leader(mut self, leader: Pid) -> Self {
+        self.session_leader = Some(leader);
+        self
+    }
+
     pub(crate) fn pid_getter(&self) -> &ProcessIdGetter {
         &self.pid_getter
     }
 
+    fn foreground_pid(&self) -> Option<Pid> {
+        match self.session_leader {
+            Some(leader) => Some(foreground_process_group(leader).unwrap_or(leader)),
+            None => self.pid_getter.pid(),
+        }
+    }
+
     fn refresh(&self) -> Option<MappedRwLockReadGuard<'_, Process>> {
-        let pid = self.pid_getter.pid()?;
+        let pid = self.foreground_pid()?;
         let fallback_pid = self.pid_getter.fallback_pid();
         let mut system = self.system.write();
         // sysinfo never evicts processes that are absent from the refreshed pid
@@ -148,7 +165,7 @@ impl PtyProcessInfo {
 
     #[cfg(unix)]
     pub(crate) fn kill_current_process(&self) -> bool {
-        let Some(pid) = self.pid_getter.pid() else {
+        let Some(pid) = self.foreground_pid() else {
             return false;
         };
         unsafe { libc::killpg(pid.as_u32() as i32, libc::SIGKILL) == 0 }
@@ -239,8 +256,41 @@ impl PtyProcessInfo {
     }
 
     pub(crate) fn pid(&self) -> Option<Pid> {
-        self.pid_getter.pid()
+        self.foreground_pid()
     }
+}
+
+/// The foreground process group of the terminal `leader` controls.
+#[cfg(target_os = "macos")]
+fn foreground_process_group(leader: Pid) -> Option<Pid> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            leader.as_u32() as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&raw mut info).cast(),
+            size,
+        )
+    };
+    (written == size && info.e_tpgid > 0).then(|| Pid::from_u32(info.e_tpgid))
+}
+
+/// The foreground process group of the terminal `leader` controls.
+#[cfg(target_os = "linux")]
+fn foreground_process_group(leader: Pid) -> Option<Pid> {
+    let stat = std::fs::read_to_string(format!("/proc/{leader}/stat")).ok()?;
+    // The command name may contain spaces and parentheses, so fields are
+    // counted from the last `)`: state, ppid, pgrp, session, tty_nr, tpgid.
+    let fields = stat.get(stat.rfind(')')? + 1..)?;
+    let group: i32 = fields.split_whitespace().nth(5)?.parse().ok()?;
+    (group > 0).then(|| Pid::from_u32(group as u32))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn foreground_process_group(_leader: Pid) -> Option<Pid> {
+    None
 }
 
 #[cfg(all(test, unix))]

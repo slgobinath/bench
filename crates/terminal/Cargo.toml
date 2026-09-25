@@ -37,6 +37,7 @@ serde.workspace = true
 settings.workspace = true
 sysinfo.workspace = true
 task.workspace = true
+terminal_host.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 thiserror.workspace = true
