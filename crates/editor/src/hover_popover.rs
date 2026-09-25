@@ -18,7 +18,7 @@ use language::{DiagnosticEntry, Language, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement, MarkdownStyle};
 use multi_buffer::{MultiBufferOffset, ToOffset, ToPoint};
-use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart};
+use project::{HoverBlock, HoverBlockKind, InlayHintLabelPart, ProjectItem as _};
 use settings::Settings;
 use std::{
     borrow::Cow,
@@ -27,7 +27,7 @@ use std::{
 use std::{ops::Range, sync::Arc, time::Duration};
 use std::{path::PathBuf, rc::Rc};
 use theme_settings::ThemeSettings;
-use ui::{CopyButton, Scrollbars, WithScrollbar, prelude::*, theme_is_transparent};
+use ui::{CopyButton, Scrollbars, Tooltip, WithScrollbar, prelude::*, theme_is_transparent};
 use url::Url;
 use util::TryFutureExt;
 use workspace::{OpenOptions, OpenVisible, Workspace};
@@ -1417,7 +1417,9 @@ impl DiagnosticPopover {
                     .relative()
                     .py_1()
                     .pl_2()
-                    .pr_8()
+                    // Room for both the send and copy buttons, which float over
+                    // the message's top right corner.
+                    .pr_12()
                     .bg(self.background_color)
                     .border_1()
                     .border_color(self.border_color)
@@ -1452,15 +1454,24 @@ impl DiagnosticPopover {
                                 ),
                             ),
                     )
-                    .child(div().absolute().top_1().right_1().child({
-                        let message = self
-                            .local_diagnostic
-                            .diagnostic
-                            .message
-                            .as_shared_string()
-                            .clone();
-                        CopyButton::new("copy-diagnostic", message).tooltip_label("Copy Diagnostic")
-                    }))
+                    .child(
+                        h_flex()
+                            .absolute()
+                            .top_1()
+                            .right_1()
+                            .gap_0p5()
+                            .child(self.render_send_to_agent_button(cx))
+                            .child({
+                                let message = self
+                                    .local_diagnostic
+                                    .diagnostic
+                                    .message
+                                    .as_shared_string()
+                                    .clone();
+                                CopyButton::new("copy-diagnostic", message)
+                                    .tooltip_label("Copy Diagnostic")
+                            }),
+                    )
                     .custom_scrollbars(
                         Scrollbars::for_settings::<EditorSettingsScrollbarProxy>()
                             .tracked_scroll_handle(&self.scroll_handle),
@@ -1469,6 +1480,56 @@ impl DiagnosticPopover {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Hands the diagnostic to the agent as `path:line message`, so it can go
+    /// straight to the line without the editor's language server.
+    fn render_send_to_agent_button(&self, cx: &mut Context<Editor>) -> impl IntoElement {
+        let editor = cx.entity().downgrade();
+        let start = self.local_diagnostic.range.start;
+        let message = self
+            .local_diagnostic
+            .diagnostic
+            .message
+            .as_shared_string()
+            .to_string();
+
+        IconButton::new("send-diagnostic-to-agent", IconName::Sparkle)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Send to Agent"))
+            .on_click(move |_, window, cx| {
+                let Some((path, line)) = editor
+                    .update(cx, |editor, cx| {
+                        let (buffer, point) =
+                            editor.buffer().read(cx).point_to_buffer_point(start, cx)?;
+                        let project = editor.project()?.read(cx);
+                        let buffer = buffer.read(cx);
+                        let path = buffer
+                            .project_path(cx)
+                            .and_then(|project_path| project.absolute_path(&project_path, cx))
+                            .or_else(|| {
+                                buffer
+                                    .file()
+                                    .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                            })?;
+                        Some((path.to_string_lossy().into_owned(), point.row + 1))
+                    })
+                    .ok()
+                    .flatten()
+                else {
+                    return;
+                };
+
+                window.dispatch_action(
+                    Box::new(zed_actions::claude::SendDiagnostic {
+                        path,
+                        line,
+                        message: message.clone(),
+                    }),
+                    cx,
+                );
+            })
     }
 }
 

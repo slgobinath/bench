@@ -13,7 +13,7 @@ use terminal_view::TerminalView;
 use terminal_view::terminal_panel::TerminalPanel;
 use util::ResultExt as _;
 use workspace::Workspace;
-use zed_actions::claude::{NewTerminal, SendCommit, SendFile, SendSelection};
+use zed_actions::claude::{NewTerminal, SendCommit, SendDiagnostic, SendFile, SendSelection};
 
 use crate::agent_panel::format_selection_for_terminal;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
@@ -69,6 +69,14 @@ pub fn init(cx: &mut App) {
             })
             .register_action(|workspace, action: &SendCommit, window, cx| {
                 send(workspace, Payload::Commit(action.sha.clone()), window, cx);
+            })
+            .register_action(|workspace, action: &SendDiagnostic, window, cx| {
+                let payload = Payload::Diagnostic {
+                    path: PathBuf::from(action.path.clone()),
+                    line: action.line,
+                    message: action.message.clone(),
+                };
+                send(workspace, payload, window, cx);
             });
     })
     .detach();
@@ -79,6 +87,11 @@ enum Payload {
     Selection(AgentContextSelection),
     File(PathBuf),
     Commit(String),
+    Diagnostic {
+        path: PathBuf,
+        line: u32,
+        message: String,
+    },
 }
 
 fn send(
@@ -170,6 +183,14 @@ fn paste(
             format!("{} ", mention_path(path, &working_directory, workspace, cx))
         }
         Payload::Commit(sha) => format!("{sha} "),
+        Payload::Diagnostic {
+            path,
+            line,
+            message,
+        } => {
+            let path = mention_path(path, &working_directory, workspace, cx);
+            format!("{path}:{line} {message} ")
+        }
     };
     if text.is_empty() {
         return;

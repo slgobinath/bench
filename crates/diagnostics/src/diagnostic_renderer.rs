@@ -9,10 +9,11 @@ use gpui::{AppContext, Entity, Focusable, WeakEntity};
 use language::{BufferId, Diagnostic, DiagnosticEntryRef, LanguageRegistry};
 use lsp::DiagnosticSeverity;
 use markdown::{CopyButtonVisibility, Markdown, MarkdownElement};
+use project::ProjectItem as _;
 use settings::Settings;
 use text::Point;
 use theme_settings::ThemeSettings;
-use ui::{CopyButton, prelude::*};
+use ui::{CopyButton, Tooltip, prelude::*};
 use util::maybe;
 
 use crate::toolbar_controls::DiagnosticsToolbarEditor;
@@ -57,6 +58,7 @@ impl DiagnosticRenderer {
                     severity: primary.diagnostic.severity,
                     diagnostics_editor: diagnostics_editor.clone(),
                     copy_message: primary.diagnostic.message.as_shared_string().clone(),
+                    buffer_id,
                     markdown: cx.new(|cx| {
                         Markdown::new(markdown.into(), language_registry.clone(), None, cx)
                     }),
@@ -72,6 +74,7 @@ impl DiagnosticRenderer {
                     severity: entry.diagnostic.severity,
                     diagnostics_editor: diagnostics_editor.clone(),
                     copy_message: entry.diagnostic.message.as_shared_string().clone(),
+                    buffer_id,
                     markdown: cx.new(|cx| {
                         Markdown::new(markdown.into(), language_registry.clone(), None, cx)
                     }),
@@ -202,6 +205,10 @@ pub(crate) struct DiagnosticBlock {
     pub(crate) markdown: Entity<Markdown>,
     pub(crate) diagnostics_editor: Option<Arc<dyn DiagnosticsToolbarEditor>>,
     pub(crate) copy_message: SharedString,
+    /// The buffer the diagnostic is reported in, which is how the send button
+    /// finds the file to name. `initial_range` is in this buffer's
+    /// coordinates, so the line it reports is right even in a multibuffer.
+    pub(crate) buffer_id: BufferId,
 }
 
 impl DiagnosticBlock {
@@ -225,6 +232,7 @@ impl DiagnosticBlock {
         let line_height = editor_line_height;
         let diagnostics_editor = self.diagnostics_editor.clone();
 
+        let send_editor = editor.clone();
         let copy_button_id = format!(
             "copy-diagnostic-{}-{}-{}-{}",
             self.initial_range.start.row,
@@ -265,11 +273,56 @@ impl DiagnosticBlock {
                     }),
                 ),
             )
+            .child(self.render_send_to_agent_button(send_editor))
             .child(
                 CopyButton::new(copy_button_id, self.copy_message.clone())
                     .tooltip_label("Copy Diagnostic"),
             )
             .into_any_element()
+    }
+
+    /// Hands the diagnostic to the agent as `path:line message`, so it can go
+    /// straight to the line without the editor's language server.
+    fn render_send_to_agent_button(&self, editor: WeakEntity<Editor>) -> impl IntoElement {
+        let buffer_id = self.buffer_id;
+        let line = self.initial_range.start.row + 1;
+        let message = self.copy_message.to_string();
+        let id = SharedString::from(format!("send-diagnostic-to-agent-{buffer_id:?}-{line}"));
+
+        IconButton::new(id, IconName::Sparkle)
+            .icon_size(IconSize::Small)
+            .icon_color(Color::Muted)
+            .tooltip(Tooltip::text("Send to Agent"))
+            .on_click(move |_, window, cx| {
+                let Some(path) = editor
+                    .update(cx, |editor, cx| {
+                        let buffer = editor.buffer().read(cx).buffer(buffer_id)?;
+                        let project = editor.project()?.read(cx);
+                        let buffer = buffer.read(cx);
+                        buffer
+                            .project_path(cx)
+                            .and_then(|project_path| project.absolute_path(&project_path, cx))
+                            .or_else(|| {
+                                buffer
+                                    .file()
+                                    .and_then(|file| file.as_local().map(|file| file.abs_path(cx)))
+                            })
+                    })
+                    .ok()
+                    .flatten()
+                else {
+                    return;
+                };
+
+                window.dispatch_action(
+                    Box::new(zed_actions::claude::SendDiagnostic {
+                        path: path.to_string_lossy().into_owned(),
+                        line,
+                        message: message.clone(),
+                    }),
+                    cx,
+                );
+            })
     }
 
     pub fn open_link(

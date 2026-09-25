@@ -726,6 +726,20 @@ pub mod claude {
         /// The commit to mention, as a full SHA.
         pub sha: String,
     }
+
+    /// Sends a diagnostic, with the line it is reported on, to the agent
+    /// terminal for the active worktree.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendDiagnostic {
+        /// Absolute path of the file the diagnostic is reported in.
+        pub path: String,
+        /// One-based line the diagnostic starts on.
+        pub line: u32,
+        /// The diagnostic's message.
+        pub message: String,
+    }
 }
 
 /// Opens the recent projects interface.
