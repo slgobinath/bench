@@ -279,13 +279,16 @@ search = { workspace = true, features = ["test-support"] }
 repl = { workspace = true, features = ["test-support"] }
 
 
+# Bench installs beside a real Zed rather than over it, so the identifier and
+# the URL scheme are its own: sharing either would mean sharing preferences with
+# Zed, and racing it for `zed://` links.
 [package.metadata.bundle-dev]
 icon = ["resources/app-icon-dev@2x.png", "resources/app-icon-dev.png"]
-identifier = "dev.zed.Zed-Dev"
-name = "Zed Dev"
+identifier = "dev.bench.Bench"
+name = "Bench"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["bench"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]

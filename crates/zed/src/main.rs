@@ -5,15 +5,13 @@ mod reliability;
 mod watcher_debug;
 mod zed;
 
-// Ensure the binary name stays in sync with APP_NAME so that the paths used
-// at runtime (data dir, config dir, etc.) match what the binary is called.
-const _: () = assert!(
-    paths::APP_NAME_LOWERCASE
-        .as_bytes()
-        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
-    "paths::APP_NAME_LOWERCASE must match the binary name. \
-     Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
-);
+// Upstream asserts here that the binary name matches `paths::APP_NAME`, so
+// that a fork renaming one remembers the other. Bench deliberately has them
+// apart: its user data is its own (`~/.config/bench`, `Application
+// Support/Bench`, and so on, from `APP_NAME`), while the executable inside the
+// bundle is still `zed`, because that is the name `Bench.app/Contents/MacOS`
+// carries and the name the `cli` shim execs. Nothing derives a path from the
+// binary's name; `APP_NAME` is the only source for those.
 
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};

@@ -240,12 +240,14 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
+    # A local install has already moved the bundle into /Applications, so there
+    # is nothing left at `app_path` for the DMG to be built from.
+    if [ "$local_install" = true ]; then
+        echo "Installed locally - skipping DMG creation"
+    elif [[ "$target_dir" = "debug" ]]; then
         echo "Debug build detected - skipping DMG creation and signing"
-        if [ "$local_install" = false ]; then
-            echo "Created application bundle:"
-            echo "$app_path"
-        fi
+        echo "Created application bundle:"
+        echo "$app_path"
     else
         dmg_target_directory="target/${target_triple}/${target_dir}"
         dmg_source_directory="${dmg_target_directory}/dmg"
