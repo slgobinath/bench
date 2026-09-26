@@ -1671,11 +1671,10 @@ fn group_repository(
     cx: &App,
 ) -> Option<Entity<Repository>> {
     let anchor = project_root(key);
-    let mut repositories: Vec<Entity<Repository>> = Vec::new();
-    for open in open_worktrees {
-        let project = open.workspace.read(cx).project().read(cx);
-        repositories.extend(project.repositories(cx).values().cloned());
-    }
+    let repositories: Vec<Entity<Repository>> = open_worktrees
+        .iter()
+        .filter_map(|open| workspace_repository(open, cx))
+        .collect();
     repositories
         .iter()
         .find(|repository| anchor.is_some() && repository_anchor(repository, cx) == anchor)
@@ -1843,19 +1842,46 @@ fn linked_worktrees(
 ) -> Vec<(GitWorktree, Entity<Repository>)> {
     let mut linked: Vec<(GitWorktree, Entity<Repository>)> = Vec::new();
     for open in open_worktrees {
-        let project = open.workspace.read(cx).project().read(cx);
-        for repository in project.repositories(cx).values() {
-            for worktree in repository.read(cx).snapshot().linked_worktrees.iter() {
-                if !linked
-                    .iter()
-                    .any(|(listed, _)| listed.path == worktree.path)
-                {
-                    linked.push((worktree.clone(), repository.clone()));
-                }
+        let Some(repository) = workspace_repository(open, cx) else {
+            continue;
+        };
+        for worktree in repository.read(cx).snapshot().linked_worktrees.iter() {
+            if !linked
+                .iter()
+                .any(|(listed, _)| listed.path == worktree.path)
+            {
+                linked.push((worktree.clone(), repository.clone()));
             }
         }
     }
     linked
+}
+
+/// The repository a workspace's own checkout belongs to.
+///
+/// A project holds a repository for every git directory it finds, and that
+/// includes repositories nested inside the checkout — clones kept under a
+/// `repos/` folder, or package managers' checkouts under `build/`. Their
+/// worktrees are not the project's, so only the innermost repository at or
+/// above the workspace root counts; anything below it is someone else's.
+fn workspace_repository(open: &OpenWorktree, cx: &App) -> Option<Entity<Repository>> {
+    let root = open.root.as_deref()?;
+    let project = open.workspace.read(cx).project().read(cx);
+    project
+        .repositories(cx)
+        .values()
+        .filter(|repository| {
+            root.starts_with(&repository.read(cx).snapshot().work_directory_abs_path)
+        })
+        .max_by_key(|repository| {
+            repository
+                .read(cx)
+                .snapshot()
+                .work_directory_abs_path
+                .components()
+                .count()
+        })
+        .cloned()
 }
 
 /// The panel's label for a worktree: its own directory name, or `main` for the
@@ -2143,6 +2169,7 @@ impl Panel for WorktreePanel {
 mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
+    use serde_json::json;
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
     use settings::{Settings as _, SettingsStore};
@@ -2703,6 +2730,76 @@ mod tests {
                 ("main".to_owned(), None),
             ],
             "only the worktree on the branch with the pull request is coloured"
+        );
+    }
+
+    /// A project that keeps other repositories inside it — clones under a
+    /// `repos/` folder — lists only its own worktrees. The nested repositories
+    /// are still in the project for the editor and language servers, but their
+    /// worktrees belong to them, not to the project.
+    #[gpui::test]
+    async fn repositories_nested_in_a_project_do_not_add_worktrees(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree(
+            "/outer",
+            json!({
+                ".git": {},
+                "file.txt": "hi",
+                "repos": {
+                    "inner": {
+                        ".git": {},
+                        "file.txt": "hi",
+                    },
+                },
+            }),
+        )
+        .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/outer/.git"),
+            false,
+            worktree("/outer-fix", "fix", false),
+        )
+        .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/outer/repos/inner/.git"),
+            false,
+            worktree("/inner-fix", "inner-fix", false),
+        )
+        .await;
+
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let repositories = project.read_with(&mut cx, |project, cx| project.repositories(cx).len());
+        assert_eq!(
+            repositories, 2,
+            "the nested repository is still part of the project"
+        );
+
+        let rows = panels[0].read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .map(|row| {
+                    let worktrees: Vec<String> = row
+                        .worktrees
+                        .iter()
+                        .map(|worktree| worktree.name.to_string())
+                        .collect();
+                    (row.name.to_string(), worktrees)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(
+            rows,
+            vec![(
+                "outer".to_owned(),
+                vec!["main".to_owned(), "outer-fix".to_owned()]
+            )]
         );
     }
 
