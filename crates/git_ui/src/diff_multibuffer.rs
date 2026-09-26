@@ -1,7 +1,12 @@
 use crate::{
     conflict_view,
+    git_graph::{
+        ChangedFileDirectoryEntry, ChangedFileEntry, ChangedFileTreeEntry,
+        ChangedFileTreeStatusEntry, TREE_INDENT, build_changed_file_tree_entries,
+    },
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
+    git_status_icon,
 };
 use anyhow::Result;
 use buffer_diff::BufferDiff;
@@ -10,12 +15,14 @@ use editor::{
     EditorEvent, EditorSettings, SelectionEffects, SplittableEditor, actions::GoToHunk,
     multibuffer_context_lines, scroll::Autoscroll,
 };
+use file_icons::FileIcons;
 use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+    App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    Render, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity, px,
+    uniform_list,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -27,15 +34,21 @@ use project::{
     },
 };
 use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Range, rc::Rc, sync::Arc};
 use theme::ActiveTheme;
-use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
+use ui::{
+    CommonAnimationExt as _, IndentGuideColors, KeyBinding, ListItem, ListItemSpacing, Tooltip,
+    WithScrollbar, prelude::*,
+};
 use util::{ResultExt as _, rel_path::RelPath};
 use workspace::{
     CloseActiveItem, ItemNavHistory, Workspace,
     item::{Item, SaveOptions},
 };
+use zed_actions::git::ToggleDiffFileTree;
 use ztracing::instrument;
+
+const FILE_TREE_WIDTH: Pixels = px(260.);
 
 /// Loading every changed file at once makes the first one land no sooner than the
 /// last, leaving a large diff on a spinner. Throughput flattens past this point.
@@ -59,6 +72,10 @@ pub struct DiffMultibuffer {
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
     empty_label: SharedString,
+    changed_files: Vec<ChangedFileEntry>,
+    changed_file_path_keys: HashMap<RepoPath, PathKey>,
+    file_tree_expanded_directories: HashMap<RepoPath, bool>,
+    file_tree_scroll_handle: UniformListScrollHandle,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -153,6 +170,7 @@ impl DiffMultibuffer {
             was_group_by = group_by;
             was_tree_view = tree_view;
             was_collapse_untracked_diff = is_collapse_untracked_diff;
+            cx.notify();
         })
         .detach();
 
@@ -171,6 +189,10 @@ impl DiffMultibuffer {
             pending_scroll: None,
             review_comment_count: 0,
             empty_label: empty_label.into(),
+            changed_files: Vec::new(),
+            changed_file_path_keys: HashMap::default(),
+            file_tree_expanded_directories: HashMap::default(),
+            file_tree_scroll_handle: UniformListScrollHandle::new(),
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -407,6 +429,7 @@ impl DiffMultibuffer {
                 if !editor.focus_handle(cx).contains_focused(window, cx) {
                     return;
                 }
+                cx.notify();
                 cx.emit(event.clone());
                 let Some(project_path) = self.active_project_path(cx) else {
                     return;
@@ -679,6 +702,16 @@ impl DiffMultibuffer {
             this.buffer_subscriptions
                 .retain(|repo_path, _| live_repo_paths.contains(repo_path));
 
+            this.changed_files = entries
+                .values()
+                .map(|entry| ChangedFileEntry::new(entry.repo_path.clone(), entry.file_status))
+                .collect();
+            this.changed_file_path_keys = entries
+                .iter()
+                .map(|(path_key, entry)| (entry.repo_path.clone(), path_key.clone()))
+                .collect();
+            cx.notify();
+
             entries
         })?;
 
@@ -834,6 +867,244 @@ impl DiffMultibuffer {
         })
     }
 
+    pub(crate) fn register(workspace: &mut Workspace) {
+        workspace.register_action(|workspace, _: &ToggleDiffFileTree, _window, cx| {
+            let show_file_tree = GitPanelSettings::get_global(cx).diff_file_tree;
+            settings::update_settings_file(
+                workspace.app_state().fs.clone(),
+                cx,
+                move |settings, _| {
+                    settings.git_panel.get_or_insert_default().diff_file_tree =
+                        Some(!show_file_tree);
+                },
+            );
+        });
+    }
+
+    fn toggle_file_tree_view(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let tree_view = GitPanelSettings::get_global(cx).tree_view;
+        settings::update_settings_file(
+            workspace.read(cx).app_state().fs.clone(),
+            cx,
+            move |settings, _| {
+                settings.git_panel.get_or_insert_default().tree_view = Some(!tree_view);
+            },
+        );
+        self.file_tree_scroll_handle
+            .scroll_to_item(0, gpui::ScrollStrategy::Top);
+    }
+
+    /// The path key of the file under the cursor in whichever side of the diff has focus.
+    fn active_path_key(&self, cx: &App) -> Option<PathKey> {
+        let editor = self.editor.read(cx).focused_editor().read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let position = editor.selections.newest_anchor().head();
+        let (anchor, _) = snapshot.anchor_to_buffer_anchor(position)?;
+        snapshot.path_for_buffer(anchor.buffer_id).cloned()
+    }
+
+    fn render_file_tree(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tree_view = GitPanelSettings::get_global(cx).tree_view;
+        let entries: Rc<Vec<ChangedFileTreeEntry>> = Rc::new(if tree_view {
+            build_changed_file_tree_entries(
+                self.changed_files.clone(),
+                &self.file_tree_expanded_directories,
+            )
+        } else {
+            self.changed_files
+                .iter()
+                .cloned()
+                .map(|entry| {
+                    ChangedFileTreeEntry::File(ChangedFileTreeStatusEntry { entry, depth: 0 })
+                })
+                .collect()
+        });
+        let active_path_key = self.active_path_key(cx);
+        let file_count = self.changed_files.len();
+        let indent_entries = entries.clone();
+
+        v_flex()
+            .flex_none()
+            .w(FILE_TREE_WIDTH)
+            .h_full()
+            .border_r_1()
+            .border_color(cx.theme().colors().border_variant)
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                h_flex()
+                    .p_2()
+                    .pb_1()
+                    .gap_1()
+                    .w_full()
+                    .justify_between()
+                    .child(
+                        Label::new(format!(
+                            "{} Changed {}",
+                            file_count,
+                            if file_count == 1 { "File" } else { "Files" }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("toggle-diff-file-tree-view", IconName::ListTree)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(tree_view)
+                            .tooltip(Tooltip::text(if tree_view {
+                                "Show Flat View"
+                            } else {
+                                "Show Tree View"
+                            }))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.toggle_file_tree_view(cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("diff-file-tree-container")
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        uniform_list(
+                            "diff-file-tree",
+                            entries.len(),
+                            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                range
+                                    .filter_map(|ix| {
+                                        let entry = entries.get(ix)?;
+                                        Some(this.render_file_tree_entry(
+                                            ix,
+                                            entry,
+                                            tree_view,
+                                            active_path_key.as_ref(),
+                                            cx,
+                                        ))
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .when(tree_view, |list| {
+                            list.with_decoration(
+                                ui::indent_guides(px(TREE_INDENT), IndentGuideColors::panel(cx))
+                                    .with_left_offset(
+                                        ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
+                                    )
+                                    .with_compute_indents_fn(
+                                        cx.entity(),
+                                        move |_, range, _window, _cx| {
+                                            range
+                                                .map(|ix| {
+                                                    indent_entries
+                                                        .get(ix)
+                                                        .map_or(0, ChangedFileTreeEntry::depth)
+                                                })
+                                                .collect()
+                                        },
+                                    ),
+                            )
+                        })
+                        .size_full()
+                        .track_scroll(&self.file_tree_scroll_handle),
+                    )
+                    .vertical_scrollbar_for(&self.file_tree_scroll_handle, window, cx),
+            )
+    }
+
+    fn render_file_tree_entry(
+        &self,
+        ix: usize,
+        entry: &ChangedFileTreeEntry,
+        tree_view: bool,
+        active_path_key: Option<&PathKey>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match entry {
+            ChangedFileTreeEntry::Directory(directory) => {
+                self.render_file_tree_directory(ix, directory, cx)
+            }
+            ChangedFileTreeEntry::File(file) => {
+                let path_key = self.changed_file_path_keys.get(&file.entry.repo_path);
+                let is_active = path_key.is_some_and(|path_key| Some(path_key) == active_path_key);
+                let entry = &file.entry;
+                let directory_label =
+                    (!tree_view && !entry.dir_path.is_empty()).then(|| entry.dir_path.clone());
+                let full_path: SharedString = entry.repo_path.as_unix_str().to_string().into();
+
+                ListItem::new(("diff-file-tree-file", ix))
+                    .spacing(ListItemSpacing::Sparse)
+                    .indent_level(file.depth)
+                    .indent_step_size(px(TREE_INDENT))
+                    .toggle_state(is_active)
+                    .start_slot(git_status_icon(entry.status))
+                    .child(
+                        Label::new(entry.file_name.clone())
+                            .size(LabelSize::Small)
+                            .when(entry.status.is_deleted(), Label::strikethrough)
+                            .truncate(),
+                    )
+                    .when_some(directory_label, |this, directory_label| {
+                        this.child(
+                            Label::new(directory_label)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .truncate_start(),
+                        )
+                    })
+                    .tooltip(Tooltip::text(full_path))
+                    .when_some(path_key.cloned(), |this, path_key| {
+                        this.on_click(cx.listener(move |this, _, window, cx| {
+                            this.move_to_path(path_key.clone(), window, cx);
+                            window.focus(&this.editor.focus_handle(cx), cx);
+                        }))
+                    })
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_file_tree_directory(
+        &self,
+        ix: usize,
+        directory: &ChangedFileDirectoryEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let path = directory.path.clone();
+        let expanded = directory.expanded;
+        let folder_icon = FileIcons::get_folder_icon(expanded, path.as_std_path(), cx)
+            .map(Icon::from_path)
+            .unwrap_or_else(|| {
+                Icon::new(if expanded {
+                    IconName::FolderOpen
+                } else {
+                    IconName::Folder
+                })
+            })
+            .size(IconSize::Small)
+            .color(Color::Muted);
+
+        ListItem::new(("diff-file-tree-directory", ix))
+            .spacing(ListItemSpacing::Sparse)
+            .indent_level(directory.depth)
+            .indent_step_size(px(TREE_INDENT))
+            .start_slot(folder_icon)
+            .child(
+                Label::new(directory.name.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted)
+                    .truncate(),
+            )
+            .on_click(cx.listener(move |this, _, _window, cx| {
+                this.file_tree_expanded_directories
+                    .insert(path.clone(), !expanded);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn excerpt_paths(&self, cx: &App) -> Vec<std::sync::Arc<util::rel_path::RelPath>> {
         let snapshot = self
@@ -853,6 +1124,14 @@ impl DiffMultibuffer {
                     .path
                     .clone()
             })
+            .collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn changed_file_paths(&self) -> Vec<String> {
+        self.changed_files
+            .iter()
+            .map(|entry| entry.repo_path.as_unix_str().to_string())
             .collect()
     }
 
@@ -901,19 +1180,41 @@ impl Focusable for DiffMultibuffer {
 }
 
 impl Render for DiffMultibuffer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
         let empty_label = self.empty_label.clone();
+        let show_file_tree = !is_empty && GitPanelSettings::get_global(cx).diff_file_tree;
 
+        // The file tree sits outside the focus-tracking element so that clicking
+        // it doesn't pull focus away from the diff editor.
+        h_flex()
+            .size_full()
+            .bg(cx.theme().colors().editor_background)
+            .when(show_file_tree, |el| {
+                el.child(self.render_file_tree(window, cx))
+            })
+            .child(self.render_diff(is_empty, is_loading, empty_label, cx))
+    }
+}
+
+impl DiffMultibuffer {
+    fn render_diff(
+        &self,
+        is_empty: bool,
+        is_loading: bool,
+        empty_label: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .track_focus(&self.focus_handle)
             .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
-            .bg(cx.theme().colors().editor_background)
             .flex()
             .items_center()
             .justify_center()
-            .size_full()
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .when(is_empty && is_loading, |el| {
                 let rems = TextSize::Large.rems(cx);
                 el.child(

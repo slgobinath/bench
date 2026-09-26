@@ -6398,7 +6398,7 @@ fn panels_page() -> SettingsPage {
         ]
     }
 
-    fn git_panel_section() -> [SettingsPageItem; 18] {
+    fn git_panel_section() -> [SettingsPageItem; 19] {
         [
             SettingsPageItem::SectionHeader("Git Panel"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -6532,6 +6532,25 @@ fn panels_page() -> SettingsPage {
                     pick: |settings_content| settings_content.git_panel.as_ref()?.group_by.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.git_panel.get_or_insert_default().group_by = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Diff File Tree",
+                description: "Whether to show the changed files list beside diffs in the diff views.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.diff_file_tree"),
+                    pick: |settings_content| {
+                        settings_content.git_panel.as_ref()?.diff_file_tree.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .diff_file_tree = value;
                     },
                 }),
                 metadata: None,

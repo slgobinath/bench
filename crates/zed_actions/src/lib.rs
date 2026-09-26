@@ -375,7 +375,9 @@ pub mod git {
             /// Opens the git worktree selector.
             Worktree,
             /// Creates a pull request for the current branch.
-            CreatePullRequest
+            CreatePullRequest,
+            /// Shows or hides the changed files list beside the diff.
+            ToggleDiffFileTree
         ]
     );
 }

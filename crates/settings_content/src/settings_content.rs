@@ -829,6 +829,11 @@ pub struct GitPanelSettingsContent {
     /// Default: false
     pub tree_view: Option<bool>,
 
+    /// Whether to show the changed files list beside diffs in the diff views.
+    ///
+    /// Default: true
+    pub diff_file_tree: Option<bool>,
+
     /// Whether to show the addition/deletion change count next to each file in the Git panel.
     ///
     /// Default: true

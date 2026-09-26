@@ -70,7 +70,7 @@ const LINE_WIDTH: Pixels = px(1.5);
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 const COPIED_STATE_DURATION: Duration = Duration::from_secs(2);
 const COMMIT_TAG_LIST_WIDTH_IN_REMS: Rems = rems(10.);
-const TREE_INDENT: f32 = 20.0;
+pub(crate) const TREE_INDENT: f32 = 20.0;
 const TABLE_COLUMN_COUNT: usize = 4;
 const ROW_VERTICAL_PADDING: Pixels = px(4.0);
 
@@ -204,28 +204,34 @@ impl PickerDelegate for CommitTagPickerDelegate {
 }
 
 #[derive(Clone)]
-struct ChangedFileEntry {
-    status: FileStatus,
-    file_name: SharedString,
-    dir_path: SharedString,
-    repo_path: RepoPath,
+pub(crate) struct ChangedFileEntry {
+    pub(crate) status: FileStatus,
+    pub(crate) file_name: SharedString,
+    pub(crate) dir_path: SharedString,
+    pub(crate) repo_path: RepoPath,
 }
 
 impl ChangedFileEntry {
-    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
-        let file_name: SharedString = file
-            .path
+    pub(crate) fn new(repo_path: RepoPath, status: FileStatus) -> Self {
+        let file_name: SharedString = repo_path
             .file_name()
             .map(|n| n.to_string())
             .unwrap_or_default()
             .into();
-        let dir_path: SharedString = file
-            .path
+        let dir_path: SharedString = repo_path
             .parent()
             .map(|p| p.as_unix_str().to_string())
             .unwrap_or_default()
             .into();
+        Self {
+            status,
+            file_name,
+            dir_path,
+            repo_path,
+        }
+    }
 
+    fn from_commit_file(file: &CommitFile, _cx: &App) -> Self {
         let status_code = match (&file.old_text, &file.new_text) {
             (None, Some(_)) => StatusCode::Added,
             (Some(_), None) => StatusCode::Deleted,
@@ -237,12 +243,7 @@ impl ChangedFileEntry {
             worktree_status: StatusCode::Unmodified,
         });
 
-        Self {
-            status,
-            file_name,
-            dir_path,
-            repo_path: file.path.clone(),
-        }
+        Self::new(file.path.clone(), status)
     }
 
     fn open_in_commit_view(
@@ -313,14 +314,23 @@ impl ChangedFileEntry {
     }
 }
 
-enum ChangedFileTreeEntry {
+pub(crate) enum ChangedFileTreeEntry {
     Directory(ChangedFileDirectoryEntry),
     File(ChangedFileTreeStatusEntry),
 }
 
-struct ChangedFileTreeStatusEntry {
-    entry: ChangedFileEntry,
-    depth: usize,
+impl ChangedFileTreeEntry {
+    pub(crate) fn depth(&self) -> usize {
+        match self {
+            Self::Directory(entry) => entry.depth,
+            Self::File(entry) => entry.depth,
+        }
+    }
+}
+
+pub(crate) struct ChangedFileTreeStatusEntry {
+    pub(crate) entry: ChangedFileEntry,
+    pub(crate) depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -343,11 +353,11 @@ impl ChangedFilesViewMode {
     }
 }
 
-struct ChangedFileDirectoryEntry {
-    path: RepoPath,
-    name: SharedString,
-    depth: usize,
-    expanded: bool,
+pub(crate) struct ChangedFileDirectoryEntry {
+    pub(crate) path: RepoPath,
+    pub(crate) name: SharedString,
+    pub(crate) depth: usize,
+    pub(crate) expanded: bool,
 }
 
 impl ChangedFileDirectoryEntry {
@@ -406,7 +416,7 @@ struct ChangedFileTreeNode {
     files: Vec<ChangedFileEntry>,
 }
 
-fn build_changed_file_tree_entries(
+pub(crate) fn build_changed_file_tree_entries(
     mut files: Vec<ChangedFileEntry>,
     expanded_dirs: &HashMap<RepoPath, bool>,
 ) -> Vec<ChangedFileTreeEntry> {

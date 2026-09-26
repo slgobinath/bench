@@ -6081,6 +6081,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "group_by": "status",
     "collapse_untracked_diff": false,
     "tree_view": false,
+    "diff_file_tree": true,
     "scrollbar": {
       "show": null
     },
@@ -6106,6 +6107,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `group_by`: How to group entries in the git panel. Can be `none` or `status`
 - `collapse_untracked_diff`: Whether to collapse untracked files in the diff panel
 - `tree_view`: Whether to show entries in tree or flat view in the panel
+- `diff_file_tree`: Whether to show the changed files list beside diffs in the diff views
 - `scrollbar`: When to show the scrollbar in the git panel
 - `starts_open`: Whether the git panel should open on startup
 - `show_count_badge`: Whether to show a badge on the git panel icon with the count of uncommitted changes

@@ -111,6 +111,7 @@ impl ProjectDiff {
         workspace.register_action(|workspace, _: &Add, window, cx| {
             Self::deploy_at(workspace, None, window, cx);
         });
+        DiffMultibuffer::register(workspace);
         workspace::register_serializable_item::<ProjectDiff>(cx);
     }
 
@@ -396,6 +397,11 @@ impl ProjectDiff {
     #[cfg(any(test, feature = "test-support"))]
     pub fn excerpt_file_paths(&self, cx: &App) -> Vec<String> {
         self.diff.read(cx).excerpt_file_paths(cx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn changed_file_paths(&self, cx: &App) -> Vec<String> {
+        self.diff.read(cx).changed_file_paths()
     }
 }
 
@@ -2311,6 +2317,51 @@ mod tests {
         // `src/m.rs`, `src/sub/b.rs`.
         let paths = diff.read_with(cx, |diff, cx| diff.excerpt_file_paths(cx));
         assert_eq!(paths, vec!["src/sub/b.rs", "src/a.rs", "src/m.rs"]);
+    }
+
+    #[gpui::test]
+    async fn test_changed_files_list_follows_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "b.rs": "B\n",
+                "src": { "a.rs": "A\n" },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        cx.run_until_parked();
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("b.rs", "b\n".into()), ("src/a.rs", "a\n".into())],
+        );
+        cx.run_until_parked();
+
+        let (changed_files, excerpt_paths) = diff.read_with(cx, |diff, cx| {
+            (diff.changed_file_paths(cx), diff.excerpt_file_paths(cx))
+        });
+        assert_eq!(changed_files, excerpt_paths);
+        assert_eq!(changed_files, vec!["b.rs", "src/a.rs"]);
+
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("b.rs", "B\n".into()), ("src/a.rs", "a\n".into())],
+        );
+        cx.run_until_parked();
+
+        let changed_files = diff.read_with(cx, |diff, cx| diff.changed_file_paths(cx));
+        assert_eq!(changed_files, vec!["src/a.rs"]);
     }
 
     #[gpui::test]

@@ -1142,6 +1142,10 @@
     //
     // Default: false
     "tree_view": false,
+    // Whether to show the changed files list beside diffs in the diff views.
+    //
+    // Default: true
+    "diff_file_tree": true,
     // Whether the git panel should open on startup.
     //
     // Default: false
