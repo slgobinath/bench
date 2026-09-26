@@ -1084,6 +1084,17 @@
     // Whether to keep the machine awake while an agent is working.
     "keep_awake": true
   },
+  // Bench: the worktree panel.
+  "worktree_panel": {
+    // Directories a linked worktree has to be inside to be listed, such as
+    // ["~/bench"]. Paths may start with `~`. An empty list allows every
+    // directory. A repository's own checkout, and any worktree open in the
+    // window, are always listed.
+    "include": [],
+    // Directories whose linked worktrees are never listed, even when they are
+    // inside an included directory.
+    "exclude": []
+  },
   "git_panel": {
     // Whether to show the git panel button in the status bar.
     "button": true,

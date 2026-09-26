@@ -185,6 +185,7 @@ impl VsCodeSettings {
             agent_servers: None,
             // Bench's own; VS Code has nothing that maps onto it.
             agents: None,
+            worktree_panel: None,
             audio: None,
             auto_update: None,
             base_keymap: Some(BaseKeymapContent::VSCode),

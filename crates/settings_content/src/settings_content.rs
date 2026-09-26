@@ -203,6 +203,9 @@ pub struct SettingsContent {
     /// Bench: the agents running in Bench's terminals.
     pub agents: Option<AgentTrackingSettingsContent>,
 
+    /// Bench: the worktree panel.
+    pub worktree_panel: Option<WorktreePanelSettingsContent>,
+
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -405,7 +408,7 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        agents, call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        agents, worktree_panel, call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
@@ -726,6 +729,23 @@ pub struct CallSettingsContent {
     ///
     /// Default: false
     pub share_on_join: Option<bool>,
+}
+
+#[with_fallible_options]
+/// Bench: which worktrees the worktree panel lists.
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct WorktreePanelSettingsContent {
+    /// Directories a linked worktree has to be inside to be listed. Paths may
+    /// start with `~`. An empty list allows every directory. A repository's own
+    /// checkout, and any worktree open in the window, are always listed.
+    ///
+    /// Default: []
+    pub include: Option<Vec<String>>,
+    /// Directories whose linked worktrees are never listed, even when they are
+    /// inside an included directory. Paths may start with `~`.
+    ///
+    /// Default: []
+    pub exclude: Option<Vec<String>>,
 }
 
 #[with_fallible_options]

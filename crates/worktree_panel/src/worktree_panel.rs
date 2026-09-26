@@ -44,6 +44,7 @@ use project::{
 };
 use ui::{Indicator, Label, ListItem, ListItemSpacing, Tooltip, prelude::*};
 use ui_input::{ErasedEditor, InputField};
+use settings::Settings as _;
 use util::path_list::PathList;
 use util::paths::home_dir;
 use util::ResultExt as _;
@@ -63,6 +64,49 @@ actions!(
         Toggle,
     ]
 );
+
+/// Which linked worktrees the panel lists. See the `worktree_panel` section of
+/// the settings file.
+#[derive(Clone, Debug, PartialEq, settings::RegisterSetting)]
+pub struct WorktreePanelSettings {
+    pub include: Vec<PathBuf>,
+    pub exclude: Vec<PathBuf>,
+}
+
+impl WorktreePanelSettings {
+    /// Whether a linked worktree at `path` is one the settings allow.
+    ///
+    /// Other tools keep worktrees of the same repositories in directories of
+    /// their own, and every one of them is in `git worktree list`. These lists
+    /// are how a user keeps those out of a panel that is about Bench's.
+    fn allows(&self, path: &Path) -> bool {
+        let included =
+            self.include.is_empty() || self.include.iter().any(|root| path.starts_with(root));
+        included && !self.exclude.iter().any(|root| path.starts_with(root))
+    }
+}
+
+impl settings::Settings for WorktreePanelSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let panel = content.worktree_panel.clone().unwrap_or_default();
+        Self {
+            include: expand_paths(panel.include.unwrap_or_default()),
+            exclude: expand_paths(panel.exclude.unwrap_or_default()),
+        }
+    }
+}
+
+fn expand_paths(paths: Vec<String>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .map(|path| match path.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                home_dir().join(rest.trim_start_matches('/'))
+            }
+            _ => PathBuf::from(path),
+        })
+        .collect()
+}
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _, _| {
@@ -295,6 +339,17 @@ impl WorktreePanel {
         if let Some(tracker) = AgentTracker::try_global(cx) {
             subscriptions.push(cx.subscribe(&tracker, |_, _, _: &AgentsChanged, cx| cx.notify()));
         }
+        // Only when this panel's own settings changed: the settings store
+        // changes on every edit of the settings file, and redrawing for all of
+        // them is the per-change cost the subscriptions above avoid.
+        let mut settings = WorktreePanelSettings::get_global(cx).clone();
+        subscriptions.push(cx.observe_global::<settings::SettingsStore>(move |_, cx| {
+            let current = WorktreePanelSettings::get_global(cx);
+            if *current != settings {
+                settings = current.clone();
+                cx.notify();
+            }
+        }));
 
         let filter = (ui_input::ERASED_EDITOR_FACTORY
             .get()
@@ -435,6 +490,17 @@ impl WorktreePanel {
             .iter()
             .map(|open| open.root.clone())
             .collect();
+        let settings = WorktreePanelSettings::get_global(cx);
+        // What the window has open stays listed whatever the settings say, and
+        // so does the repository's own checkout, which is what a project is.
+        worktrees.retain(|worktree| {
+            worktree.is_main
+                || Some(worktree.path.as_path()) == anchor.as_deref()
+                || open_roots
+                    .iter()
+                    .any(|root| root.as_deref() == Some(worktree.path.as_path()))
+                || settings.allows(&worktree.path)
+        });
         let switch_from = open_worktrees.first().map(|open| open.workspace.clone());
         let pull_requests = self.scanned_pull_requests(key, cx);
         let tracker = AgentTracker::try_global(cx);
@@ -2172,7 +2238,7 @@ mod tests {
     use serde_json::json;
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
-    use settings::{Settings as _, SettingsStore};
+    use settings::SettingsStore;
     use std::sync::Arc;
     use workspace::ProjectGroup;
     use workspace::dock::PanelSizeState;
@@ -2801,6 +2867,64 @@ mod tests {
                 vec!["main".to_owned(), "outer-fix".to_owned()]
             )]
         );
+    }
+
+    /// Worktrees other tools made of the same repository are in its worktree
+    /// list too. The settings keep them out, but never the repository's own
+    /// checkout or a worktree the window has open.
+    #[gpui::test]
+    async fn worktrees_outside_the_allowed_directories_are_not_listed(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.insert_tree("/elsewhere/opened", json!({ "file.txt": "hi" }))
+            .await;
+        for (path, branch) in [
+            ("/bench/outer-fix", "fix"),
+            ("/bench/skipped/outer-skip", "skip"),
+            ("/elsewhere/outer-old", "old"),
+            ("/elsewhere/opened", "opened"),
+        ] {
+            fs.add_linked_worktree_for_repo(
+                Path::new("/outer/.git"),
+                false,
+                worktree(path, branch, false),
+            )
+            .await;
+        }
+        cx.update(|_window, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.worktree_panel = Some(settings::WorktreePanelSettingsContent {
+                        include: Some(vec!["/bench".to_owned()]),
+                        exclude: Some(vec!["/bench/skipped".to_owned()]),
+                    });
+                });
+            });
+        });
+
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project, window, cx)
+        });
+        let opened = Project::test(fs.clone(), ["/elsewhere/opened".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(opened, window, cx)
+        });
+        cx.run_until_parked();
+
+        let names = panels[0].read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .map(|worktree| worktree.name.to_string())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(names, vec!["main", "opened", "outer-fix"]);
     }
 
     fn pull_request(head_ref: &str, state: PullRequestState) -> PullRequest {
