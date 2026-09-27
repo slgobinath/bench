@@ -505,12 +505,15 @@ pub(crate) enum RemoteOperationKind {
 }
 
 pub fn register(workspace: &mut Workspace) {
+    // Bench: the git panel you see is Bench's; this one stays registered,
+    // hidden, for the commit modal, the project diff and the `git::` actions
+    // that go through it. See `crate::bench_git_panel`.
     workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
-        workspace.toggle_panel_focus::<GitPanel>(window, cx);
+        workspace.toggle_panel_focus::<crate::bench_git_panel::BenchGitPanel>(window, cx);
     });
     workspace.register_action(|workspace, _: &Toggle, window, cx| {
-        if !workspace.toggle_panel_focus::<GitPanel>(window, cx) {
-            workspace.close_panel::<GitPanel>(window, cx);
+        if !workspace.toggle_panel_focus::<crate::bench_git_panel::BenchGitPanel>(window, cx) {
+            workspace.close_panel::<crate::bench_git_panel::BenchGitPanel>(window, cx);
         }
     });
     workspace.register_action(|workspace, _: &ExpandCommitEditor, window, cx| {
@@ -3981,7 +3984,7 @@ impl GitPanel {
         compressed
     }
 
-    async fn load_project_rules(
+    pub(crate) async fn load_project_rules(
         project: &Entity<Project>,
         repo_work_dir: &Arc<Path>,
         cx: &mut AsyncApp,
@@ -4027,7 +4030,7 @@ impl GitPanel {
         }
     }
 
-    fn build_commit_message_prompt(
+    pub(crate) fn build_commit_message_prompt(
         prompt: &str,
         user_agents_md: Option<&str>,
         rules_content: Option<&str>,
@@ -9440,10 +9443,9 @@ impl Panel for GitPanel {
         GitPanelSettings::get_global(cx).default_width
     }
 
-    fn icon(&self, _: &Window, cx: &App) -> Option<ui::IconName> {
-        GitPanelSettings::get_global(cx)
-            .button
-            .then_some(ui::IconName::GitBranch)
+    /// Bench: no button — Bench's git panel is the one in the dock.
+    fn icon(&self, _: &Window, _cx: &App) -> Option<ui::IconName> {
+        None
     }
 
     fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
@@ -9462,8 +9464,8 @@ impl Panel for GitPanel {
         Box::new(ToggleFocus)
     }
 
-    fn starts_open(&self, _: &Window, cx: &App) -> bool {
-        GitPanelSettings::get_global(cx).starts_open
+    fn starts_open(&self, _: &Window, _cx: &App) -> bool {
+        false
     }
 
     fn activation_priority(&self) -> u32 {
@@ -14140,7 +14142,12 @@ mod tests {
             assert!(panel.commit_editor_expanded);
         });
 
-        cx.dispatch_action(super::ToggleFocus);
+        // Bench: `git_panel::ToggleFocus` opens Bench's git panel, so this
+        // panel is toggled directly; what is under test is where it puts
+        // focus.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<GitPanel>(window, cx);
+        });
         panel.update_in(&mut cx, |panel, window, cx| {
             assert!(panel.commit_editor.focus_handle(cx).is_focused(window));
         });

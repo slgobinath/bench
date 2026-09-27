@@ -55,6 +55,7 @@ impl RepositorySelector {
             .and_then(|active| filtered_repositories.iter().position(|repo| repo == active))
             .unwrap_or(0);
         let delegate = RepositorySelectorDelegate {
+            project: project_handle,
             repository_selector: cx.entity().downgrade(),
             repository_entries,
             filtered_repositories,
@@ -122,6 +123,9 @@ impl Render for RepositorySelector {
 impl ModalView for RepositorySelector {}
 
 pub struct RepositorySelectorDelegate {
+    /// Bench: whose multi-repository selection the checkboxes change; see
+    /// [`crate::bench_git_panel`].
+    project: Entity<Project>,
     repository_selector: WeakEntity<RepositorySelector>,
     repository_entries: Vec<Entity<Repository>>,
     filtered_repositories: Vec<Entity<Repository>>,
@@ -236,6 +240,12 @@ impl PickerDelegate for RepositorySelectorDelegate {
         selected_repo.update(cx, |selected_repo, cx| {
             selected_repo.set_as_active_repository(cx)
         });
+        // Bench: picking a repository by name picks it alone; the checkboxes
+        // are for picking several.
+        let project = self.project.clone();
+        crate::bench_git_panel::RepositorySelection::global(cx).update(cx, |selection, cx| {
+            selection.select_only_active(&project, cx)
+        });
         self.dismissed(window, cx);
     }
 
@@ -261,10 +271,35 @@ impl PickerDelegate for RepositorySelectorDelegate {
             .as_ref()
             .is_some_and(|active| active == repo_info);
 
+        // Bench: a checkbox per repository, to select several at once.
+        let project = self.project.clone();
+        let checked = crate::bench_git_panel::RepositorySelection::global(cx)
+            .update(cx, |selection, cx| selection.is_selected(&project, repo_info, cx));
+        let toggled_repository = repo_info.clone();
+        let picker = cx.entity().downgrade();
+        let checkbox = div()
+            // The row itself picks this repository alone; the checkbox must
+            // not also count as a click on it.
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                ui::Checkbox::new(("select-repository", ix), checked.into())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        let project = project.clone();
+                        let repository = toggled_repository.clone();
+                        crate::bench_git_panel::RepositorySelection::global(cx).update(
+                            cx,
+                            |selection, cx| selection.toggle(&project, &repository, cx),
+                        );
+                        picker.update(cx, |_, cx| cx.notify()).ok();
+                    }),
+            );
+
         let mut item = ListItem::new(ix)
             .inset(true)
             .spacing(ListItemSpacing::Sparse)
             .toggle_state(selected)
+            .start_slot(checkbox)
             .child(
                 h_flex()
                     .gap_1()

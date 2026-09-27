@@ -742,6 +742,15 @@ pub mod claude {
         /// The diagnostic's message.
         pub message: String,
     }
+
+    /// Puts text into the composer of the agent terminal for the active
+    /// worktree, as a prompt to finish and send — a review request, say.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendText {
+        pub text: String,
+    }
 }
 
 /// Opens the recent projects interface.
