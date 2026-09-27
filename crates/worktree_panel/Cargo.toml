@@ -23,6 +23,8 @@ git_ui_core.workspace = true
 # Asking the GitHub CLI what pull requests a branch has.
 github_cli.workspace = true
 gpui.workspace = true
+# Linking a worktree to the Linear issue its branch is named after.
+linear.workspace = true
 log.workspace = true
 menu.workspace = true
 project.workspace = true

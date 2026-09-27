@@ -130,6 +130,7 @@ members = [
     "crates/language_tools",
     "crates/languages",
     "crates/line_ending_selector",
+    "crates/linear",
     "crates/livekit_api",
     "crates/livekit_client",
     "crates/llama_cpp",
@@ -403,6 +404,7 @@ language_selector = { path = "crates/language_selector" }
 language_tools = { path = "crates/language_tools" }
 languages = { path = "crates/languages" }
 line_ending_selector = { path = "crates/line_ending_selector" }
+linear = { path = "crates/linear" }
 livekit_api = { path = "crates/livekit_api" }
 livekit_client = { path = "crates/livekit_client" }
 llama_cpp = { path = "crates/llama_cpp" }

@@ -188,6 +188,7 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         project_panel::init(cx);
         outline_panel::init(cx);
         worktree_panel::init(cx);
+        linear::init(cx);
         terminal_view::init(cx);
         image_viewer::init(cx);
         search::init(cx);

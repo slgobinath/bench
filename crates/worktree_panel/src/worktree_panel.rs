@@ -32,6 +32,7 @@ use git::repository::{CreateWorktreeTarget, Worktree as GitWorktree};
 use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
+use linear::{Issue, Linear, LinearEvent};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, Context, DismissEvent,
     Entity,
@@ -118,6 +119,20 @@ pub fn init(cx: &mut App) {
                 workspace.close_panel::<WorktreePanel>(window, cx);
             }
         });
+        // Deferred because working out which projects there are to create
+        // in reads every workspace of the window, this one included, and an
+        // action handler holds this one's lease.
+        workspace.register_action(|workspace, action: &linear::CreateWorktree, window, cx| {
+            let Some(panel) = workspace.panel::<WorktreePanel>(cx) else {
+                return;
+            };
+            let identifier = SharedString::from(action.identifier.clone());
+            window.defer(cx, move |window, cx| {
+                panel.update(cx, |panel, cx| {
+                    panel.add_worktree_for_issue(identifier, window, cx);
+                });
+            });
+        });
     })
     .detach();
 }
@@ -168,6 +183,11 @@ struct WorktreeRow {
     /// The agents running in this worktree's terminals, counted by what they
     /// are doing.
     agents: AgentSummary,
+    /// The branch this worktree has checked out; see [`RowPlan::branch`].
+    branch: Option<SharedString>,
+    /// The Linear issue the branch is named after, once Linear has said which
+    /// that is; see [`Linear::look_up_branches`].
+    issue: Option<Arc<Issue>>,
 }
 
 /// What is known about one project's pull requests; see
@@ -339,6 +359,11 @@ impl WorktreePanel {
         if let Some(tracker) = AgentTracker::try_global(cx) {
             subscriptions.push(cx.subscribe(&tracker, |_, _, _: &AgentsChanged, cx| cx.notify()));
         }
+        // A subscription for the same reason: Linear says when an issue a row
+        // shows has been looked up or has moved.
+        if let Some(linear) = Linear::global(cx) {
+            subscriptions.push(cx.subscribe(&linear, |_, _, _: &LinearEvent, cx| cx.notify()));
+        }
         // Only when this panel's own settings changed: the settings store
         // changes on every edit of the settings file, and redrawing for all of
         // them is the per-change cost the subscriptions above avoid.
@@ -442,6 +467,8 @@ impl WorktreePanel {
             })
             .collect();
 
+        hide_worktrees_inside_other_checkouts(&mut rows);
+
         // Ordered by name so a row does not move when an unrelated worktree is
         // opened or closed.
         rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -504,6 +531,7 @@ impl WorktreePanel {
         let switch_from = open_worktrees.first().map(|open| open.workspace.clone());
         let pull_requests = self.scanned_pull_requests(key, cx);
         let tracker = AgentTracker::try_global(cx);
+        let linear = Linear::global(cx);
 
         plan_rows(&worktrees, &open_roots, anchor.as_deref())
             .into_iter()
@@ -546,6 +574,12 @@ impl WorktreePanel {
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).summary_for(root))
                         .unwrap_or_default(),
+                    issue: plan
+                        .branch
+                        .as_ref()
+                        .zip(linear.as_ref())
+                        .and_then(|(branch, linear)| linear.read(cx).issue_for_branch(branch)),
+                    branch: plan.branch,
                     root: plan.root,
                 })
             })
@@ -956,11 +990,15 @@ impl WorktreePanel {
     /// a modal opened on a workspace the window is not showing is a modal
     /// nobody sees. Deferred and without `&mut Self` for the reason given on
     /// [`Self::activate`].
+    ///
+    /// With an `issue`, the modal opens already linked to it and named after
+    /// its branch; otherwise it offers to link one.
     fn add_worktree(
         &mut self,
         from: Entity<Workspace>,
         repository: Entity<Repository>,
         key: ProjectGroupKey,
+        issue: Option<Arc<Issue>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -977,13 +1015,132 @@ impl WorktreePanel {
             let host = from.clone();
             host.update(cx, |host, cx| {
                 host.toggle_modal(window, cx, move |window, cx| {
-                    NameWorktree::new(directory, window, cx, move |name, window, cx| {
+                    NameWorktree::new(directory, issue, window, cx, move |name, issue, window, cx| {
                         let from = from.clone();
                         let repository = repository.clone();
                         let key = key.clone();
                         panel
                             .update(cx, |panel, cx| {
-                                panel.create_worktree(from, repository, key, name, window, cx);
+                                panel.create_worktree(
+                                    from, repository, key, name, issue, window, cx,
+                                );
+                            })
+                            .ok();
+                    })
+                });
+            });
+        });
+    }
+
+    /// Creates a worktree for a Linear issue: asks which project it is for
+    /// when the window has more than one, then asks for the name as
+    /// [`Self::add_worktree`] does, with the issue already linked.
+    fn add_worktree_for_issue(
+        &mut self,
+        identifier: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(linear) = Linear::global(cx) else {
+            return;
+        };
+        // Only projects a worktree can be made in: an open one, since making
+        // one is something the repository does.
+        let targets: Vec<ProjectTarget> = self
+            .tree(cx)
+            .into_iter()
+            .filter_map(|row| {
+                Some(ProjectTarget {
+                    from: row
+                        .worktrees
+                        .iter()
+                        .find_map(|worktree| worktree.switch_from.clone())?,
+                    repository: row.repository?,
+                    name: row.name,
+                    key: row.key,
+                })
+            })
+            .collect();
+        let issue = linear.read_with(cx, |linear, cx| linear.issue(&identifier, cx));
+        let workspace = self.workspace.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let issue = match issue.await {
+                Ok(issue) => issue,
+                Err(error) => {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            format!("Could not find the Linear issue {identifier}: {error:#}"),
+                            cx,
+                        );
+                    })?;
+                    return anyhow::Ok(());
+                }
+            };
+            this.update_in(cx, |this, window, cx| {
+                let mut targets = targets;
+                match targets.len() {
+                    0 => {
+                        workspace
+                            .update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    "Open a project to create a worktree in.".to_string(),
+                                    cx,
+                                );
+                            })
+                            .ok();
+                    }
+                    1 => {
+                        let target = targets.remove(0);
+                        this.add_worktree(
+                            target.from,
+                            target.repository,
+                            target.key,
+                            Some(issue),
+                            window,
+                            cx,
+                        );
+                    }
+                    _ => this.choose_project(targets, issue, window, cx),
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Asks which project a worktree for `issue` goes in. Opened on the
+    /// workspace the window is showing, deferred for the reason given on
+    /// [`Self::activate`].
+    fn choose_project(
+        &mut self,
+        targets: Vec<ProjectTarget>,
+        issue: Arc<Issue>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let multi_workspace = self.multi_workspace.clone();
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let Some(host) = multi_workspace
+                .upgrade()
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+            else {
+                return;
+            };
+            host.update(cx, |host, cx| {
+                host.toggle_modal(window, cx, move |_window, cx| {
+                    ChooseProject::new(targets, issue.clone(), cx, move |target, window, cx| {
+                        let issue = issue.clone();
+                        panel
+                            .update(cx, |panel, cx| {
+                                panel.add_worktree(
+                                    target.from,
+                                    target.repository,
+                                    target.key,
+                                    Some(issue),
+                                    window,
+                                    cx,
+                                );
                             })
                             .ok();
                     })
@@ -1002,12 +1159,17 @@ impl WorktreePanel {
     ///
     /// `git worktree add` creates the directories on the way to the worktree,
     /// so the project's directory under `~/bench` need not exist yet.
+    ///
+    /// A worktree made for a Linear issue also tells Linear that work on it has
+    /// begun; see [`Linear::start_issue`]. The worktree is made first, and a
+    /// failure there is reported without undoing it.
     fn create_worktree(
         &mut self,
         from: Entity<Workspace>,
         repository: Entity<Repository>,
         key: ProjectGroupKey,
         name: SharedString,
+        issue: Option<Arc<Issue>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1020,10 +1182,32 @@ impl WorktreePanel {
                 .await?;
 
             match created {
-                Ok(()) => this.update_in(cx, |this, window, cx| {
-                    this.rediscover(project_root(&key), cx);
-                    this.open_worktree(Some(from), key, path, name, window, cx);
-                })?,
+                Ok(()) => {
+                    this.update_in(cx, |this, window, cx| {
+                        this.rediscover(project_root(&key), cx);
+                        this.open_worktree(Some(from.clone()), key, path, name, window, cx);
+                    })?;
+                    let started = issue.and_then(|issue| {
+                        let linear = cx.update(|_, cx| Linear::global(cx)).ok()??;
+                        let identifier = issue.identifier.clone();
+                        let started =
+                            linear.update(cx, |linear, cx| linear.start_issue(issue, cx));
+                        Some((identifier, started))
+                    });
+                    if let Some((identifier, started)) = started
+                        && let Err(error) = started.await
+                    {
+                        log::error!("starting the Linear issue {identifier}: {error:#}");
+                        from.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!(
+                                    "Created the worktree, but could not update {identifier} in Linear: {error:#}"
+                                ),
+                                cx,
+                            );
+                        });
+                    }
+                }
                 Err(refused) => {
                     log::error!("creating the worktree {}: {refused:#}", path.display());
                     from.update(cx, |workspace, cx| {
@@ -1273,6 +1457,7 @@ impl WorktreePanel {
                                         from.clone(),
                                         repository.clone(),
                                         add_key.clone(),
+                                        None,
                                         window,
                                         cx,
                                     );
@@ -1321,26 +1506,41 @@ impl WorktreePanel {
             .indent_step_size(px(12.))
             .selectable(true)
             .toggle_state(row.is_active)
-            .start_slot(
-                Icon::new(IconName::GitBranch)
+            .start_slot(match &row.issue {
+                // A worktree made for an issue is about the issue: where it
+                // stands says more than that it is a branch, which every row
+                // is. Drawn as Linear draws it, so the two panels agree.
+                Some(issue) => {
+                    let identifier = issue.identifier.clone();
+                    div()
+                        .id(("issue-state", index))
+                        .child(render_issue_state(issue))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.open_issue(identifier.clone(), window, cx);
+                        }))
+                        .into_any_element()
+                }
+                None => Icon::new(IconName::GitBranch)
                     .size(IconSize::Small)
-                    // What became of the branch outranks which worktree you
-                    // are in: the row you are in is already the tinted one,
-                    // and a pull request is the thing you cannot see from
-                    // here. Green while it is open, purple once it is merged.
-                    .color(match row.pull_request {
-                        Some(state) => pull_request_color(state),
+                    .color(if row.is_active {
                         // The worktree the window is showing. One accented
                         // icon says which of them you are in from across the
                         // tree.
-                        None if row.is_active => Color::Accent,
-                        None if is_open => Color::Muted,
+                        Color::Accent
+                    } else if is_open {
+                        Color::Muted
+                    } else {
                         // A worktree that exists but is not open in this
                         // window: the row is there to be clicked, and should
                         // not read as one of the window's own.
-                        None => Color::Ignored,
-                    }),
-            )
+                        Color::Ignored
+                    })
+                    .into_any_element(),
+            })
+            .when_some(row_tooltip(row), |this, tooltip| {
+                this.tooltip(Tooltip::text(tooltip))
+            })
             .child(
                 h_flex()
                     .w_full()
@@ -1348,19 +1548,41 @@ impl WorktreePanel {
                     .gap_1p5()
                     .justify_between()
                     .child(
-                        // Both of these truncate: a worktree named after a long
-                        // branch would otherwise widen the row past the panel
-                        // and carry the delete button off the edge with it.
-                        Label::new(row.name.clone())
-                            .single_line()
-                            .truncate()
-                            .color(if is_open {
-                                Color::Default
-                            } else {
-                                Color::Muted
-                            }),
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .children(row.issue.as_ref().map(|issue| {
+                                self.render_issue_identifier(issue, index, cx)
+                            }))
+                            .child(
+                                // Truncated: a worktree named after a long
+                                // branch would otherwise widen the row past the
+                                // panel and carry the delete button off the
+                                // edge with it.
+                                Label::new(match &row.issue {
+                                    Some(issue) => {
+                                        name_without_identifier(&row.name, &issue.identifier)
+                                    }
+                                    None => row.name.clone(),
+                                })
+                                .single_line()
+                                .truncate()
+                                .color(if is_open {
+                                    Color::Default
+                                } else {
+                                    Color::Muted
+                                }),
+                            ),
                     )
-                    .children(render_agents(index, &row.agents)),
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .gap_1p5()
+                            .children(row.pull_request.map(|state| {
+                                render_pull_request(state, index)
+                            }))
+                            .children(render_agents(index, &row.agents)),
+                    ),
             )
             .end_slot_on_hover(
                 h_flex().when_some(delete, |this, (repository, root, workspace)| {
@@ -1393,13 +1615,109 @@ impl WorktreePanel {
     }
 }
 
+impl WorktreePanel {
+    /// The identifier of the Linear issue a worktree's branch is named after.
+    /// Clicking it opens the issue rather than the worktree.
+    fn render_issue_identifier(
+        &self,
+        issue: &Issue,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let identifier = issue.identifier.clone();
+        div()
+            .id(("issue", index))
+            .flex_none()
+            .child(
+                Label::new(issue.identifier.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.open_issue(identifier.clone(), window, cx);
+            }))
+    }
+
+    /// Opens an issue's tab in the worktree the window is showing. Deferred
+    /// for the reason given on [`Self::activate`]: focusing the tab walks the
+    /// docks, and a click handler holds this panel's lease.
+    fn open_issue(&mut self, identifier: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+        let multi_workspace = self.multi_workspace.clone();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = multi_workspace
+                .upgrade()
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+            else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                linear::open_issue(workspace, identifier, window, cx);
+            });
+        });
+    }
+}
+
+/// A Linear issue's state, as Linear draws it: its group's icon in the colour
+/// the team gave the state.
+fn render_issue_state(issue: &Issue) -> Icon {
+    Icon::new(issue.state.kind.icon())
+        .size(IconSize::Small)
+        .map(|icon| match issue.state.color() {
+            Some(color) => icon.color(Color::Custom(color)),
+            None => icon.color(Color::Muted),
+        })
+}
+
+/// What became of the pull request opened from a worktree's branch. At the end
+/// of the row, with the agents: both are what is happening to the worktree,
+/// where the icon at the start says what it is.
+fn render_pull_request(state: PullRequestState, index: usize) -> impl IntoElement {
+    div()
+        .id(("pull-request", index))
+        .child(
+            Icon::new(IconName::PullRequest)
+                .size(IconSize::XSmall)
+                .color(pull_request_color(state)),
+        )
+        .tooltip(Tooltip::text(format!("Pull request: {}", state.label())))
+}
+
+/// What a worktree row says on hover: the branch in full, since a linked row
+/// shows it shortened, and the issue it is for.
+fn row_tooltip(row: &WorktreeRow) -> Option<String> {
+    let issue = row.issue.as_ref()?;
+    let branch = row.branch.as_ref().unwrap_or(&row.name);
+    Some(format!(
+        "{branch}\n{} · {}: {}",
+        issue.identifier, issue.state.name, issue.title
+    ))
+}
+
+/// A linked worktree's name with the issue identifier it starts with taken
+/// off, since the row already shows the identifier: `RB-146-connect-extras`
+/// is `connect-extras`, and so is `dev-rb-146-connect-extras`, whose
+/// directory name flattened a `dev/` branch prefix. A name that is nothing but
+/// the identifier, or does not carry it, is left whole.
+fn name_without_identifier(name: &str, identifier: &str) -> SharedString {
+    let lowercase_name = name.to_ascii_lowercase();
+    let lowercase_identifier = identifier.to_ascii_lowercase();
+    let rest = lowercase_name
+        .find(&lowercase_identifier)
+        .filter(|start| *start == 0 || name[..*start].ends_with(['-', '/']))
+        .and_then(|start| name.get(start + identifier.len()..))
+        .map(|rest| rest.trim_start_matches(['-', '_', '/']))
+        .filter(|rest| !rest.is_empty());
+    SharedString::from(rest.unwrap_or(name).to_string())
+}
+
 /// The height of a row, project and worktree alike.
 ///
 /// Taller than what the list item's own padding gives it, which is sized for a
 /// long list read at a glance. This one is short — a handful of projects and
 /// their worktrees — and its rows are click targets you aim at, so they are
 /// given the room. In rems, so that it follows the UI font size.
-const ROW_HEIGHT: Rems = Rems(1.875);
+const ROW_HEIGHT: Rems = Rems(2.25);
 
 /// How long the chevron takes to turn. Short enough that expanding still feels
 /// like a direct response to the click, long enough to be seen.
@@ -1596,51 +1914,326 @@ fn plan_rows(
     plans
 }
 
-/// Asks for the name of a new worktree.
+/// Asks for the name of a new worktree, and which Linear issue it is for.
 ///
-/// One field, because the name is the whole answer: it names the directory the
-/// worktree is created in and the branch that is created with it. Where it goes
-/// is shown rather than asked; see [`worktrees_directory`].
+/// The name is the whole answer: it names the directory the worktree is created
+/// in and the branch that is created with it. Where it goes is shown rather
+/// than asked; see [`worktrees_directory`].
+///
+/// With Linear connected, an issue can be linked first, and linking one names
+/// the worktree after the branch Linear suggests for it. The name stays
+/// editable — the issue is linked through the branch name, so a name that no
+/// longer carries the identifier is a worktree Linear will not find, but that
+/// is the user's call to make.
 struct NameWorktree {
     name: Entity<InputField>,
     /// The project's worktree directory, shown so that the layout Bench
     /// imposes is visible before the worktree is made.
     directory: PathBuf,
-    confirm: Box<dyn Fn(SharedString, &mut Window, &mut App)>,
+    /// Absent when Linear is not connected, and the modal is just the name.
+    issue_search: Option<IssueSearch>,
+    linked: Option<Arc<Issue>>,
+    confirm: Box<dyn Fn(SharedString, Option<Arc<Issue>>, &mut Window, &mut App)>,
 }
+
+struct IssueSearch {
+    linear: Entity<Linear>,
+    field: Entity<InputField>,
+    results: Vec<Arc<Issue>>,
+    selected: usize,
+    searching: bool,
+    error: Option<SharedString>,
+    _search: Task<()>,
+    _subscription: gpui::Subscription,
+}
+
+/// How many issues the picker lists. It is a picker, not the panel: past a
+/// handful, typing is quicker than scrolling.
+const ISSUE_RESULTS: usize = 6;
+
+/// How long typing has to pause before the picker searches.
+const ISSUE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 
 impl NameWorktree {
     fn new(
         directory: PathBuf,
+        issue: Option<Arc<Issue>>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        confirm: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+        confirm: impl Fn(SharedString, Option<Arc<Issue>>, &mut Window, &mut App) + 'static,
     ) -> Self {
-        Self {
-            name: cx.new(|cx| InputField::new(window, cx, "Worktree name")),
-            directory,
-            confirm: Box::new(confirm),
+        let name = cx.new(|cx| InputField::new(window, cx, "Worktree name"));
+        if let Some(issue) = &issue {
+            name.read(cx)
+                .editor()
+                .clone()
+                .set_text(&issue.branch_name, window, cx);
         }
+
+        let issue_search = Linear::global(cx)
+            .filter(|linear| linear.read(cx).is_connected())
+            .map(|linear| {
+                let field = cx.new(|cx| {
+                    InputField::new(window, cx, "Link a Linear issue…")
+                        .start_icon(IconName::MagnifyingGlass)
+                });
+                let modal = cx.entity().downgrade();
+                let editor = field.read(cx).editor().clone();
+                let subscription = editor.subscribe(
+                    Box::new(move |event, _window, cx| {
+                        if event == ui_input::ErasedEditorEvent::BufferEdited {
+                            modal
+                                .update(cx, |modal, cx| modal.search_issues(true, cx))
+                                .ok();
+                        }
+                    }),
+                    window,
+                    cx,
+                );
+                IssueSearch {
+                    linear,
+                    field,
+                    results: Vec::new(),
+                    selected: 0,
+                    searching: false,
+                    error: None,
+                    _search: Task::ready(()),
+                    _subscription: subscription,
+                }
+            });
+
+        let mut this = Self {
+            name,
+            directory,
+            issue_search,
+            linked: issue,
+            confirm: Box::new(confirm),
+        };
+        if this.linked.is_none() {
+            this.search_issues(false, cx);
+        }
+        this
+    }
+
+    /// Asks Linear for issues matching the search box. Empty, that is your own
+    /// unfinished issues, so the likeliest ones are there before anything is
+    /// typed.
+    fn search_issues(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        let Some(search) = &mut self.issue_search else {
+            return;
+        };
+        let query = search.field.read(cx).text(cx);
+        search.searching = true;
+        search._search = cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(ISSUE_SEARCH_DEBOUNCE).await;
+            }
+            let Ok(found) = this.update(cx, |this, cx| {
+                this.issue_search
+                    .as_ref()
+                    .map(|search| search.linear.read(cx).search(&query, cx))
+            }) else {
+                return;
+            };
+            let Some(found) = found else {
+                return;
+            };
+            let found = found.await;
+            this.update(cx, |this, cx| {
+                let Some(search) = &mut this.issue_search else {
+                    return;
+                };
+                search.searching = false;
+                search.selected = 0;
+                match found {
+                    Ok(mut issues) => {
+                        issues.truncate(ISSUE_RESULTS);
+                        search.results = issues;
+                        search.error = None;
+                    }
+                    Err(error) => {
+                        search.results.clear();
+                        search.error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        cx.notify();
+    }
+
+    /// Links the worktree to `issue` and names it after the issue's branch,
+    /// then moves on to the name, which is the one thing left to confirm.
+    fn link(&mut self, issue: Arc<Issue>, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.name.read(cx).editor().clone();
+        editor.set_text(&issue.branch_name, window, cx);
+        self.linked = Some(issue);
+        window.focus(&editor.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn unlink(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.linked = None;
+        if let Some(search) = &self.issue_search {
+            window.focus(&search.field.focus_handle(cx), cx);
+        }
+        cx.notify();
+    }
+
+    /// Whether the issue search is where the keyboard is, which is when Enter
+    /// and the arrow keys are about its results rather than the name.
+    fn searching_issues(&self, window: &Window, cx: &App) -> bool {
+        self.linked.is_none()
+            && self
+                .issue_search
+                .as_ref()
+                .is_some_and(|search| search.field.focus_handle(cx).contains_focused(window, cx))
     }
 
     fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.searching_issues(window, cx) {
+            let selected = self
+                .issue_search
+                .as_ref()
+                .and_then(|search| search.results.get(search.selected).cloned());
+            if let Some(issue) = selected {
+                self.link(issue, window, cx);
+            }
+            return;
+        }
+
         let name = self.name.read(cx).text(cx).trim().to_owned();
         // Nothing to do with a name git would refuse but wait for a better one.
         if !is_branch_name(&name) {
             return;
         }
-        (self.confirm)(name.into(), window, cx);
+        (self.confirm)(name.into(), self.linked.clone(), window, cx);
         cx.emit(DismissEvent);
     }
 
     fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
         cx.emit(DismissEvent);
     }
+
+    fn select_next(&mut self, _: &menu::SelectNext, window: &mut Window, cx: &mut Context<Self>) {
+        self.move_selection(1, window, cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.move_selection(-1, window, cx);
+    }
+
+    fn move_selection(&mut self, by: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.searching_issues(window, cx) {
+            cx.propagate();
+            return;
+        }
+        let Some(search) = &mut self.issue_search else {
+            return;
+        };
+        let count = search.results.len();
+        if count == 0 {
+            return;
+        }
+        search.selected = (search.selected as isize + by).rem_euclid(count as isize) as usize;
+        cx.notify();
+    }
+
+    fn render_linked(&self, issue: &Issue, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .min_w_0()
+            .gap_1p5()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(render_issue_state(issue))
+            .child(
+                Label::new(issue.identifier.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Label::new(issue.title.clone())
+                        .size(LabelSize::Small)
+                        .single_line()
+                        .truncate(),
+                ),
+            )
+            .child(
+                IconButton::new("unlink-issue", IconName::Close)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Unlink Issue"))
+                    .on_click(cx.listener(|this, _, window, cx| this.unlink(window, cx))),
+            )
+    }
+
+    fn render_search(&self, search: &IssueSearch, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = if let Some(error) = &search.error {
+            Some(Label::new(error.clone()).color(Color::Error))
+        } else if search.results.is_empty() {
+            Some(
+                Label::new(if search.searching {
+                    "Searching…"
+                } else {
+                    "No issues found"
+                })
+                .color(Color::Muted),
+            )
+        } else {
+            None
+        };
+
+        v_flex()
+            .gap_1()
+            .child(search.field.clone())
+            .children(status.map(|status| div().px_2().child(status.size(LabelSize::Small))))
+            .children(search.results.iter().enumerate().map(|(index, issue)| {
+                let chosen = issue.clone();
+                ListItem::new(("issue-result", index))
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(index == search.selected)
+                    .start_slot(render_issue_state(issue))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .child(
+                                Label::new(issue.identifier.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                Label::new(issue.title.clone())
+                                    .size(LabelSize::Small)
+                                    .single_line()
+                                    .truncate(),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.link(chosen.clone(), window, cx);
+                    }))
+            }))
+    }
 }
 
 impl Focusable for NameWorktree {
+    /// Where the modal opens: on the issue search when there is an issue to
+    /// pick, otherwise on the name.
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.name.focus_handle(cx)
+        match &self.issue_search {
+            Some(search) if self.linked.is_none() => search.field.focus_handle(cx),
+            _ => self.name.focus_handle(cx),
+        }
     }
 }
 
@@ -1650,22 +2243,142 @@ impl ModalView for NameWorktree {}
 
 impl Render for NameWorktree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let issue_section = match (&self.linked, &self.issue_search) {
+            (Some(issue), _) => Some(self.render_linked(issue, cx).into_any_element()),
+            (None, Some(search)) => Some(self.render_search(search, cx).into_any_element()),
+            (None, None) => None,
+        };
         v_flex()
             .key_context("NameWorktree")
-            .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::confirm))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
             .elevation_3(cx)
             .w(rems(34.))
             .p_3()
             .gap_2()
             .child(Label::new("New Worktree"))
+            .children(issue_section)
             .child(self.name.clone())
             .child(
                 Label::new(format!("{}/<name>", self.directory.display()))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
+    }
+}
+
+/// A project a worktree can be made in, for [`ChooseProject`].
+struct ProjectTarget {
+    name: SharedString,
+    from: Entity<Workspace>,
+    repository: Entity<Repository>,
+    key: ProjectGroupKey,
+}
+
+/// Asks which project a worktree for a Linear issue goes in. An issue does
+/// not say which repository its work happens in, and a window can hold
+/// several.
+struct ChooseProject {
+    issue: Arc<Issue>,
+    targets: Vec<ProjectTarget>,
+    selected: usize,
+    focus_handle: FocusHandle,
+    choose: Box<dyn Fn(ProjectTarget, &mut Window, &mut App)>,
+}
+
+impl ChooseProject {
+    fn new(
+        targets: Vec<ProjectTarget>,
+        issue: Arc<Issue>,
+        cx: &mut Context<Self>,
+        choose: impl Fn(ProjectTarget, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            issue,
+            targets,
+            selected: 0,
+            focus_handle: cx.focus_handle(),
+            choose: Box::new(choose),
+        }
+    }
+
+    fn choose_index(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if index >= self.targets.len() {
+            return;
+        }
+        let target = self.targets.remove(index);
+        cx.emit(DismissEvent);
+        (self.choose)(target, window, cx);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        self.choose_index(self.selected, window, cx);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = (self.selected + 1) % self.targets.len().max(1);
+        cx.notify();
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = self.targets.len().max(1);
+        self.selected = (self.selected + count - 1) % count;
+        cx.notify();
+    }
+}
+
+impl Focusable for ChooseProject {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for ChooseProject {}
+
+impl ModalView for ChooseProject {}
+
+impl Render for ChooseProject {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("ChooseProject")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .child(Label::new(format!(
+                "Create a worktree for {} in…",
+                self.issue.identifier
+            )))
+            .children(self.targets.iter().enumerate().map(|(index, target)| {
+                ListItem::new(("project-target", index))
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(index == self.selected)
+                    .start_slot(
+                        Icon::new(IconName::Folder)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(Label::new(target.name.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.choose_index(index, window, cx);
+                    }))
+            }))
     }
 }
 
@@ -1746,6 +2459,49 @@ fn group_repository(
         .find(|repository| anchor.is_some() && repository_anchor(repository, cx) == anchor)
         .or_else(|| repositories.first())
         .cloned()
+}
+
+/// Drops the worktrees that live inside a worktree of another project.
+///
+/// A project that keeps clones of other repositories inside it — a
+/// `repos/` folder listed in a manifest — gets a copy of each clone inside
+/// every one of its worktrees, and each copy is a git worktree of that clone.
+/// Once the clone is a project of its own, every one of those copies is in
+/// its worktree list, all named after the folder they sit in. They are part
+/// of the worktree that holds them, not worktrees to switch to, so they are
+/// not rows.
+///
+/// Only when the checkout directly holding it is another *project's*: a
+/// repository that keeps its worktrees inside its own checkout, such as
+/// `.worktrees/`, lists them as usual. The repository's own checkout and anything the window has open stay
+/// listed, as they do for the settings.
+fn hide_worktrees_inside_other_checkouts(rows: &mut [RepositoryRow]) {
+    let checkouts: Vec<(usize, PathBuf)> = rows
+        .iter()
+        .enumerate()
+        .flat_map(|(project, row)| {
+            row.worktrees
+                .iter()
+                .filter_map(move |worktree| Some((project, worktree.root.clone()?)))
+        })
+        .collect();
+    for (project, row) in rows.iter_mut().enumerate() {
+        row.worktrees.retain(|worktree| {
+            let Some(root) = worktree.root.as_deref() else {
+                return true;
+            };
+            // The checkout it is directly inside. A clone inside a project
+            // can keep worktrees in its own checkout too, and those are inside
+            // the outer project's checkout as well; the nearest one decides.
+            let holder = checkouts
+                .iter()
+                .filter(|(_, checkout)| root != checkout && root.starts_with(checkout))
+                .max_by_key(|(_, checkout)| checkout.components().count());
+            worktree.is_main
+                || worktree.workspace.is_some()
+                || holder.is_none_or(|(holder, _)| *holder == project)
+        });
+    }
 }
 
 /// The directory a project group stands for: the main worktree of the
@@ -2026,6 +2782,16 @@ impl Render for WorktreePanel {
         let filter = self.filter(cx);
         let roots: Vec<PathBuf> = tree.iter().filter_map(|row| project_root(&row.key)).collect();
         self.scan_pull_requests(&roots, cx);
+        if let Some(linear) = Linear::global(cx) {
+            let branches: Vec<SharedString> = tree
+                .iter()
+                .flat_map(|row| row.worktrees.iter())
+                .filter_map(|worktree| worktree.branch.clone())
+                .collect();
+            linear.update(cx, |linear, cx| {
+                linear.look_up_branches(branches.iter().map(|branch| branch.as_ref()), cx);
+            });
+        }
         let mut worktree_index = 0;
 
         v_flex()
@@ -2866,6 +3632,120 @@ mod tests {
                 "outer".to_owned(),
                 vec!["main".to_owned(), "outer-fix".to_owned()]
             )]
+        );
+    }
+
+    #[test]
+    fn a_linked_worktree_is_named_without_its_identifier() {
+        for (name, identifier, expected) in [
+            (
+                "RB-146-connect-extras-and-books-by-group",
+                "RB-146",
+                "connect-extras-and-books-by-group",
+            ),
+            (
+                "dev-rb-152-connect-location-details",
+                "RB-152",
+                "connect-location-details",
+            ),
+            ("rb-134-new-rentbee-website-v1", "RB-134", "new-rentbee-website-v1"),
+            ("RB-146", "RB-146", "RB-146"),
+            ("fix-login", "RB-146", "fix-login"),
+            // Only where an identifier starts: not inside another word.
+            ("arb-146-thing", "RB-146", "arb-146-thing"),
+        ] {
+            assert_eq!(
+                name_without_identifier(name, identifier).as_ref(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A clone kept inside a project gets a copy in each of the project's
+    /// worktrees, and each copy is a worktree of the clone. Once the clone is
+    /// a project of its own, those copies are part of the outer project's
+    /// worktrees, not rows of their own — unless the window has one open.
+    /// Worktrees a repository keeps inside its own checkout are still listed.
+    #[gpui::test]
+    async fn worktrees_inside_another_projects_worktree_are_not_listed(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree(
+            "/outer",
+            json!({
+                ".git": {},
+                "file.txt": "hi",
+                "repos": { "inner": { ".git": {}, "file.txt": "hi" } },
+            }),
+        )
+        .await;
+        fs.insert_tree("/work/fix/repos/inner", json!({ "file.txt": "hi" }))
+            .await;
+        fs.insert_tree("/work/other/repos/inner", json!({ "file.txt": "hi" }))
+            .await;
+        for (path, branch) in [("/work/fix", "fix"), ("/work/other", "other")] {
+            fs.add_linked_worktree_for_repo(
+                Path::new("/outer/.git"),
+                false,
+                worktree(path, branch, false),
+            )
+            .await;
+        }
+        for (path, branch) in [
+            ("/work/fix/repos/inner", "inner-fix"),
+            ("/work/other/repos/inner", "inner-other"),
+            ("/outer/repos/inner/.worktrees/own", "own"),
+        ] {
+            fs.add_linked_worktree_for_repo(
+                Path::new("/outer/repos/inner/.git"),
+                false,
+                worktree(path, branch, false),
+            )
+            .await;
+        }
+
+        for root in ["/outer", "/work/fix/repos/inner"] {
+            let project = Project::test(fs.clone(), [root.as_ref()], &mut cx).await;
+            multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project, window, cx)
+            });
+        }
+        cx.run_until_parked();
+
+        let rows = panels[0].read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .map(|row| {
+                    let roots: Vec<PathBuf> = row
+                        .worktrees
+                        .iter()
+                        .filter_map(|worktree| worktree.root.clone())
+                        .collect();
+                    (row.name.to_string(), roots)
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let inner = rows
+            .iter()
+            .find(|(name, _)| name == "inner")
+            .map(|(_, roots)| roots.clone())
+            .expect("the inner clone is a project of its own");
+        assert!(inner.contains(&PathBuf::from("/outer/repos/inner")));
+        assert!(
+            inner.contains(&PathBuf::from("/work/fix/repos/inner")),
+            "the copy the window has open stays listed"
+        );
+        assert!(
+            inner.contains(&PathBuf::from("/outer/repos/inner/.worktrees/own")),
+            "a worktree inside its own repository's checkout stays listed"
+        );
+        assert!(
+            !inner.contains(&PathBuf::from("/work/other/repos/inner")),
+            "a copy inside another project's worktree is not a row"
         );
     }
 

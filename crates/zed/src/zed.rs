@@ -79,6 +79,7 @@ use settings::{
 };
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
+use linear::LinearPanel;
 use worktree_panel::WorktreePanel;
 
 use std::{
@@ -440,7 +441,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
     init_reduce_motion(cx);
     init_global_config_error_notifications(cx);
 
-    cx.observe_new(|_multi_workspace: &mut MultiWorkspace, window, cx| {
+    cx.observe_new(|multi_workspace: &mut MultiWorkspace, window, cx| {
         let Some(window) = window else {
             return;
         };
@@ -448,8 +449,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         #[cfg(feature = "track-project-leak")]
         {
             let multi_workspace_handle = cx.weak_entity();
-            let workspace_handle = _multi_workspace.workspace().downgrade();
-            let project_handle = _multi_workspace.workspace().read(cx).project().downgrade();
+            let workspace_handle = multi_workspace.workspace().downgrade();
+            let project_handle = multi_workspace.workspace().read(cx).project().downgrade();
             let window_id_2 = window.window_handle().window_id();
             cx.on_window_closed(move |cx, window_id| {
                 let multi_workspace_handle = multi_workspace_handle.clone();
@@ -501,10 +502,15 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         });
 
         let multi_workspace_handle = cx.entity();
+        // The worktree the window was showing before a switch. The event's
+        // `source_workspace` is whatever the caller of `activate` chose to
+        // pass, and most pass nothing, so it cannot say which worktree was
+        // left.
+        let mut previous_workspace = multi_workspace.workspace().downgrade();
         cx.subscribe_in(
             &multi_workspace_handle,
             window,
-            |this, _multi_workspace, event: &workspace::MultiWorkspaceEvent, window, cx| {
+            move |this, _multi_workspace, event: &workspace::MultiWorkspaceEvent, window, cx| {
                 let workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace } =
                     event
                 else {
@@ -513,6 +519,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 
                 let active_workspace = this.workspace().clone();
                 let source_workspace = source_workspace.clone();
+                let left_workspace = std::mem::replace(
+                    &mut previous_workspace,
+                    active_workspace.downgrade(),
+                )
+                .upgrade();
                 active_workspace.update(cx, |workspace, cx| {
                     if let Some(ref source) = source_workspace {
                         if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
@@ -524,6 +535,11 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                                 );
                             });
                         }
+                    }
+
+                    if let Some(left) = &left_workspace {
+                        follow_dock_of::<WorktreePanel>(left, workspace, window, cx);
+                        follow_dock_of::<LinearPanel>(left, workspace, window, cx);
                     }
 
                     ensure_agent_panel_for_workspace(workspace, source_workspace, window, cx)
@@ -782,6 +798,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
+        let linear_panel = LinearPanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -806,6 +823,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(linear_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
@@ -867,6 +885,55 @@ fn setup_or_teardown_ai_panel<P: Panel>(
 /// the agent panel goes by default. Two panels in one dock with the same
 /// priority is an assertion failure in debug builds — the app will not start.
 const AGENT_PANEL: bool = false;
+
+/// Carries the dock that holds panel `P` over from the worktree you left to the
+/// one you switched to: whether it is open, and which of its panels it shows.
+///
+/// Bench holds a workspace per worktree, and a dock's state belongs to its
+/// workspace, so without this each worktree remembers its own: close the
+/// worktree panel in one, switch to another you had open before, and it is
+/// back. The docks passed here hold panels that are about the window rather
+/// than the worktree, so they follow the window. A worktree whose panels are
+/// created fresh gets the same answer from `Panel::starts_open`; this is the
+/// case where they already exist.
+///
+/// The whole dock rather than `P` alone, because panels share a dock: closing
+/// one panel's dock closes it under every other panel too, and only the dock
+/// as a whole can say what should be showing.
+fn follow_dock_of<P: workspace::Panel>(
+    source: &Entity<Workspace>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    if source.entity_id() == cx.entity_id() {
+        return;
+    }
+    let Some(dock) = workspace
+        .all_docks()
+        .into_iter()
+        .find(|dock| dock.read(cx).panel_index_for_type::<P>().is_some())
+        .cloned()
+    else {
+        return;
+    };
+    let source_dock = source.read(cx).dock_at_position(dock.read(cx).position());
+    let source_dock = source_dock.read(cx);
+    let open = source_dock.is_open();
+    let showing = source_dock
+        .active_panel()
+        .map(|panel| panel.persistent_name());
+    dock.update(cx, |dock, cx| {
+        if let Some(index) =
+            showing.and_then(|showing| dock.panel_index_for_persistent_name(showing, cx))
+        {
+            dock.activate_panel(index, window, cx);
+        }
+        if dock.is_open() != open {
+            dock.set_open(open, window, cx);
+        }
+    });
+}
 
 fn ensure_agent_panel_for_workspace(
     workspace: &mut Workspace,
@@ -5913,6 +5980,7 @@ mod tests {
                 "action",
                 "activity_indicator",
                 "agent",
+                "agents",
                 "agents_sidebar",
                 "app_menu",
                 "assistant",
@@ -5959,6 +6027,7 @@ mod tests {
                 "language_selector",
                 "welcome",
                 "line_ending_selector",
+                "linear",
                 "lsp_command_selector",
                 "lsp_tool",
                 "markdown",
@@ -6197,6 +6266,7 @@ mod tests {
             project_panel::init(cx);
             outline_panel::init(cx);
             worktree_panel::init(cx);
+            linear::init(cx);
             agent_tracker::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);
@@ -7212,6 +7282,106 @@ mod tests {
             true,
             "Case 3: The window with the cancelled prompt should stay open"
         );
+    }
+
+    /// Closing the worktree or Linear panel in one worktree and switching to
+    /// another that already has its own workspace must not bring it back, and
+    /// opening it must carry across the same way.
+    #[gpui::test]
+    async fn test_panel_visibility_follows_the_window_across_worktrees(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        cx.update(init);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree(path!("/"), json!({ "dir1": {}, "dir2": {} }))
+            .await;
+
+        let project1 = Project::test(app_state.fs.clone(), [path!("/dir1").as_ref()], cx).await;
+        let project2 = Project::test(app_state.fs.clone(), [path!("/dir2").as_ref()], cx).await;
+        let window = cx.add_window({
+            let project = project1.clone();
+            |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace1 = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .unwrap();
+        let workspace2 = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.test_add_workspace(project2.clone(), window, cx)
+            })
+            .unwrap();
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.activate(workspace2.clone(), None, window, cx);
+                multi_workspace.activate(workspace1.clone(), None, window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        fn showing<P: workspace::Panel>(workspace: &Entity<Workspace>, cx: &App) -> bool {
+            workspace.read(cx).all_docks().iter().any(|dock| {
+                let dock = dock.read(cx);
+                dock.is_open()
+                    && dock
+                        .active_panel()
+                        .is_some_and(|panel| panel.persistent_name() == P::persistent_name())
+            })
+        }
+        let switch_to = |workspace: &Entity<Workspace>, cx: &mut TestAppContext| {
+            window
+                .update(cx, |multi_workspace, window, cx| {
+                    multi_workspace.activate(workspace.clone(), None, window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+        };
+
+        for workspace in [&workspace1, &workspace2] {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.panel::<WorktreePanel>(cx).is_some());
+                assert!(workspace.panel::<LinearPanel>(cx).is_some());
+            });
+        }
+
+        let in_workspace = |workspace: &Entity<Workspace>,
+                            cx: &mut TestAppContext,
+                            f: &dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| f(workspace, window, cx))
+                })
+                .unwrap();
+        };
+
+        // Opened in one worktree, it is open in the next.
+        in_workspace(&workspace1, cx, &|workspace, window, cx| {
+            workspace.open_panel::<WorktreePanel>(window, cx)
+        });
+        switch_to(&workspace2, cx);
+        cx.update(|cx| assert!(showing::<WorktreePanel>(&workspace2, cx)));
+
+        // Each follows in its own dock, without disturbing the other.
+        in_workspace(&workspace2, cx, &|workspace, window, cx| {
+            workspace.open_panel::<LinearPanel>(window, cx)
+        });
+        switch_to(&workspace1, cx);
+        cx.update(|cx| {
+            assert!(showing::<LinearPanel>(&workspace1, cx));
+            assert!(showing::<WorktreePanel>(&workspace1, cx));
+        });
+
+        // Closed in one worktree, it stays closed in the next.
+        in_workspace(&workspace1, cx, &|workspace, window, cx| {
+            workspace.close_panel::<LinearPanel>(window, cx)
+        });
+        switch_to(&workspace2, cx);
+        cx.update(|cx| {
+            assert!(!showing::<LinearPanel>(&workspace2, cx));
+            assert!(showing::<WorktreePanel>(&workspace2, cx));
+        });
     }
 
     #[gpui::test]
