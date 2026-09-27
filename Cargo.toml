@@ -239,6 +239,7 @@ members = [
     "crates/windows_resources",
     "crates/workspace",
     "crates/worktree",
+    "crates/worktree_metadata",
     "crates/worktree_panel",
     "crates/worktree_benchmarks",
     "crates/x_ai",
@@ -510,6 +511,7 @@ web_search_providers = { path = "crates/web_search_providers" }
 which_key = { path = "crates/which_key" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
+worktree_metadata = { path = "crates/worktree_metadata" }
 worktree_panel = { path = "crates/worktree_panel" }
 x_ai = { path = "crates/x_ai" }
 x_ai_subscribed = { path = "crates/x_ai_subscribed" }

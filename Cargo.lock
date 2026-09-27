@@ -470,6 +470,9 @@ dependencies = [
  "settings",
  "tempfile",
  "terminal",
+ "theme",
+ "theme_settings",
+ "time",
  "ui",
  "workspace",
 ]
@@ -13752,6 +13755,7 @@ dependencies = [
  "ui",
  "windows 0.62.2",
  "workspace",
+ "worktree_metadata",
  "zed_actions",
 ]
 
@@ -22523,6 +22527,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "worktree_metadata"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs",
+ "gpui",
+ "log",
+ "serde",
+ "serde_json",
+ "util",
+]
+
+[[package]]
 name = "worktree_panel"
 version = "0.1.0"
 dependencies = [
@@ -22530,6 +22547,7 @@ dependencies = [
  "anyhow",
  "db",
  "editor",
+ "futures 0.3.34",
  "git",
  "git_ui_core",
  "github_cli",
@@ -22549,6 +22567,7 @@ dependencies = [
  "util",
  "which",
  "workspace",
+ "worktree_metadata",
  "zed_actions",
 ]
 

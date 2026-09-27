@@ -232,10 +232,13 @@ impl Render for PlatformTitleBar {
         let button_layout = self.effective_button_layout(&decorations, cx);
         let sidebar = self.sidebar_render_state(cx);
         // Bench: which worktree you are in, as a colour.
-        let titlebar_background = worktree_tint::title_bar_background(
-            self.active_worktree(cx).as_deref(),
-            titlebar_color,
-        );
+        let hue = self.active_worktree(cx).map(|worktree| {
+            worktree_metadata::WorktreeMetadataStore::global(cx)
+                .read(cx)
+                .get(&worktree, cx)
+                .hue_for(&worktree)
+        });
+        let titlebar_background = worktree_tint::title_bar_background(hue, titlebar_color);
 
         let title_bar = h_flex()
             .window_control_area(WindowControlArea::Drag)

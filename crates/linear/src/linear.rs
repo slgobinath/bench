@@ -915,6 +915,31 @@ impl Linear {
         })
     }
 
+    /// The issue with Linear's own `id`, once it has been looked up; see
+    /// [`Self::look_up_ids`].
+    pub fn issue_for_id(&self, id: &str) -> Option<Arc<Issue>> {
+        self.lookups.get(id)?.issue.clone()
+    }
+
+    /// Asks Linear about the issues with these ids — the ones worktrees were
+    /// made for — including archived ones, alongside the branch lookups. An
+    /// id finds its issue whatever has become of its identifier.
+    pub fn look_up_ids<'a>(&mut self, ids: impl IntoIterator<Item = &'a str>, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        for id in ids {
+            let fresh = self
+                .lookups
+                .get(id)
+                .is_some_and(|lookup| Instant::now() < lookup.fresh_until);
+            if !fresh {
+                self.queued_lookups.insert(SharedString::from(id.to_owned()));
+            }
+        }
+        self.start_lookups(cx);
+    }
+
     /// The issue a branch is named after, when Linear has already said which
     /// that is. See [`Self::look_up_branches`] for how it comes to know.
     pub fn issue_for_branch(&self, branch: &str) -> Option<Arc<Issue>> {
@@ -977,9 +1002,34 @@ impl Linear {
                 if batch.is_empty() {
                     break;
                 }
-                let found = issues_by_identifier(http_client.as_ref(), &key, &batch).await;
+                // Linear's own ids and identifiers share the queue; they
+                // are told apart by shape, and asked about in one request each.
+                let (ids, identifiers): (Vec<SharedString>, Vec<SharedString>) = batch
+                    .iter()
+                    .cloned()
+                    .partition(|key| is_issue_id(key));
+                let found = async {
+                    let mut found = Vec::new();
+                    if !identifiers.is_empty() {
+                        found.extend(
+                            issues_by_identifier(http_client.as_ref(), &key, &identifiers).await?,
+                        );
+                    }
+                    if !ids.is_empty() {
+                        found.extend(issues_by_id(http_client.as_ref(), &key, &ids).await?);
+                    }
+                    anyhow::Ok(found)
+                }
+                .await;
                 this.update(cx, |this, cx| match found {
                     Ok(found) => {
+                        log::info!(
+                            "looked up Linear issues {batch:?}, found {:?}",
+                            found
+                                .iter()
+                                .map(|issue| issue.identifier.as_ref())
+                                .collect::<Vec<_>>()
+                        );
                         // Linear answered, so an identifier it did not return
                         // is not an issue — a branch that only looks like one.
                         let fresh_until = Instant::now() + LOOKUP_REFRESH;
@@ -1035,11 +1085,21 @@ impl Linear {
     }
 
     fn remember(&mut self, issue: Arc<Issue>) {
+        let fresh_until = Instant::now() + LOOKUP_REFRESH;
+        // By id as well as identifier: a worktree Bench made remembers the
+        // issue's id, which outlives its identifier.
+        self.lookups.insert(
+            issue.id.clone(),
+            Lookup {
+                issue: Some(issue.clone()),
+                fresh_until,
+            },
+        );
         self.lookups.insert(
             issue.identifier.clone(),
             Lookup {
                 issue: Some(issue),
-                fresh_until: Instant::now() + LOOKUP_REFRESH,
+                fresh_until,
             },
         );
     }
@@ -1308,6 +1368,38 @@ async fn search_issues(
     Ok(response.search_issues)
 }
 
+/// Whether a lookup key is Linear's own id — a UUID — rather than an
+/// identifier such as `ENG-123`.
+fn is_issue_id(key: &str) -> bool {
+    key.len() == 36 && key.chars().filter(|character| *character == '-').count() == 4
+}
+
+/// Several issues by Linear's own id in one request, archived ones included:
+/// a worktree outlives the issue it was made for being archived.
+async fn issues_by_id(
+    http_client: &dyn HttpClient,
+    key: &str,
+    ids: &[SharedString],
+) -> Result<Vec<Issue>> {
+    #[derive(Deserialize)]
+    struct Issues {
+        #[serde(deserialize_with = "nodes")]
+        issues: Vec<Issue>,
+    }
+    let ids: Vec<&str> = ids.iter().map(|id| id.as_ref()).collect();
+    let response: Issues = graphql(
+        http_client,
+        key,
+        &format!(
+            "query($filter: IssueFilter, $first: Int) {{ \
+             issues(filter: $filter, first: $first, includeArchived: true) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
+        ),
+        json!({ "filter": { "id": { "in": ids } }, "first": ids.len() }),
+    )
+    .await?;
+    Ok(response.issues)
+}
+
 /// Several issues by identifier in one request. `issue(id:)` takes one at a
 /// time, but an identifier is a team key and a number, and the issue filter
 /// can match any of several of those.
@@ -1337,7 +1429,7 @@ async fn issues_by_identifier(
         key,
         &format!(
             "query($filter: IssueFilter, $first: Int) {{ \
-             issues(filter: $filter, first: $first) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
+             issues(filter: $filter, first: $first, includeArchived: true) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
         ),
         json!({ "filter": { "or": any_of }, "first": identifiers.len() }),
     )
@@ -1556,6 +1648,49 @@ pub(crate) mod tests {
                 Some("RB-146")
             );
         });
+    }
+
+    /// A worktree Bench made remembers its issue's id, which finds the issue
+    /// even once its identifier has changed, and asks for archived ones too.
+    #[gpui::test]
+    async fn an_issue_is_found_by_its_id(cx: &mut TestAppContext) {
+        const ID: &str = "3f2b1c4d-0000-4000-8000-00000000abcd";
+        let asked_for_archived = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let http_client = FakeHttpClient::create({
+            let asked_for_archived = asked_for_archived.clone();
+            move |request| {
+                let asked_for_archived = asked_for_archived.clone();
+                async move {
+                    let mut body = String::new();
+                    let mut request_body = request.into_body();
+                    futures::AsyncReadExt::read_to_string(&mut request_body, &mut body).await?;
+                    if body.contains("includeArchived: true") {
+                        asked_for_archived.store(true, Ordering::SeqCst);
+                    }
+                    let mut issue = issue_json("RB2-7");
+                    issue["id"] = json!(ID);
+                    let response = json!({ "data": { "issues": { "nodes": [issue] } } });
+                    Ok(Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(response.to_string()))?)
+                }
+            }
+        });
+        let linear = connected_linear(http_client, cx);
+        linear.update(cx, |linear, cx| linear.look_up_ids([ID], cx));
+        cx.run_until_parked();
+
+        linear.read_with(cx, |linear, _| {
+            assert_eq!(
+                linear
+                    .issue_for_id(ID)
+                    .map(|issue| issue.identifier.clone())
+                    .as_deref(),
+                Some("RB2-7"),
+                "found by id, under the identifier it has now"
+            );
+        });
+        assert!(asked_for_archived.load(Ordering::SeqCst));
     }
 
     /// A refresh that fails leaves the issue on screen rather than making the

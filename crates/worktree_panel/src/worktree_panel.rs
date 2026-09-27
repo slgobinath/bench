@@ -33,6 +33,9 @@ use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
 use linear::{Issue, Linear, LinearEvent};
+use worktree_metadata::{
+    HUE_NAMES, HUES, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
+};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, Context, DismissEvent,
     Entity,
@@ -43,7 +46,10 @@ use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
-use ui::{Indicator, Label, ListItem, ListItemSpacing, Tooltip, prelude::*};
+use ui::{
+    CommonAnimationExt as _, ContextMenu, Indicator, Label, ListItem, ListItemSpacing, Tooltip,
+    prelude::*,
+};
 use ui_input::{ErasedEditor, InputField};
 use settings::Settings as _;
 use util::path_list::PathList;
@@ -53,7 +59,6 @@ use workspace::{
     ModalView, MultiWorkspace, MultiWorkspaceEvent, OpenMode, RemovalIntent, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelSizeState},
 };
-use zed_actions::SwitchWorktree;
 
 actions!(
     worktree_panel,
@@ -185,8 +190,12 @@ struct WorktreeRow {
     agents: AgentSummary,
     /// The branch this worktree has checked out; see [`RowPlan::branch`].
     branch: Option<SharedString>,
-    /// The Linear issue the branch is named after, once Linear has said which
-    /// that is; see [`Linear::look_up_branches`].
+    /// The issue Bench made this worktree for, as it stored it. It outlives
+    /// the issue's identifier, which the branch name only has a copy of.
+    linked_issue: Option<LinkedIssue>,
+    /// The worktree's Linear issue, once Linear has said which that is: the
+    /// one it was made for, or else the one its branch is named after. See
+    /// [`Linear::look_up_ids`] and [`Linear::look_up_branches`].
     issue: Option<Arc<Issue>>,
 }
 
@@ -303,6 +312,8 @@ pub struct WorktreePanel {
     /// bordered box: the panel's header is chrome, and a box with a border
     /// around it there competes with the rows for attention.
     filter: Arc<dyn ErasedEditor>,
+    /// The colour menu of a worktree row, while it is open.
+    context_menu: Option<(Entity<ContextMenu>, gpui::Point<gpui::Pixels>, gpui::Subscription)>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -364,6 +375,8 @@ impl WorktreePanel {
         if let Some(linear) = Linear::global(cx) {
             subscriptions.push(cx.subscribe(&linear, |_, _, _: &LinearEvent, cx| cx.notify()));
         }
+        let metadata = WorktreeMetadataStore::global(cx);
+        subscriptions.push(cx.subscribe(&metadata, |_, _, _: &MetadataChanged, cx| cx.notify()));
         // Only when this panel's own settings changed: the settings store
         // changes on every edit of the settings file, and redrawing for all of
         // them is the per-change cost the subscriptions above avoid.
@@ -403,6 +416,7 @@ impl WorktreePanel {
             multi_workspace,
             focus_handle: cx.focus_handle(),
             filter,
+            context_menu: None,
             _subscriptions: subscriptions,
         }
     }
@@ -532,6 +546,7 @@ impl WorktreePanel {
         let pull_requests = self.scanned_pull_requests(key, cx);
         let tracker = AgentTracker::try_global(cx);
         let linear = Linear::global(cx);
+        let metadata = WorktreeMetadataStore::try_global(cx);
 
         plan_rows(&worktrees, &open_roots, anchor.as_deref())
             .into_iter()
@@ -574,14 +589,29 @@ impl WorktreePanel {
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).summary_for(root))
                         .unwrap_or_default(),
-                    issue: plan
-                        .branch
-                        .as_ref()
-                        .zip(linear.as_ref())
-                        .and_then(|(branch, linear)| linear.read(cx).issue_for_branch(branch)),
+                    linked_issue: plan
+                        .root
+                        .as_deref()
+                        .zip(metadata.as_ref())
+                        .and_then(|(root, metadata)| metadata.read(cx).get(root, cx).issue),
+                    issue: None,
                     branch: plan.branch,
                     root: plan.root,
                 })
+            })
+            .map(|mut row| {
+                let linear = linear.as_ref().map(|linear| linear.read(cx));
+                row.issue = linear.and_then(|linear| {
+                    row.linked_issue
+                        .as_ref()
+                        .and_then(|linked| linear.issue_for_id(&linked.id))
+                        .or_else(|| {
+                            row.branch
+                                .as_ref()
+                                .and_then(|branch| linear.issue_for_branch(branch))
+                        })
+                });
+                row
             })
             .collect()
     }
@@ -774,28 +804,27 @@ impl WorktreePanel {
         });
     }
 
-    /// Opens a worktree the window does not have open yet.
+    /// Opens a worktree the window does not have open yet, under the project
+    /// it belongs to.
     ///
-    /// With a workspace of the worktree's own project to switch from, this goes
-    /// through [`SwitchWorktree`], whose handler `git_ui` registers on the
-    /// workspace: it opens the worktree as another workspace in this window,
-    /// and is the same call the worktree picker makes, so both routes land in
-    /// the same place. It activates that workspace first, so that the action
-    /// dispatches against it — the panel lists every project, so the workspace
-    /// the user is looking at is not necessarily the one this worktree belongs
-    /// to.
+    /// Opening one takes a moment — its project is created, its saved layout
+    /// read back, its terminals reattached — and for all of that the window
+    /// would otherwise go on showing the worktree you were in. That reads as a
+    /// click that did nothing, or worse, as having arrived: the terminal you
+    /// type into next is still the old worktree's. So the window says what it
+    /// is doing straight away, with a dialog over the worktree you are leaving
+    /// that takes the keyboard until the new one is showing.
     ///
-    /// A project with nothing open has no workspace to switch from, so its
-    /// worktree is opened as a workspace of its own. Naming the project group
-    /// keeps it under the row it was clicked in rather than starting a second
-    /// one.
+    /// It opens the worktree directly rather than through another worktree of
+    /// the same repository, which is what used to make the window flash to
+    /// that one first. Naming the project group keeps it under the row it was
+    /// clicked in.
     ///
     /// Like [`Self::activate`], this runs on `window.defer` and takes no
     /// `&mut Self` — see there for why a lease on this panel across an
     /// activation is a panic.
     fn open_worktree(
         &mut self,
-        from: Option<Entity<Workspace>>,
         key: ProjectGroupKey,
         root: PathBuf,
         name: SharedString,
@@ -804,36 +833,38 @@ impl WorktreePanel {
     ) {
         let multi_workspace = self.multi_workspace.clone();
         window.defer(cx, move |window, cx| {
-            let Some(from) = from else {
-                multi_workspace
-                    .update(cx, |multi_workspace, cx| {
-                        multi_workspace
-                            .find_or_create_local_workspace(
-                                PathList::new(&[root]),
-                                Some(key),
-                                None,
-                                OpenMode::Activate,
-                                None,
-                                window,
-                                cx,
-                            )
-                            .detach_and_log_err(cx);
-                    })
-                    .ok();
+            let Some(multi_workspace) = multi_workspace.upgrade() else {
                 return;
             };
-            multi_workspace
-                .update(cx, |multi_workspace, cx| {
-                    multi_workspace.activate(from, None, window, cx);
-                })
-                .ok();
-            window.dispatch_action(
-                Box::new(SwitchWorktree {
-                    path: root,
-                    display_name: name.to_string(),
-                }),
-                cx,
-            );
+            let leaving = multi_workspace.read(cx).workspace().clone();
+            let opening = leaving.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, |_, cx| OpeningWorktree::new(name.clone(), cx));
+                workspace.active_modal::<OpeningWorktree>(cx)
+            });
+            let opened = multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.find_or_create_local_workspace(
+                    PathList::new(&[root]),
+                    Some(key),
+                    None,
+                    OpenMode::Activate,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            cx.spawn(async move |cx| {
+                let opened = opened.await;
+                if let Some(opening) = opening {
+                    opening.update(cx, |_, cx| cx.emit(DismissEvent));
+                }
+                if let Err(error) = opened {
+                    log::error!("opening the worktree {name}: {error:#}");
+                    leaving.update(cx, |workspace, cx| {
+                        workspace.show_error(format!("Could not open “{name}”: {error:#}"), cx);
+                    });
+                }
+            })
+            .detach();
         });
     }
 
@@ -1174,6 +1205,18 @@ impl WorktreePanel {
         cx: &mut Context<Self>,
     ) {
         let (path, target) = new_worktree(&key, &name);
+        // The project's other worktrees, whose colours the new one avoids.
+        let siblings: Vec<PathBuf> = self
+            .tree(cx)
+            .into_iter()
+            .filter(|row| row.key.matches(&key))
+            .flat_map(|row| row.worktrees)
+            .filter_map(|worktree| worktree.root)
+            .collect();
+        let linked = issue.as_ref().map(|issue| LinkedIssue {
+            id: issue.id.to_string(),
+            identifier: issue.identifier.to_string(),
+        });
         cx.spawn_in(window, async move |this, cx| {
             let created = repository
                 .update(cx, |repository, _| {
@@ -1183,9 +1226,24 @@ impl WorktreePanel {
 
             match created {
                 Ok(()) => {
+                    // Stored before the worktree opens, so its title bar is
+                    // in its own colour from the first frame.
+                    cx.update(|_, cx| {
+                        WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+                            let hue = store.least_used_hue(&siblings, cx);
+                            store.update(
+                                &path,
+                                |metadata| {
+                                    metadata.hue = Some(hue);
+                                    metadata.issue = linked;
+                                },
+                                cx,
+                            );
+                        });
+                    })?;
                     this.update_in(cx, |this, window, cx| {
                         this.rediscover(project_root(&key), cx);
-                        this.open_worktree(Some(from.clone()), key, path, name, window, cx);
+                        this.open_worktree(key, path, name, window, cx);
                     })?;
                     let started = issue.and_then(|issue| {
                         let linear = cx.update(|_, cx| Linear::global(cx)).ok()??;
@@ -1223,91 +1281,231 @@ impl WorktreePanel {
         .detach_and_log_err(cx);
     }
 
-    /// Deletes a worktree: closes its workspace if the window has it open,
-    /// then removes it with `git worktree remove`.
+    /// Deletes a worktree: closes the workspaces showing anything inside it,
+    /// removes the repositories nested in it, then removes the worktree.
     ///
     /// It asks first, because this deletes a directory. It asks a second time
-    /// when git refuses — which is what git does when the worktree has changes
-    /// that removing it would lose — rather than forcing straight away.
+    /// when git refuses — which is what git does when a worktree has changes
+    /// that removing it would lose — naming what git refused and why, rather
+    /// than forcing straight away.
     ///
-    /// The workspace goes before the directory does: a workspace whose folder
+    /// A worktree of a project that keeps clones in `repos/` holds a worktree
+    /// of each clone's repository. Those go first, each through its own
+    /// repository: to the outer repository they are untracked files, so git
+    /// refuses the outer worktree while they are there, and deleting them with
+    /// it would leave each clone's repository holding a worktree that no
+    /// longer exists, with its branch locked to it.
+    ///
+    /// The workspaces go before the directory does: a workspace whose folder
     /// has just stopped existing shows an empty tree and errors on every file
-    /// watch. [`RemovalIntent::KeepProject`] is the distinction that matters
-    /// there — deleting one worktree must not close the repository it belongs
-    /// to, even when it is the last one open.
+    /// watch. Every workspace inside the worktree goes, not only the one its
+    /// row shows — one opened at a nested repository, say. And once the
+    /// directory is gone, anything still showing it is closed too, and any
+    /// project made of it removed: a workspace of a deleted folder no longer
+    /// belongs to its repository, so it would otherwise turn up as a project
+    /// of its own.
     fn delete_worktree(
         &mut self,
         repository: Entity<Repository>,
-        workspace: Option<Entity<Workspace>>,
         root: PathBuf,
         name: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let Some(fs) = self.fs(cx) else {
+            return;
+        };
         let multi_workspace = self.multi_workspace.clone();
         // The project git will be asked about again once this worktree is
         // gone; see `rediscover`.
         let project = repository_anchor(&repository, cx);
-        let confirmed = window.prompt(
-            gpui::PromptLevel::Warning,
-            &format!("Delete the worktree “{name}”?"),
-            Some(&format!("{} will be removed from disk.", root.display())),
-            &["Delete", "Cancel"],
-            cx,
-        );
 
         cx.spawn_in(window, async move |this, cx| {
+            let nested = cx
+                .background_spawn(nested_worktrees(fs.clone(), root.clone()))
+                .await;
+            let mut detail = format!("{} will be removed from disk.", root.display());
+            if !nested.is_empty() {
+                detail.push_str(&format!(
+                    "\n\nThe repositories inside it are removed from their own repositories \
+                     first: {}.",
+                    nested
+                        .iter()
+                        .map(|nested| nested.label(&root))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            let confirmed = cx.update(|window, cx| {
+                window.prompt(
+                    gpui::PromptLevel::Warning,
+                    &format!("Delete the worktree “{name}”?"),
+                    Some(&detail),
+                    &["Delete", "Cancel"],
+                    cx,
+                )
+            })?;
             if confirmed.await? != 0 {
                 return anyhow::Ok(());
             }
 
-            if let Some(workspace) = workspace {
-                let closed = multi_workspace
-                    .update_in(cx, |multi_workspace, window, cx| {
-                        multi_workspace.remove([workspace], RemovalIntent::KeepProject, window, cx)
-                    })?
+            // Closing can stop to ask about unsaved changes, and answering no
+            // means the worktree stays. Deleting the directory anyway would
+            // throw away the very work the prompt was protecting.
+            let closed = multi_workspace
+                .update_in(cx, |multi_workspace, window, cx| {
+                    close_workspaces_inside(multi_workspace, &root, window, cx)
+                })?
+                .await?;
+            if !closed {
+                return anyhow::Ok(());
+            }
+
+            let git = which::which("git").ok();
+            let mut refused: Vec<(String, anyhow::Error)> = Vec::new();
+            let mut refused_nested = Vec::new();
+            for nested in &nested {
+                match remove_nested(&fs, git.as_deref(), nested, false).await {
+                    Ok(()) => {}
+                    Err(error) => {
+                        refused.push((nested.label(&root), error));
+                        refused_nested.push(nested.clone());
+                    }
+                }
+            }
+            // Only once everything inside it is gone: with a nested
+            // repository refused, the outer worktree still holds it, and
+            // nothing is deleted until the user says so.
+            let mut outer_removed = false;
+            if refused.is_empty() {
+                let removed = repository
+                    .update(cx, |repository, _| {
+                        repository.remove_worktree(root.clone(), false)
+                    })
                     .await?;
-                // Closing can stop to ask about unsaved changes, and answering
-                // no means the worktree stays. Deleting the directory anyway
-                // would throw away the very work the prompt was protecting.
-                if !closed {
-                    return anyhow::Ok(());
+                match removed {
+                    Ok(()) => outer_removed = true,
+                    Err(error) => refused.push((name.to_string(), error)),
                 }
             }
 
-            let removed = repository
-                .update(cx, |repository, _| {
-                    repository.remove_worktree(root.clone(), false)
-                })
-                .await?;
-
-            let Err(refused) = removed else {
-                return anyhow::Ok(());
-            };
-            log::warn!("git refused to remove the worktree {name}: {refused:#}");
-
-            let forced = cx.update(|window, cx| {
-                window.prompt(
-                    gpui::PromptLevel::Warning,
-                    &format!("Could not delete “{name}”."),
-                    Some(&format!(
-                        "{refused}\n\nDeleting it anyway discards whatever is in it."
-                    )),
-                    &["Delete Anyway", "Cancel"],
-                    cx,
-                )
-            })?;
-            if forced.await? != 0 {
-                return anyhow::Ok(());
+            if !refused.is_empty() {
+                for (what, error) in &refused {
+                    log::warn!("git refused to remove {what}: {error:#}");
+                }
+                let reasons = refused
+                    .iter()
+                    .map(|(what, error)| format!("• {what}: {}", git_reason(error)))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let forced = cx.update(|window, cx| {
+                    window.prompt(
+                        gpui::PromptLevel::Warning,
+                        &format!("Could not delete “{name}”."),
+                        Some(&format!(
+                            "{reasons}\n\nDeleting it anyway discards whatever is in it."
+                        )),
+                        &["Delete Anyway", "Cancel"],
+                        cx,
+                    )
+                })?;
+                if forced.await? != 0 {
+                    this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
+                        .ok();
+                    return anyhow::Ok(());
+                }
+                for nested in &refused_nested {
+                    remove_nested(&fs, git.as_deref(), nested, true).await?;
+                }
+                if !outer_removed {
+                    repository
+                        .update(cx, |repository, _| repository.remove_worktree(root.clone(), true))
+                        .await??;
+                }
             }
-            repository
-                .update(cx, |repository, _| repository.remove_worktree(root, true))
-                .await??;
+
+            multi_workspace
+                .update_in(cx, |multi_workspace, window, cx| {
+                    clear_deleted(multi_workspace, &root, window, cx);
+                })
+                .ok();
+            cx.update(|_, cx| {
+                WorktreeMetadataStore::global(cx)
+                    .update(cx, |store, cx| store.remove(&root, cx));
+            })?;
             this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
                 .ok();
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
+    }
+
+    /// The colour menu of a worktree: the colours a worktree can be, the one
+    /// it is ticked, and going back to the one worked out from its folder.
+    fn deploy_colour_menu(
+        &mut self,
+        root: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = WorktreeMetadataStore::global(cx);
+        let metadata = store.read(cx).get(&root, cx);
+        let current = metadata.hue_for(&root);
+        let chosen = metadata.hue.is_some();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            menu = menu.header("Colour");
+            for hue in 0..HUES {
+                let name = HUE_NAMES.get(usize::from(hue)).copied().unwrap_or_default();
+                let store = store.clone();
+                let root = root.clone();
+                menu = menu.custom_entry(
+                    move |_, _| {
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(div().size_3().rounded_full().bg(hue_color(hue)))
+                            .child(Label::new(name))
+                            .when(hue == current, |this| {
+                                this.child(
+                                    div().flex_1().flex().justify_end().child(
+                                        Icon::new(IconName::Check)
+                                            .size(IconSize::Small)
+                                            .color(Color::Accent),
+                                    ),
+                                )
+                            })
+                            .into_any_element()
+                    },
+                    move |_, cx| {
+                        store.update(cx, |store, cx| {
+                            store.update(&root, |metadata| metadata.hue = Some(hue), cx)
+                        });
+                    },
+                );
+            }
+            let store = store.clone();
+            let root = root.clone();
+            menu.separator().toggleable_entry(
+                "Automatic",
+                !chosen,
+                IconPosition::Start,
+                None,
+                move |_, cx| {
+                    store.update(cx, |store, cx| {
+                        store.update(&root, |metadata| metadata.hue = None, cx)
+                    });
+                },
+            )
+        });
+        let focus = menu.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        let subscription = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
     }
 
     fn toggle_collapsed(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
@@ -1488,7 +1686,7 @@ impl WorktreePanel {
         let delete = (!row.is_main)
             .then(|| row.repository.clone().zip(row.root.clone()))
             .flatten()
-            .map(|(repository, root)| (repository, root, row.workspace.clone()));
+            ;
         let delete_name = row.name.clone();
         // What a click does: go to the worktree if the window has it open,
         // otherwise open it.
@@ -1497,7 +1695,7 @@ impl WorktreePanel {
             .root
             .clone()
             .filter(|_| !is_open)
-            .map(|root| (row.switch_from.clone(), row.key.clone(), root));
+            .map(|root| (row.key.clone(), root));
         let open_name = row.name.clone();
         ListItem::new(("worktree", index))
             .spacing(ListItemSpacing::Sparse)
@@ -1584,30 +1782,46 @@ impl WorktreePanel {
                             .children(render_agents(index, &row.agents)),
                     ),
             )
-            .end_slot_on_hover(
-                h_flex().when_some(delete, |this, (repository, root, workspace)| {
-                    this.child(
-                        IconButton::new(("delete-worktree", index), IconName::Trash)
+            .end_slot_on_hover(h_flex().map(|this| match delete {
+                Some((repository, root)) => this.child(
+                    IconButton::new(("delete-worktree", index), IconName::Trash)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Delete Worktree"))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.delete_worktree(
+                                repository.clone(),
+                                root.clone(),
+                                delete_name.clone(),
+                                window,
+                                cx,
+                            );
+                        })),
+                ),
+                // The row keeps the room the delete button takes even while
+                // the button is hidden, so a row that has none — the
+                // repository's own checkout — holds the same room, or its
+                // agent dot sits further right than every other row's.
+                None => this.child(
+                    div().opacity(0.).child(
+                        IconButton::new(("no-delete-worktree", index), IconName::Trash)
                             .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Delete Worktree"))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.delete_worktree(
-                                    repository.clone(),
-                                    workspace.clone(),
-                                    root.clone(),
-                                    delete_name.clone(),
-                                    window,
-                                    cx,
-                                );
-                            })),
-                    )
-                }),
-            )
+                            .disabled(true),
+                    ),
+                ),
+            }))
+            .when_some(row.root.clone(), |this, root| {
+                this.on_secondary_mouse_down(cx.listener(
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_colour_menu(root.clone(), event.position, window, cx);
+                    },
+                ))
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 match (activate.clone(), open.clone()) {
                     (Some(workspace), _) => this.activate(workspace, window, cx),
-                    (None, Some((from, key, root))) => {
-                        this.open_worktree(from, key, root, open_name.clone(), window, cx)
+                    (None, Some((key, root))) => {
+                        this.open_worktree(key, root, open_name.clone(), window, cx)
                     }
                     (None, None) => {}
                 }
@@ -2382,6 +2596,71 @@ impl Render for ChooseProject {
     }
 }
 
+/// What the window shows while a worktree opens; see
+/// [`WorktreePanel::open_worktree`]. It is a modal so that it holds the
+/// keyboard: what you type while a worktree opens must not go to the one you
+/// are leaving.
+struct OpeningWorktree {
+    name: SharedString,
+    focus_handle: FocusHandle,
+}
+
+impl OpeningWorktree {
+    fn new(name: SharedString, cx: &mut Context<Self>) -> Self {
+        Self {
+            name,
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Focusable for OpeningWorktree {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for OpeningWorktree {}
+
+impl ModalView for OpeningWorktree {}
+
+impl Render for OpeningWorktree {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .key_context("OpeningWorktree")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .child(
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::Small)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2),
+            )
+            .child(
+                v_flex()
+                    .min_w_0()
+                    .child(
+                        Label::new(format!("Opening {}…", self.name))
+                            .single_line()
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new("The worktree shows here once it has loaded.")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+    }
+}
+
 /// Where a new worktree goes and what it checks out: a directory named after it
 /// under the project's worktree directory, on a new branch of the same name off
 /// whatever the repository has checked out.
@@ -2502,6 +2781,240 @@ fn hide_worktrees_inside_other_checkouts(rows: &mut [RepositoryRow]) {
                 || holder.is_none_or(|(holder, _)| *holder == project)
         });
     }
+}
+
+/// A worktree of another repository that lives inside a worktree being
+/// deleted: a clone under `repos/`, checked out for this worktree.
+#[derive(Clone, Debug)]
+struct NestedWorktree {
+    path: PathBuf,
+    /// The `.git` directory of the repository it is a worktree of.
+    common_dir: PathBuf,
+}
+
+impl NestedWorktree {
+    /// How the prompts name it: its path inside the worktree, which is what
+    /// tells two clones apart.
+    fn label(&self, root: &Path) -> String {
+        self.path
+            .strip_prefix(root)
+            .unwrap_or(&self.path)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// How deep below a worktree nested repositories are looked for. `repos/x`
+/// is two; a little more covers layouts that group them further.
+const NESTED_DEPTH: usize = 3;
+
+/// Directories never worth descending into when looking for nested
+/// repositories: they are large, and what is in them is built or fetched, not
+/// checked out.
+const SKIPPED_DIRECTORIES: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    ".dart_tool",
+    "Pods",
+    ".gradle",
+];
+
+/// The linked worktrees of other repositories inside `root`.
+///
+/// A linked worktree is a directory whose `.git` is a file pointing at
+/// `<repository>/.git/worktrees/<name>`; a clone of its own has a `.git`
+/// directory and is left alone, since deleting it is deleting the clone.
+/// The search stops at each one it finds — what is inside a nested repository
+/// is that repository's business — and does not go deep, because a worktree
+/// can hold hundreds of thousands of files.
+async fn nested_worktrees(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<NestedWorktree> {
+    use futures::StreamExt as _;
+
+    let mut found = Vec::new();
+    let mut level = vec![root];
+    for _ in 0..NESTED_DEPTH {
+        let mut next = Vec::new();
+        for directory in level {
+            let Ok(mut children) = fs.read_dir(&directory).await else {
+                continue;
+            };
+            while let Some(child) = children.next().await {
+                let Ok(child) = child else {
+                    continue;
+                };
+                let skipped = child
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| SKIPPED_DIRECTORIES.contains(&name));
+                if skipped || !fs.is_dir(&child).await {
+                    continue;
+                }
+                match linked_worktree_common_dir(fs.as_ref(), &child).await {
+                    Some(common_dir) => found.push(NestedWorktree {
+                        path: child,
+                        common_dir,
+                    }),
+                    None => {
+                        if !fs.is_dir(&child.join(".git")).await {
+                            next.push(child);
+                        }
+                    }
+                }
+            }
+        }
+        level = next;
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// The repository `directory` is a linked worktree of, from its `.git` file:
+/// `gitdir: <repository>/.git/worktrees/<name>`, whose `commondir` names the
+/// repository's `.git`.
+async fn linked_worktree_common_dir(fs: &dyn Fs, directory: &Path) -> Option<PathBuf> {
+    let dot_git = fs.load(&directory.join(".git")).await.ok()?;
+    let gitdir = PathBuf::from(dot_git.strip_prefix("gitdir:")?.trim());
+    let gitdir = if gitdir.is_relative() {
+        directory.join(gitdir)
+    } else {
+        gitdir
+    };
+    match fs.load(&gitdir.join("commondir")).await {
+        Ok(common_dir) => {
+            let common_dir = PathBuf::from(common_dir.trim());
+            Some(if common_dir.is_relative() {
+                normalize(&gitdir.join(common_dir))
+            } else {
+                common_dir
+            })
+        }
+        // `<repository>/.git/worktrees/<name>` is two levels below it.
+        Err(_) => Some(gitdir.parent()?.parent()?.to_path_buf()),
+    }
+}
+
+/// `a/b/../c` as `a/c`, without asking the filesystem: git writes
+/// `commondir` relative to the worktree's own git directory.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            component => normalized.push(component),
+        }
+    }
+    normalized
+}
+
+/// Removes a nested worktree through the repository it belongs to, the way
+/// `git worktree remove` in that repository would.
+async fn remove_nested(
+    fs: &Arc<dyn Fs>,
+    git: Option<&Path>,
+    nested: &NestedWorktree,
+    force: bool,
+) -> anyhow::Result<()> {
+    let repository = fs.open_repo(&nested.common_dir, git)?;
+    repository.remove_worktree(nested.path.clone(), force).await
+}
+
+/// Git's own reason for refusing, which is the part worth reading: the last
+/// line that says something, without the "Git command failed" wrapping.
+fn git_reason(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    message
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty() && !line.starts_with("Git command failed"))
+        .map(|line| line.trim_start_matches("fatal: ").to_owned())
+        .unwrap_or(message)
+}
+
+/// Closes every workspace showing `root` or anything inside it. Resolves to
+/// whether they all closed — one can stop to ask about unsaved changes.
+///
+/// A workspace whose project is the worktree itself — as a worktree is while
+/// git has not yet told its project which repository it belongs to — is
+/// closed along with its project. Keeping the project would reopen the very
+/// worktree being deleted.
+fn close_workspaces_inside(
+    multi_workspace: &mut MultiWorkspace,
+    root: &Path,
+    window: &mut Window,
+    cx: &mut Context<MultiWorkspace>,
+) -> Task<anyhow::Result<bool>> {
+    let doomed = workspaces_inside(multi_workspace, root, cx);
+    if doomed.is_empty() {
+        return Task::ready(Ok(true));
+    }
+    let own_project = doomed
+        .iter()
+        .any(|workspace| is_inside(&workspace.read(cx).project_group_key(cx), root));
+    let intent = if own_project {
+        RemovalIntent::CloseProject
+    } else {
+        RemovalIntent::KeepProject
+    };
+    multi_workspace.remove(doomed, intent, window, cx)
+}
+
+/// After `root` is deleted: closes whatever still shows it and removes any
+/// project made of it. See [`WorktreePanel::delete_worktree`] for why there
+/// can be any.
+fn clear_deleted(
+    multi_workspace: &mut MultiWorkspace,
+    root: &Path,
+    window: &mut Window,
+    cx: &mut Context<MultiWorkspace>,
+) {
+    let leftovers = workspaces_inside(multi_workspace, root, cx);
+    if !leftovers.is_empty() {
+        log::info!(
+            "closing {} workspace(s) still showing the deleted {}",
+            leftovers.len(),
+            root.display()
+        );
+        multi_workspace
+            .remove(leftovers, RemovalIntent::CloseProject, window, cx)
+            .detach_and_log_err(cx);
+    }
+    let groups: Vec<ProjectGroupKey> = multi_workspace
+        .project_group_keys()
+        .into_iter()
+        .filter(|key| is_inside(key, root))
+        .collect();
+    for key in groups {
+        log::info!("removing the project made of the deleted {}", root.display());
+        multi_workspace
+            .remove_project_group(&key, window, cx)
+            .detach_and_log_err(cx);
+    }
+}
+
+fn workspaces_inside(
+    multi_workspace: &MultiWorkspace,
+    root: &Path,
+    cx: &App,
+) -> Vec<Entity<Workspace>> {
+    multi_workspace
+        .workspaces()
+        .filter(|workspace| {
+            workspace_root(workspace, cx).is_some_and(|workspace_root| workspace_root.starts_with(root))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a project is made of `root` or of something inside it.
+fn is_inside(key: &ProjectGroupKey, root: &Path) -> bool {
+    let mut paths = key.path_list().ordered_paths().peekable();
+    paths.peek().is_some() && paths.all(|path| path.starts_with(root))
 }
 
 /// The directory a project group stands for: the main worktree of the
@@ -2788,7 +3301,14 @@ impl Render for WorktreePanel {
                 .flat_map(|row| row.worktrees.iter())
                 .filter_map(|worktree| worktree.branch.clone())
                 .collect();
+            let ids: Vec<String> = tree
+                .iter()
+                .flat_map(|row| row.worktrees.iter())
+                .filter_map(|worktree| worktree.linked_issue.as_ref())
+                .map(|linked| linked.id.clone())
+                .collect();
             linear.update(cx, |linear, cx| {
+                linear.look_up_ids(ids.iter().map(String::as_str), cx);
                 linear.look_up_branches(branches.iter().map(|branch| branch.as_ref()), cx);
             });
         }
@@ -2873,6 +3393,15 @@ impl Render for WorktreePanel {
                     .child(self.render_repository(row, index, cx))
                     .children(worktrees)
                     .into_any_element()
+            }))
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
             }))
     }
 }
@@ -3005,6 +3534,8 @@ mod tests {
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
     use settings::SettingsStore;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     use std::sync::Arc;
     use workspace::ProjectGroup;
     use workspace::dock::PanelSizeState;
@@ -3310,6 +3841,403 @@ mod tests {
         );
     }
 
+    /// A Bench worktree of a project that keeps clones under `repos/`: the
+    /// outer repository `/outer` with a worktree at `/wt/fix`, and inside it
+    /// a worktree of the clone `/inner`, as its manifest checks one out for
+    /// every worktree. `/wt/fix` is open, and the window is showing it.
+    async fn worktree_with_a_nested_repository(
+        cx: &mut TestAppContext,
+    ) -> (
+        Arc<FakeFs>,
+        Entity<MultiWorkspace>,
+        Entity<Workspace>,
+        Entity<WorktreePanel>,
+        VisualTestContext,
+    ) {
+        let (fs, multi_workspace, _workspaces, _panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.insert_tree("/inner", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/outer/.git"),
+            false,
+            worktree("/wt/fix", "fix", false),
+        )
+        .await;
+        fs.insert_file("/wt/fix/file.txt", b"hi".to_vec()).await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/inner/.git"),
+            false,
+            worktree("/wt/fix/repos/inner", "fix-inner", false),
+        )
+        .await;
+        fs.insert_file("/wt/fix/repos/inner/file.txt", b"hi".to_vec())
+            .await;
+
+        let main_project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let fix_project = Project::test(fs.clone(), ["/wt/fix".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(main_project, window, cx)
+        });
+        let fix = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(fix_project, window, cx)
+        });
+        cx.run_until_parked();
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(fix.clone(), None, window, cx);
+        });
+        let panel = cx.update(|window, cx| {
+            let panel = cx.new(|cx| {
+                WorktreePanel::new(fix.downgrade(), multi_workspace.downgrade(), window, cx)
+            });
+            fix.update(cx, |workspace, cx| {
+                workspace.add_panel(panel.clone(), window, cx);
+                workspace.open_panel::<WorktreePanel>(window, cx);
+            });
+            panel
+        });
+        cx.run_until_parked();
+        (fs, multi_workspace, fix, panel, cx)
+    }
+
+    fn delete_fix(panel: &Entity<WorktreePanel>, cx: &mut VisualTestContext) {
+        let row = panel.read_with(cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .find(|worktree| worktree.root.as_deref() == Some(Path::new("/wt/fix")))
+                .expect("a row for the worktree")
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.delete_worktree(
+                row.repository.clone().expect("a repository"),
+                row.root.clone().expect("a root"),
+                "fix".into(),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    fn assert_nothing_left_of_fix(multi_workspace: &Entity<MultiWorkspace>, cx: &mut VisualTestContext) {
+        multi_workspace.read_with(cx, |multi_workspace, cx| {
+            for workspace in multi_workspace.workspaces() {
+                assert!(
+                    !workspace_root(workspace, cx)
+                        .is_some_and(|root| root.starts_with("/wt/fix")),
+                    "no workspace still shows the deleted folder"
+                );
+            }
+            for key in multi_workspace.project_group_keys() {
+                assert!(
+                    !is_inside(&key, Path::new("/wt/fix")),
+                    "the deleted folder is not a project: {key:?}"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn finds_the_worktrees_of_other_repositories_inside_a_worktree(cx: &mut TestAppContext) {
+        let (fs, _multi_workspace, _fix, _panel, _cx) = worktree_with_a_nested_repository(cx).await;
+        // A clone of its own, and a folder that is only big: neither is a
+        // worktree of another repository.
+        fs.insert_tree(
+            "/wt/fix/vendor/own-clone",
+            json!({ ".git": {}, "file.txt": "hi" }),
+        )
+        .await;
+        fs.insert_tree("/wt/fix/node_modules/pkg", json!({ ".git": "gitdir: /x" }))
+            .await;
+
+        let nested = nested_worktrees(fs.clone(), PathBuf::from("/wt/fix")).await;
+        let found: Vec<(PathBuf, PathBuf)> = nested
+            .into_iter()
+            .map(|nested| (nested.path, nested.common_dir))
+            .collect();
+        assert_eq!(
+            found,
+            vec![(PathBuf::from("/wt/fix/repos/inner"), PathBuf::from("/inner/.git"))]
+        );
+    }
+
+    /// Deleting a worktree whose PRs are merged: one question, and everything
+    /// goes — the nested worktree through its own repository, so the clone's
+    /// repository does not keep a worktree that no longer exists.
+    #[gpui::test]
+    async fn a_worktree_with_nested_repositories_deletes_cleanly(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        cx.update(|_, cx| {
+            WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+                store.update(Path::new("/wt/fix"), |metadata| metadata.hue = Some(4), cx)
+            });
+        });
+
+        delete_fix(&panel, &mut cx);
+        let (_, detail) = cx.pending_prompt().expect("the question");
+        assert!(detail.contains("repos/inner"), "{detail}");
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt(), "nothing refused, so nothing more to ask");
+        cx.update(|_, cx| {
+            let store = WorktreeMetadataStore::global(cx);
+            assert_eq!(
+                store.read(cx).get(Path::new("/wt/fix"), cx),
+                Default::default(),
+                "what was stored about it goes with it"
+            );
+        });
+        assert!(!fs.is_dir(Path::new("/wt/fix")).await);
+        assert!(
+            !fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await,
+            "the clone's repository no longer holds the nested worktree"
+        );
+        assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    /// A nested repository with changes is named in the warning, with git's
+    /// reason, and deleting anyway removes it too.
+    #[gpui::test]
+    async fn a_nested_repository_with_changes_is_named_before_deleting(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        fs.with_git_state(Path::new("/inner/.git"), false, |state| {
+            state
+                .worktrees_requiring_force_delete
+                .insert(PathBuf::from("/wt/fix/repos/inner"));
+        })
+        .expect("the clone's repository");
+
+        delete_fix(&panel, &mut cx);
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        let (title, detail) = cx.pending_prompt().expect("a warning");
+        assert_eq!(title, "Could not delete “fix”.");
+        assert!(detail.contains("• repos/inner: "), "{detail}");
+        assert!(detail.contains("contains modified or untracked files"), "{detail}");
+        cx.simulate_prompt_answer("Delete Anyway");
+        cx.run_until_parked();
+
+        assert!(!fs.is_dir(Path::new("/wt/fix")).await);
+        assert!(!fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await);
+        assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    /// Whatever else shows the worktree goes with it: a workspace opened at
+    /// the nested repository, and a project made of the worktree itself —
+    /// what a workspace of a deleted folder turns into.
+    #[gpui::test]
+    async fn deleting_leaves_no_workspace_or_project_behind(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        let nested_project =
+            Project::test(fs.clone(), ["/wt/fix/repos/inner".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(nested_project, window, cx);
+            multi_workspace.test_add_project_group(ProjectGroup {
+                key: ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/wt/fix")])),
+                workspaces: Vec::new(),
+                expanded: true,
+            });
+        });
+        cx.run_until_parked();
+
+        delete_fix(&panel, &mut cx);
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(!fs.is_dir(Path::new("/wt/fix")).await);
+        assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    /// Clicking a worktree that is not open goes straight to it: the window
+    /// switches once, to that worktree, never by way of another worktree of
+    /// the same repository — the flash that left you in the wrong one — and
+    /// the "Opening…" dialog is gone once it has.
+    #[gpui::test]
+    async fn opening_a_worktree_goes_straight_to_it(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 1).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/outer/.git"),
+            false,
+            worktree("/wt/fix", "fix", false),
+        )
+        .await;
+        fs.insert_file("/wt/fix/file.txt", b"hi".to_vec()).await;
+        let outer_project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let outer = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(outer_project, window, cx)
+        });
+        cx.run_until_parked();
+        // Looking at another project entirely.
+        let elsewhere = workspaces[0].clone();
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(elsewhere.clone(), None, window, cx);
+        });
+        cx.run_until_parked();
+
+        let shown = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let shown = shown.clone();
+            cx.subscribe(&multi_workspace, move |multi_workspace, event, cx| {
+                if let MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event {
+                    shown
+                        .borrow_mut()
+                        .push(multi_workspace.read(cx).workspace().clone());
+                }
+            })
+        });
+
+        let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
+        panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.open_worktree(key, PathBuf::from("/wt/fix"), "fix".into(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let shown = shown.borrow().clone();
+        assert_eq!(shown.len(), 1, "one switch, not two");
+        let fix = shown.first().cloned().expect("a switch");
+        assert_ne!(fix, outer, "not by way of the repository's other worktree");
+        fix.read_with(&mut cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .project()
+                    .read(cx)
+                    .worktree_paths(cx)
+                    .ordered_pairs()
+                    .next()
+                    .map(|(_, own)| own.clone()),
+                Some(PathBuf::from("/wt/fix"))
+            );
+        });
+        elsewhere.read_with(&mut cx, |workspace, cx| {
+            assert!(
+                workspace.active_modal::<OpeningWorktree>(cx).is_none(),
+                "the dialog is gone once the worktree is showing"
+            );
+        });
+    }
+
+    fn an_issue(identifier: &str) -> Arc<Issue> {
+        Arc::new(
+            serde_json::from_value(json!({
+                "id": "3f2b1c4d-0000-4000-8000-00000000abcd",
+                "identifier": identifier,
+                "title": "Legal entities carry their own logo",
+                "url": "https://linear.app/acme/issue/RB-116",
+                "branchName": "dev/rb-116-legal-entities",
+                "priority": 0,
+                "priorityLabel": "No priority",
+                "state": { "id": "s", "name": "Todo", "color": "#e2e2e2", "type": "unstarted" },
+                "assignee": null,
+                "team": { "id": "t", "key": "RB", "name": "Rentbee" },
+                "project": null,
+                "cycle": null,
+                "labels": { "nodes": [] },
+            }))
+            .expect("an issue"),
+        )
+    }
+
+    /// A worktree made for an issue remembers the issue by Linear's own id,
+    /// which outlives the branch name's copy of its identifier, and gets the
+    /// colour its project's other worktrees are not using.
+    #[gpui::test]
+    async fn a_new_worktree_remembers_its_issue_and_gets_its_own_colour(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let outer = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
+        let repository = project.read_with(&mut cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("the outer repository")
+        });
+
+        panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree(
+                outer.clone(),
+                repository,
+                key.clone(),
+                "dev/rb-116-legal-entities".into(),
+                Some(an_issue("RB-116")),
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (path, _) = new_worktree(&key, "dev/rb-116-legal-entities");
+        let (metadata, sibling_hue) = cx.update(|_, cx| {
+            let store = WorktreeMetadataStore::global(cx);
+            let store = store.read(cx);
+            let outer = PathBuf::from("/outer");
+            (store.get(&path, cx), store.get(&outer, cx).hue_for(&outer))
+        });
+        assert_eq!(
+            metadata.issue,
+            Some(LinkedIssue {
+                id: "3f2b1c4d-0000-4000-8000-00000000abcd".into(),
+                identifier: "RB-116".into(),
+            })
+        );
+        let hue = metadata.hue.expect("a colour chosen when it was made");
+        assert_ne!(hue, sibling_hue, "not the colour the project's main checkout has");
+
+        let linked = panels[0].read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .find(|worktree| worktree.root.as_deref() == Some(path.as_path()))
+                .and_then(|worktree| worktree.linked_issue)
+        });
+        assert_eq!(
+            linked.map(|linked| linked.identifier).as_deref(),
+            Some("RB-116"),
+            "the row knows its issue without reading the branch name"
+        );
+        drop(workspaces);
+    }
+
+    /// Right-clicking a worktree opens its colour menu, which draws.
+    #[gpui::test]
+    async fn the_colour_menu_opens(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.deploy_colour_menu(PathBuf::from("/wt/fix"), gpui::point(px(10.), px(10.)), window, cx);
+        });
+        cx.run_until_parked();
+        panel.read_with(&mut cx, |panel, _| assert!(panel.context_menu.is_some()));
+    }
+
+    #[test]
+    fn git_s_reason_is_what_the_warning_says() {
+        let error = anyhow::anyhow!(
+            "Git command failed:\nfatal: '/wt/fix' contains modified or untracked files, use --force to delete it\n\n"
+        );
+        assert_eq!(
+            git_reason(&error),
+            "'/wt/fix' contains modified or untracked files, use --force to delete it"
+        );
+    }
+
     /// A worktree of a project with nothing open has no workspace to switch
     /// from, so clicking it opens it as a workspace of its own — under the
     /// project it was clicked in, rather than as a second project.
@@ -3332,7 +4260,6 @@ mod tests {
 
         panels[0].update_in(&mut cx, |panel, window, cx| {
             panel.open_worktree(
-                None,
                 closed.clone(),
                 PathBuf::from("/closed"),
                 "closed".into(),
