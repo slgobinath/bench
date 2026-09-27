@@ -29,6 +29,7 @@
 //!   see [`awake`].
 
 pub mod awake;
+pub mod claude_usage;
 pub mod hooks;
 mod keep_awake_button;
 
@@ -43,6 +44,7 @@ use gpui::{
 use settings::Settings as _;
 use terminal::Terminal;
 
+pub use claude_usage::{ClaudeUsage, ClaudeUsageButton};
 pub use keep_awake_button::{KeepAwakeButton, ToggleKeepAwake, agent_state_color};
 
 /// Which terminal processes count as agents, and what Bench does while one of
@@ -181,6 +183,13 @@ pub struct AgentTracker {
     /// The user's toggle, off the status bar button. Separate from "is the
     /// assertion held", which is what the agents decide.
     keep_awake: bool,
+    /// What Claude Code last reported about the plan's limits; see
+    /// [`claude_usage`].
+    claude_usage: Option<ClaudeUsage>,
+    /// When the usage file last changed, so a sweep reads it only when it
+    /// has.
+    claude_usage_modified: Option<std::time::SystemTime>,
+    claude_status_line_installed: bool,
     _sweep: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -202,6 +211,7 @@ pub fn init(cx: &mut App) {
     let tracker = cx.new(AgentTracker::new);
     cx.set_global(GlobalAgentTracker(tracker));
     keep_awake_button::init(cx);
+    claude_usage::init(cx);
 }
 
 impl AgentTracker {
@@ -228,20 +238,42 @@ impl AgentTracker {
             reports: hooks::HookReports::default(),
             awake: awake::AwakeGuard::new(),
             keep_awake: AgentSettings::get_global(cx).keep_awake,
+            claude_usage: None,
+            claude_usage_modified: None,
+            claude_status_line_installed: false,
             _sweep: cx.spawn(async move |this, cx| {
+                let installed = cx.background_spawn(async { claude_usage::installed() }).await;
+                if this
+                    .update(cx, |this, cx| this.set_claude_status_line_installed(installed, cx))
+                    .is_err()
+                {
+                    return;
+                }
                 loop {
                     cx.background_executor().timer(SWEEP).await;
-                    let Ok(offset) = this.read_with(cx, |this, _| this.reports.offset()) else {
+                    let Ok((offset, usage_modified)) = this.read_with(cx, |this, _| {
+                        (this.reports.offset(), this.claude_usage_modified)
+                    }) else {
                         return;
                     };
-                    // Off the main thread: this is a `stat` every second, and
-                    // occasionally a read, on a thread that has frames to draw.
-                    let appended = cx
+                    // Off the main thread: this is a `stat` or two every
+                    // second, and occasionally a read, on a thread that has
+                    // frames to draw.
+                    let (appended, usage) = cx
                         .background_spawn(async move {
-                            hooks::read_appended(offset, EVENTS_MAX_BYTES)
+                            (
+                                hooks::read_appended(offset, EVENTS_MAX_BYTES),
+                                claude_usage::read_if_changed(usage_modified),
+                            )
                         })
                         .await;
-                    if this.update(cx, |this, cx| this.sweep(appended, cx)).is_err() {
+                    if this
+                        .update(cx, |this, cx| {
+                            this.take_claude_usage(usage, cx);
+                            this.sweep(appended, cx);
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -394,6 +426,49 @@ impl AgentTracker {
     }
 
     /// Whether the user has left the stay-awake behaviour turned on.
+    /// What Claude Code last reported about the plan's limits, if it has.
+    pub fn claude_usage(&self) -> Option<&ClaudeUsage> {
+        self.claude_usage.as_ref()
+    }
+
+    /// Whether Claude Code's status line is Bench's, which is what reports the
+    /// usage. As of launch, and of the last install or uninstall from Bench.
+    pub fn claude_status_line_installed(&self) -> bool {
+        self.claude_status_line_installed
+    }
+
+    pub(crate) fn set_claude_status_line_installed(
+        &mut self,
+        installed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.claude_status_line_installed != installed {
+            self.claude_status_line_installed = installed;
+            cx.emit(AgentsChanged);
+            cx.notify();
+        }
+    }
+
+    /// Takes in what [`claude_usage::read_if_changed`] found. A file that
+    /// changed but could not be read as usage leaves the last report standing.
+    fn take_claude_usage(
+        &mut self,
+        read: Option<(std::time::SystemTime, Option<ClaudeUsage>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((modified, usage)) = read else {
+            return;
+        };
+        self.claude_usage_modified = Some(modified);
+        if let Some(usage) = usage
+            && self.claude_usage.as_ref() != Some(&usage)
+        {
+            self.claude_usage = Some(usage);
+            cx.emit(AgentsChanged);
+            cx.notify();
+        }
+    }
+
     pub fn keep_awake(&self) -> bool {
         self.keep_awake
     }

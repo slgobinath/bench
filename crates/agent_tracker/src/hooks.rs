@@ -296,7 +296,7 @@ fn uninstall_at(path: &Path) -> Result<()> {
     write_settings(path, &settings)
 }
 
-fn read_settings(path: &Path) -> Result<Map<String, Value>> {
+pub(crate) fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     match std::fs::read_to_string(path) {
         Ok(settings) if !settings.trim().is_empty() => serde_json::from_str(&settings)
             .with_context(|| format!("reading {}", path.display())),
@@ -308,7 +308,7 @@ fn read_settings(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
-fn write_settings(path: &Path, settings: &Map<String, Value>) -> Result<()> {
+pub(crate) fn write_settings(path: &Path, settings: &Map<String, Value>) -> Result<()> {
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory)
             .with_context(|| format!("creating {}", directory.display()))?;
@@ -348,7 +348,7 @@ fn is_ours(matcher: &Value) -> bool {
 /// Single-quoted for `sh`, which is what runs a hook's command. The data
 /// directory is under the user's home and can hold a space — `Application
 /// Support` does on every Mac.
-fn shell_quote(path: &Path) -> String {
+pub(crate) fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
