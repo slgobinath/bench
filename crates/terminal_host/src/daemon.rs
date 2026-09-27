@@ -35,6 +35,22 @@ const IDLE_EXIT_AFTER: Duration = Duration::from_secs(60);
 /// process group are sent SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(3);
 
+/// How long a pause in a session's output ends a burst; see [`pump_output`].
+/// The reads of one write follow each other in microseconds, and a keystroke's
+/// echo waiting this long is not something anyone can see.
+const OUTPUT_BURST_GAP: Duration = Duration::from_millis(1);
+
+/// The longest a burst is held back, so output that never pauses — a build log,
+/// `cat` of a large file — still reaches the screen as it goes.
+const OUTPUT_BURST_MAX_WAIT: Duration = Duration::from_millis(8);
+
+/// The most a burst holds before it is sent anyway.
+const OUTPUT_BURST_MAX_BYTES: usize = 256 * 1024;
+
+/// How many reads can wait for [`pump_output`] before the reader stops reading,
+/// which stops the program writing: the pty's own back-pressure, kept.
+const OUTPUT_CHUNKS_QUEUED: usize = 64;
+
 /// Starts a daemon for `socket` that outlives this process.
 #[allow(
     clippy::disallowed_methods,
@@ -465,7 +481,63 @@ fn create(host: &Arc<Host>, request: CreateSession) -> Result<SessionInfo> {
     Ok(session.info())
 }
 
-fn pump_output(session: &Session, mut output: Box<dyn Read + Send>) {
+/// Moves a session's output to its screen and its client, a burst at a time.
+///
+/// A program redraws its screen with one write, but a pty hands that write
+/// over in small reads — a kilobyte at a time on macOS. Sent on as they come,
+/// each read is a frame of its own, and the client can paint between any two
+/// of them: the screen half cleared, half drawn, which is a flicker on every
+/// redraw. A shell running in a terminal directly has no such gaps, because
+/// its terminal reads the pty in one tight loop. So reads that follow each
+/// other closely are gathered into one frame, the way that loop would have
+/// read them.
+fn pump_output(session: &Session, output: Box<dyn Read + Send>) {
+    let (chunks, received) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_CHUNKS_QUEUED);
+    thread::spawn(move || read_output(output, chunks));
+
+    let mut disconnected = false;
+    while !disconnected {
+        let Ok(mut burst) = received.recv() else {
+            return;
+        };
+        let started = Instant::now();
+        while burst.len() < OUTPUT_BURST_MAX_BYTES {
+            let waited = started.elapsed();
+            if waited >= OUTPUT_BURST_MAX_WAIT {
+                break;
+            }
+            let gap = OUTPUT_BURST_GAP.min(OUTPUT_BURST_MAX_WAIT - waited);
+            match received.recv_timeout(gap) {
+                Ok(chunk) => burst.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                // The program is gone; send what it wrote last, then stop.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        // The screen and the attached client are updated under one lock, so an
+        // attach sees every byte either in its repaint or on its stream. The
+        // client first: it is the one someone is watching.
+        let mut state = session.state();
+        let client_gone = state.attached.as_ref().is_some_and(|attachment| {
+            attachment
+                .output
+                .send(Outgoing::Output(burst.clone()))
+                .is_err()
+        });
+        if client_gone {
+            state.attached = None;
+        }
+        state.screen.advance(&burst);
+    }
+}
+
+/// Reads a session's pty until it closes, handing each read to
+/// [`pump_output`].
+fn read_output(mut output: Box<dyn Read + Send>, chunks: mpsc::SyncSender<Vec<u8>>) {
     let mut buffer = vec![0; 64 * 1024];
     loop {
         let len = match output.read(&mut buffer) {
@@ -474,17 +546,8 @@ fn pump_output(session: &Session, mut output: Box<dyn Read + Send>) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
         };
-        let bytes = &buffer[..len];
-        // The screen and the attached client are updated under one lock, so an
-        // attach sees every byte either in its repaint or on its stream.
-        let mut state = session.state();
-        state.screen.advance(bytes);
-        let disconnected = state
-            .attached
-            .as_ref()
-            .is_some_and(|attachment| attachment.output.send(Outgoing::Output(bytes.to_vec())).is_err());
-        if disconnected {
-            state.attached = None;
+        if chunks.send(buffer[..len].to_vec()).is_err() {
+            return;
         }
     }
 }
@@ -687,6 +750,60 @@ mod tests {
         };
         assert_eq!(exit, 7i32.to_be_bytes());
         assert!(host.sessions()?.is_empty());
+        fs::remove_dir_all(dir).ok();
+        Ok(())
+    }
+
+    /// A program redrawing its screen writes it all at once, but a pty hands
+    /// it over a kilobyte at a time on macOS. Forwarding each kilobyte as it
+    /// comes lets the client paint the screen half redrawn — a flicker on
+    /// every redraw — so a burst reaches the client in as few frames as the
+    /// cap allows.
+    #[test]
+    fn a_burst_of_output_reaches_the_client_whole() -> Result<()> {
+        let (host, dir) = start_daemon()?;
+        let session = host.create(command(
+            "echo ready; read line; head -c 30000 /dev/zero | tr '\\0' x; echo; echo done; read line",
+        ))?;
+        let stream = UnixStream::connect(&host.socket)?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = stream;
+        write_message(
+            &mut writer,
+            &Envelope {
+                version: PROTOCOL_VERSION,
+                request: Request::Attach {
+                    id: session.id.clone(),
+                    cols: 100,
+                    rows: 30,
+                    client_pid: 1,
+                },
+            },
+        )?;
+        assert!(matches!(read_message(&mut reader)?, Response::Attached));
+        read_until(&mut reader, "ready")?;
+
+        write_frame(&mut writer, frame::DATA, b"go\n")?;
+        let mut burst_frames = 0;
+        let mut seen = 0;
+        while seen < 30000 {
+            let Some((kind, payload)) = read_frame(&mut reader)? else {
+                bail!("stream ended mid-burst");
+            };
+            if kind != frame::DATA {
+                continue;
+            }
+            let xs = payload.iter().filter(|byte| **byte == b'x').count();
+            if xs > 0 {
+                burst_frames += 1;
+                seen += xs;
+            }
+        }
+        assert!(
+            burst_frames <= 2,
+            "30 KB written at once arrived in {burst_frames} frames"
+        );
+        assert!(host.kill(&session.id, None)?);
         fs::remove_dir_all(dir).ok();
         Ok(())
     }
