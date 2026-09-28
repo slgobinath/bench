@@ -10180,6 +10180,7 @@ dependencies = [
  "ui_input",
  "util",
  "workspace",
+ "zed_actions",
  "zed_credentials_provider",
 ]
 

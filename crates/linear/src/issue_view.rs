@@ -17,6 +17,13 @@ use workspace::item::{Item, ItemEvent};
 
 use crate::{CreateWorktree, Issue, IssueDetail, Linear, LinearEvent};
 
+/// The link, with a trailing space so it doesn't fuse with what is typed next.
+pub(crate) fn send_to_agent(url: &str) -> zed_actions::claude::SendText {
+    zed_actions::claude::SendText {
+        text: format!("{url} "),
+    }
+}
+
 /// Opens an issue's tab in the workspace, or goes to it if it is already open.
 pub fn open_issue(
     workspace: &mut Workspace,
@@ -50,6 +57,9 @@ pub struct IssueView {
     identifier: SharedString,
     /// What the tab is titled with before the issue has loaded, and after.
     title: Option<SharedString>,
+    /// Known once the issue has loaded; the tab can only be sent to the agent
+    /// from then on.
+    url: Option<SharedString>,
     project: Entity<Project>,
     loaded: Loaded,
     focus_handle: FocusHandle,
@@ -83,6 +93,7 @@ impl IssueView {
         let mut this = Self {
             identifier,
             title: None,
+            url: None,
             project,
             loaded: Loaded::Loading,
             focus_handle: cx.focus_handle(),
@@ -123,6 +134,7 @@ impl IssueView {
             cx.new(|cx| Markdown::new(source, Some(languages), None, cx))
         };
         self.title = Some(detail.issue.title.clone());
+        self.url = Some(detail.issue.url.clone());
         let description = detail
             .description
             .as_deref()
@@ -389,6 +401,20 @@ impl Item for IssueView {
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
         Some(Icon::new(IconName::ListTodo))
+    }
+
+    fn tab_extra_context_menu_actions(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+        self.url
+            .iter()
+            .map(|url| {
+                let action: Box<dyn gpui::Action> = Box::new(send_to_agent(url));
+                ("Send to Agent".into(), action)
+            })
+            .collect()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

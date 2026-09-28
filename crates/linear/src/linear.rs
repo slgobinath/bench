@@ -450,11 +450,12 @@ struct Lookup {
     fresh_until: Instant,
 }
 
-/// How the panel groups the issues it lists.
+/// How the panel groups the issues it lists. By status until chosen
+/// otherwise: where an issue stands is what you scan the list for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum IssueGrouping {
-    #[default]
     None,
+    #[default]
     Status,
     Cycle,
 }

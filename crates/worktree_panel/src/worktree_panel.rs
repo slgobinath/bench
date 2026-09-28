@@ -23,7 +23,7 @@
 //! the only owner of the workspace and project list, and a second copy of it
 //! here would be a second thing to keep honest.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -297,6 +297,9 @@ struct ProjectScans {
     /// By worktree root rather than by project: each worktree has files of
     /// its own.
     statuses: HashMap<PathBuf, StatusScan>,
+    /// The worktrees being pushed or pulled, by root, so that a second click
+    /// while one runs does nothing and every panel shows it running.
+    syncing: HashSet<PathBuf>,
 }
 
 /// What is known about one worktree's status; see
@@ -1855,6 +1858,19 @@ impl WorktreePanel {
             .filter(|_| !is_open)
             .map(|root| (row.key.clone(), root));
         let open_name = row.name.clone();
+        // Only the repository's own checkout: it is where the branch everyone
+        // else starts from lives, and keeping it level with its upstream is
+        // the chore. A worktree's branch is pushed when its work is done.
+        let sync = match (&row.root, row.status.ahead_behind) {
+            (Some(root), Some((ahead, behind))) if row.is_main && (ahead > 0 || behind > 0) => {
+                Some((root.clone(), ahead, behind))
+            }
+            _ => None,
+        };
+        let is_syncing = row.root.as_ref().is_some_and(|root| {
+            cx.try_global::<ProjectScans>()
+                .is_some_and(|scans| scans.syncing.contains(root))
+        });
 
         let name = match &row.issue {
             Some(issue) => name_without_identifier(&row.name, &issue.identifier),
@@ -1926,14 +1942,45 @@ impl WorktreePanel {
                             }),
                     )
                     .child(
-                        // Truncated: a long title would otherwise widen the
-                        // card past the panel.
-                        div().flex_1().min_w_0().child(
-                            Label::new(heading)
-                                .single_line()
-                                .truncate()
-                                .color(text_color),
-                        ),
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                // Truncated: a long title would otherwise
+                                // widen the card past the panel.
+                                div().min_w_0().child(
+                                    Label::new(heading)
+                                        .single_line()
+                                        .truncate()
+                                        .color(text_color),
+                                ),
+                            )
+                            .children(sync.map(|(root, ahead, behind)| {
+                                if is_syncing {
+                                    Icon::new(IconName::ArrowCircle)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted)
+                                        .with_rotate_animation(2)
+                                        .into_any_element()
+                                } else {
+                                    IconButton::new(("sync", index), IconName::ArrowCircle)
+                                        .icon_size(IconSize::XSmall)
+                                        .icon_color(Color::Accent)
+                                        .tooltip(Tooltip::text(sync_description(ahead, behind)))
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.sync_worktree(
+                                                root.clone(),
+                                                ahead > 0,
+                                                behind > 0,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .into_any_element()
+                                }
+                            })),
                     )
                     .children(row.status.last_edit.and_then(|at| {
                         let ago = SystemTime::now().duration_since(at).ok()?;
@@ -2005,6 +2052,62 @@ impl WorktreePanel {
 }
 
 impl WorktreePanel {
+    /// Pulls the commits the worktree's branch is behind by, then pushes the
+    /// ones it is ahead by. Pulling only fast-forwards: a branch that has
+    /// gone its own way needs a merge or a rebase, and which is not for a
+    /// button to decide, so git's refusal is shown instead.
+    fn sync_worktree(
+        &mut self,
+        root: PathBuf,
+        push: bool,
+        pull: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let started = cx.default_global::<ProjectScans>().syncing.insert(root.clone());
+        if !started {
+            return;
+        }
+        cx.refresh_windows();
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_spawn(sync_with_upstream(root.clone(), push, pull))
+                .await;
+            let refused = cx.update(|window, cx| {
+                record_scan(cx, |scans| {
+                    scans.syncing.remove(&root);
+                    // Due again, so the counts the sync changed are asked for
+                    // on the next draw. A refresh already in flight started
+                    // before the sync and would land with the old counts.
+                    if let Some(StatusScan::Found {
+                        checked, _refresh, ..
+                    }) = scans.statuses.get_mut(&root)
+                    {
+                        if let Some(due) = Instant::now().checked_sub(STATUS_REFRESH) {
+                            *checked = due;
+                        }
+                        *_refresh = None;
+                    }
+                });
+                result.err().map(|error| {
+                    log::warn!("could not sync {}: {error:#}", root.display());
+                    window.prompt(
+                        gpui::PromptLevel::Warning,
+                        "Could not sync with the upstream branch.",
+                        Some(&git_reason(&error)),
+                        &["OK"],
+                        cx,
+                    )
+                })
+            })?;
+            if let Some(refused) = refused {
+                refused.await?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     /// Asks for a worktree's title, starting from the one it has. Opened on
     /// the workspace the window is showing, which is the one whose panel was
     /// clicked, and deferred for the reason given on [`Self::activate`].
@@ -2219,6 +2322,16 @@ fn render_ahead_behind(index: usize, ahead: u32, behind: u32) -> Option<impl Int
             )
             .tooltip(Tooltip::text(format!("Commits {}", explained.join("; ")))),
     )
+}
+
+/// What the sync button will do, for its tooltip.
+fn sync_description(ahead: u32, behind: u32) -> String {
+    let commits = |count: u32| format!("{count} commit{}", if count == 1 { "" } else { "s" });
+    match (ahead, behind) {
+        (0, behind) => format!("Pull {}", commits(behind)),
+        (ahead, 0) => format!("Push {}", commits(ahead)),
+        (ahead, behind) => format!("Pull {} and push {}", commits(behind), commits(ahead)),
+    }
 }
 
 /// How long ago a worktree was last edited, as briefly as a card has room for.
@@ -3402,6 +3515,37 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
 /// as likely to be a cache written by a language server as anything anyone
 /// edited. Everything is left at its default when git cannot say: not a
 /// repository, no commits, no git.
+/// `git pull --ff-only`, then `git push`, as asked, in the worktree at `root`.
+async fn sync_with_upstream(root: PathBuf, push: bool, pull: bool) -> anyhow::Result<()> {
+    let git = which::which("git").map_err(|_| anyhow::anyhow!("git is not installed"))?;
+    let run = |args: &'static [&'static str]| {
+        let mut command = util::command::new_command(&git);
+        command
+            .current_dir(&root)
+            // Nobody is at a terminal to answer a credentials prompt, and
+            // waiting for one would leave the button spinning forever.
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args);
+        async move {
+            let output = command.output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "git {} failed:\n{}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            anyhow::Ok(())
+        }
+    };
+    if pull {
+        run(&["pull", "--ff-only"]).await?;
+    }
+    if push {
+        run(&["push"]).await?;
+    }
+    Ok(())
+}
+
 async fn worktree_status(fs: Arc<dyn Fs>, root: PathBuf) -> WorktreeStatus {
     let Some(git) = which::which("git").ok() else {
         return WorktreeStatus::default();

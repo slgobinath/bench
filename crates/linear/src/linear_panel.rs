@@ -26,7 +26,7 @@ use crate::{
     API_KEY_ENV_VAR, API_KEY_SETTINGS_URL, AssigneeFilter, Connection, CreateWorktree,
     CycleFilter, Issue, IssueFilters, IssueGrouping, KeySource, Linear, LinearEvent, Named,
     StateType,
-    issue_view::open_issue_in,
+    issue_view::{open_issue_in, send_to_agent},
 };
 
 actions!(
@@ -475,8 +475,9 @@ impl LinearPanel {
     fn render_issue(&self, issue: &Issue, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let identifier = issue.identifier.clone();
         let create_identifier = issue.identifier.to_string();
+        let url = issue.url.clone();
         // From the panel's own node rather than whatever has focus: the
-        // handler is the workspace's, and focus is not always inside it.
+        // handlers are the workspace's, and focus is not always inside it.
         let focus_handle = self.focus_handle.clone();
         ListItem::new(("issue", index))
             .spacing(ListItemSpacing::Sparse)
@@ -512,19 +513,38 @@ impl LinearPanel {
                 issue.identifier, issue.state.name, issue.title
             )))
             .end_slot_on_hover(
-                IconButton::new(("create-worktree", index), IconName::GitBranchPlus)
-                    .icon_size(IconSize::Small)
-                    .tooltip(Tooltip::text("Create Worktree"))
-                    .on_click(move |_, window, cx| {
-                        cx.stop_propagation();
-                        focus_handle.dispatch_action(
-                            &CreateWorktree {
-                                identifier: create_identifier.clone(),
-                            },
-                            window,
-                            cx,
-                        );
-                    }),
+                h_flex()
+                    .child(
+                        IconButton::new(("send-to-agent", index), IconName::Sparkle)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Send to Agent"))
+                            .on_click({
+                                let focus_handle = focus_handle.clone();
+                                move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    focus_handle.dispatch_action(
+                                        &send_to_agent(&url),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            }),
+                    )
+                    .child(
+                        IconButton::new(("create-worktree", index), IconName::GitBranchPlus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Create Worktree"))
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                focus_handle.dispatch_action(
+                                    &CreateWorktree {
+                                        identifier: create_identifier.clone(),
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }),
+                    ),
             )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_issue(identifier.clone(), window, cx);
