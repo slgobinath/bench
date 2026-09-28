@@ -1112,57 +1112,6 @@ impl BenchGitPanel {
         }));
     }
 
-    /// Asks the Claude session of the worktree to review the changes the
-    /// changes tab is showing. The request lands in its composer, to send or
-    /// add to.
-    fn ask_for_review(&self, window: &mut Window, cx: &mut Context<Self>) {
-        let repositories = self.selected(cx);
-        let root = project_root(&self.project, cx);
-        let names: Vec<String> = repositories
-            .iter()
-            .map(|repository| {
-                let path = work_directory(repository, cx);
-                match root.as_ref().and_then(|root| path.strip_prefix(root).ok()) {
-                    Some(relative) if !relative.as_os_str().is_empty() => {
-                        relative.to_string_lossy().into_owned()
-                    }
-                    _ => repository.read(cx).display_name().to_string(),
-                }
-            })
-            .collect();
-        let whose = match names.as_slice() {
-            [one] => format!("in {one}"),
-            many => format!("in these repositories: {}", many.join(", ")),
-        };
-        let text = match self.changes_mode {
-            ChangesMode::Working => format!(
-                "Review my uncommitted changes {whose}. Point out bugs, risky changes, missing \
-                 tests and anything that should not be committed. "
-            ),
-            ChangesMode::Branch => {
-                let bases: Vec<String> = repositories
-                    .iter()
-                    .filter_map(|repository| match self.branch_changes.get(&repository.entity_id()) {
-                        Some(BranchChanges::Loaded { base, .. }) => Some(base.to_string()),
-                        _ => None,
-                    })
-                    .collect::<HashSet<_>>()
-                    .into_iter()
-                    .collect();
-                let against = match bases.as_slice() {
-                    [base] => format!(" against {base}"),
-                    _ => " against its base branch".to_owned(),
-                };
-                format!(
-                    "Review everything on this branch{against}, committed or not, {whose}. \
-                     Point out bugs, risky changes and missing tests, as for a pull request. "
-                )
-            }
-        };
-        self.focus_handle
-            .dispatch_action(&zed_actions::claude::SendText { text }, window, cx);
-    }
-
     // Remote operations
 
     /// Runs `operation` on every selected repository in turn, and says how it
@@ -1519,14 +1468,6 @@ impl BenchGitPanel {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.tree = !this.tree;
                                 cx.notify();
-                            })),
-                    )
-                    .child(
-                        IconButton::new("ask-for-review", IconName::AiClaude)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Ask Claude to Review"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.ask_for_review(window, cx)
                             })),
                     ),
             )
