@@ -265,6 +265,13 @@
     },
   },
   {
+    "context": "SqlConsole",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-enter": "database::RunQuery",
+    },
+  },
+  {
     "context": "AgentFeedbackMessageEditor > Editor",
     "use_key_equivalents": true,
     "bindings": {

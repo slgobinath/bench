@@ -79,6 +79,7 @@ use settings::{
 };
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
+use database_explorer::DatabasePanel;
 use linear::LinearPanel;
 use worktree_panel::WorktreePanel;
 
@@ -789,6 +790,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
         let linear_panel = LinearPanel::load(workspace_handle.clone(), cx.clone());
+        let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -815,6 +817,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(linear_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 
@@ -6258,6 +6261,7 @@ mod tests {
             outline_panel::init(cx);
             worktree_panel::init(cx);
             linear::init(cx);
+            database_explorer::init(cx);
             agent_tracker::init(cx);
             terminal_view::init(cx);
             let credentials_provider = zed_credentials_provider::global(cx);

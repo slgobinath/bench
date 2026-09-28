@@ -1,0 +1,43 @@
+[package]
+name = "database_explorer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/database_explorer.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+credentials_provider.workspace = true
+db.workspace = true
+editor.workspace = true
+futures.workspace = true
+gpui.workspace = true
+# Postgres, through sqlx, wants a Tokio reactor; GPUI's executor is not one.
+gpui_tokio.workspace = true
+language.workspace = true
+log.workspace = true
+menu.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# The simple query protocol, which `sqlx::raw_sql` uses, hands every value back
+# as text; that is what lets arbitrary SQL be shown without a decoder per type.
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres"] }
+ui.workspace = true
+ui_input.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+zed_credentials_provider.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+# The ignored test that runs against a real server needs a reactor of its own.
+tokio = { workspace = true, features = ["rt-multi-thread"] }

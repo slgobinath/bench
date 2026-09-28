@@ -771,6 +771,7 @@ fn main() {
         outline_panel::init(cx);
         worktree_panel::init(cx);
         linear::init(cx);
+        database_explorer::init(cx);
         agent_tracker::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);

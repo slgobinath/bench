@@ -227,6 +227,12 @@
     },
   },
   {
+    "context": "SqlConsole",
+    "bindings": {
+      "ctrl-enter": "database::RunQuery",
+    },
+  },
+  {
     "context": "AgentFeedbackMessageEditor > Editor",
     "bindings": {
       "escape": "menu::Cancel",
