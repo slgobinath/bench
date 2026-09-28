@@ -28,6 +28,7 @@ use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::{Result, anyhow};
 use askpass::AskPassDelegate;
 use editor::Editor;
+use file_icons::FileIcons;
 use futures::StreamExt as _;
 use git::repository::{
     CommitData, CommitOptions, DiffType, FetchOptions, LogOrder, LogSource, PushOptions,
@@ -66,6 +67,9 @@ use workspace::{
 use crate::branch_diff::BranchDiff;
 use crate::commit_tooltip::CommitAvatar;
 use crate::commit_view::CommitView;
+use crate::git_graph::{
+    ChangedFileEntry, ChangedFileTreeEntry, TREE_INDENT, build_changed_file_tree_entries,
+};
 use crate::git_panel::{GitPanel, GitStatusEntry};
 use crate::git_panel_settings::GitPanelSettings;
 use crate::git_status_icon;
@@ -330,8 +334,8 @@ impl Section {
 #[derive(Debug, PartialEq)]
 enum FileRow {
     Folder {
-        path: String,
-        name: String,
+        path: RepoPath,
+        name: SharedString,
         depth: usize,
         collapsed: bool,
     },
@@ -341,66 +345,43 @@ enum FileRow {
     },
 }
 
-/// The rows of a file list, flat or as a tree of folders. `paths` are the
-/// files in the order they are listed; a folder in `collapsed` hides what is
-/// in it.
-fn file_rows(paths: &[&str], tree: bool, collapsed: &HashSet<String>) -> Vec<FileRow> {
+/// The rows of a file list, flat or as the same tree the diff view lists
+/// files in, where a folder holding only one folder shares its row. A folder
+/// in `collapsed` hides what is in it.
+fn file_rows(changes: &[Change], tree: bool, collapsed: &HashSet<RepoPath>) -> Vec<FileRow> {
     if !tree {
-        return (0..paths.len())
+        return (0..changes.len())
             .map(|index| FileRow::File { index, depth: 0 })
             .collect();
     }
-    let mut order: Vec<usize> = (0..paths.len()).collect();
-    order.sort_by(|a, b| {
-        let a = paths.get(*a).copied().unwrap_or_default();
-        let b = paths.get(*b).copied().unwrap_or_default();
-        a.cmp(b)
-    });
-
-    let mut rows = Vec::new();
-    let mut open: Vec<String> = Vec::new();
-    for index in order {
-        let Some(path) = paths.get(index) else {
-            continue;
-        };
-        let components: Vec<&str> = path.split('/').collect();
-        let folders = components.len().saturating_sub(1);
-        let common = open
-            .iter()
-            .zip(components.iter())
-            .take_while(|(held, component)| held.as_str() == **component)
-            .count();
-        open.truncate(common);
-        let mut hidden = false;
-        for depth in 0..folders {
-            let prefix = components[..=depth].join("/");
-            if hidden {
-                break;
-            }
-            if depth >= open.len() {
-                let is_collapsed = collapsed.contains(&prefix);
-                rows.push(FileRow::Folder {
-                    name: components.get(depth).copied().unwrap_or_default().to_owned(),
-                    path: prefix.clone(),
-                    depth,
-                    collapsed: is_collapsed,
-                });
-                open.push(components.get(depth).copied().unwrap_or_default().to_owned());
-                if is_collapsed {
-                    hidden = true;
-                }
-            } else if collapsed.contains(&prefix) {
-                hidden = true;
-            }
-        }
-        if !hidden {
-            rows.push(FileRow::File {
-                index,
-                depth: if folders > 0 { folders } else { 0 },
-            });
-        }
-    }
-    rows
+    let index_by_path: HashMap<&RepoPath, usize> = changes
+        .iter()
+        .enumerate()
+        .map(|(index, change)| (&change.path, index))
+        .collect();
+    let expanded: collections::HashMap<RepoPath, bool> = collapsed
+        .iter()
+        .map(|path| (path.clone(), false))
+        .collect();
+    let files = changes
+        .iter()
+        .map(|change| ChangedFileEntry::new(change.path.clone(), change.status))
+        .collect();
+    build_changed_file_tree_entries(files, &expanded)
+        .into_iter()
+        .filter_map(|entry| match entry {
+            ChangedFileTreeEntry::Directory(directory) => Some(FileRow::Folder {
+                path: directory.path,
+                name: directory.name,
+                depth: directory.depth,
+                collapsed: !directory.expanded,
+            }),
+            ChangedFileTreeEntry::File(file) => Some(FileRow::File {
+                index: *index_by_path.get(&file.entry.repo_path)?,
+                depth: file.depth,
+            }),
+        })
+        .collect()
 }
 
 pub struct BenchGitPanel {
@@ -411,7 +392,7 @@ pub struct BenchGitPanel {
     changes_mode: ChangesMode,
     tree: bool,
     /// Folders closed in tree view, by repository and folder path.
-    collapsed: HashSet<(EntityId, String)>,
+    collapsed: HashSet<(EntityId, RepoPath)>,
     selected_commit: Option<(EntityId, String)>,
     commit_editor: Entity<Editor>,
     amend: bool,
@@ -598,20 +579,23 @@ impl BenchGitPanel {
             .detach_and_log_err(cx);
     }
 
-    /// The branch's changes against its base, as one diff.
+    /// The branch's changes against its base, as one diff, scrolled to
+    /// `change` when one is given.
     fn open_branch_diff(
         &self,
         repository: &Entity<Repository>,
         base: SharedString,
+        change: Option<&Change>,
         window: &mut Window,
         cx: &mut App,
     ) {
         let project = self.project.clone();
         let repository = repository.clone();
+        let file = change.map(|change| (change.path.clone(), change.status));
         self.workspace
             .update(cx, |workspace, cx| {
-                BranchDiff::deploy_branch_diff_with_base_ref(
-                    workspace, project, repository, base, None, window, cx,
+                BranchDiff::deploy_branch_diff_at_file(
+                    workspace, project, repository, base, None, file, window, cx,
                 );
             })
             .ok();
@@ -1612,14 +1596,13 @@ impl BenchGitPanel {
         cx: &mut Context<Self>,
     ) {
         let repository_id = repository.entity_id();
-        let collapsed: HashSet<String> = self
+        let collapsed: HashSet<RepoPath> = self
             .collapsed
             .iter()
             .filter(|(id, _)| *id == repository_id)
             .map(|(_, path)| path.clone())
             .collect();
-        let paths: Vec<&str> = changes.iter().map(|change| change.path.as_unix_str()).collect();
-        for (row, file_row) in file_rows(&paths, self.tree, &collapsed).into_iter().enumerate() {
+        for (row, file_row) in file_rows(&changes, self.tree, &collapsed).into_iter().enumerate() {
             let id = key * 100_000 + row;
             match file_row {
                 FileRow::Folder {
@@ -1628,24 +1611,35 @@ impl BenchGitPanel {
                     depth,
                     collapsed,
                 } => {
-                    let folder = path.clone();
+                    let folder_icon =
+                        FileIcons::get_folder_icon(!collapsed, path.as_std_path(), cx)
+                            .map(Icon::from_path)
+                            .unwrap_or_else(|| {
+                                Icon::new(if collapsed {
+                                    IconName::Folder
+                                } else {
+                                    IconName::FolderOpen
+                                })
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted);
                     rows.push(
                         ListItem::new(("folder", id))
                             .spacing(ListItemSpacing::Sparse)
                             .indent_level(depth)
-                            .indent_step_size(px(12.))
-                            .start_slot(
-                                Icon::new(if collapsed {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
+                            .indent_step_size(px(TREE_INDENT))
+                            .start_slot(folder_icon)
+                            .child(
+                                Label::new(name)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .truncate(),
                             )
-                            .child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
+                            .tooltip(Tooltip::text(SharedString::from(
+                                path.as_unix_str().to_owned(),
+                            )))
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let key = (repository_id, folder.clone());
+                                let key = (repository_id, path.clone());
                                 if !this.collapsed.remove(&key) {
                                     this.collapsed.insert(key);
                                 }
@@ -1717,10 +1711,11 @@ impl BenchGitPanel {
         let open_change = change.clone();
         let menu_repository = repository.clone();
         let menu_change = change.clone();
+        let full_path = SharedString::from(change.path.as_unix_str().to_owned());
         ListItem::new(("file", id))
             .spacing(ListItemSpacing::Sparse)
             .indent_level(depth)
-            .indent_step_size(px(12.))
+            .indent_step_size(px(TREE_INDENT))
             .start_slot(
                 h_flex()
                     .gap_1()
@@ -1731,7 +1726,12 @@ impl BenchGitPanel {
                 h_flex()
                     .min_w_0()
                     .gap_1()
-                    .child(Label::new(file_name).size(LabelSize::Small).single_line())
+                    .child(
+                        Label::new(file_name)
+                            .size(LabelSize::Small)
+                            .when(change.status.is_deleted(), Label::strikethrough)
+                            .single_line(),
+                    )
                     .children(directory.map(|directory| {
                         Label::new(directory)
                             .size(LabelSize::Small)
@@ -1740,8 +1740,15 @@ impl BenchGitPanel {
                             .truncate()
                     })),
             )
+            .tooltip(Tooltip::text(full_path))
             .on_click(cx.listener(move |this, _, window, cx| match &branch_base {
-                Some(base) => this.open_branch_diff(&open_repository, base.clone(), window, cx),
+                Some(base) => this.open_branch_diff(
+                    &open_repository,
+                    base.clone(),
+                    Some(&open_change),
+                    window,
+                    cx,
+                ),
                 None => this.open_diff(&open_repository, &open_change, window, cx),
             }))
             .on_secondary_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -2727,48 +2734,57 @@ mod tests {
         panel
     }
 
+    fn change(path: &str) -> Change {
+        Change {
+            path: RepoPath::new(path).expect("a repository path"),
+            status: FileStatus::Untracked,
+            staging: StageStatus::Unstaged,
+        }
+    }
+
     #[test]
     fn files_are_listed_flat_or_as_a_tree() {
-        let paths = ["src/b.rs", "a.txt", "src/deep/c.rs"];
+        let changes = [
+            change("src/b.rs"),
+            change("a.txt"),
+            change("src/deep/c.rs"),
+            change("java/io/app/Main.java"),
+        ];
+        let folder = |path: &str, name: &str, depth: usize, collapsed: bool| FileRow::Folder {
+            path: RepoPath::new(path).expect("a repository path"),
+            name: SharedString::from(name.to_owned()),
+            depth,
+            collapsed,
+        };
         assert_eq!(
-            file_rows(&paths, false, &HashSet::new()),
-            vec![
-                FileRow::File { index: 0, depth: 0 },
-                FileRow::File { index: 1, depth: 0 },
-                FileRow::File { index: 2, depth: 0 },
-            ]
+            file_rows(&changes, false, &HashSet::new()),
+            (0..4)
+                .map(|index| FileRow::File { index, depth: 0 })
+                .collect::<Vec<_>>()
         );
         assert_eq!(
-            file_rows(&paths, true, &HashSet::new()),
+            file_rows(&changes, true, &HashSet::new()),
             vec![
-                FileRow::File { index: 1, depth: 0 },
-                FileRow::Folder {
-                    path: "src".into(),
-                    name: "src".into(),
-                    depth: 0,
-                    collapsed: false
-                },
-                FileRow::File { index: 0, depth: 1 },
-                FileRow::Folder {
-                    path: "src/deep".into(),
-                    name: "deep".into(),
-                    depth: 1,
-                    collapsed: false
-                },
+                folder("java/io/app", "java/io/app", 0, false),
+                FileRow::File { index: 3, depth: 1 },
+                folder("src", "src", 0, false),
+                folder("src/deep", "deep", 1, false),
                 FileRow::File { index: 2, depth: 2 },
-            ]
-        );
-        let collapsed: HashSet<String> = ["src".to_owned()].into_iter().collect();
-        assert_eq!(
-            file_rows(&paths, true, &collapsed),
-            vec![
+                FileRow::File { index: 0, depth: 1 },
                 FileRow::File { index: 1, depth: 0 },
-                FileRow::Folder {
-                    path: "src".into(),
-                    name: "src".into(),
-                    depth: 0,
-                    collapsed: true
-                },
+            ],
+            "a folder holding only one folder shares its row"
+        );
+        let collapsed: HashSet<RepoPath> = [RepoPath::new("src").expect("a repository path")]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            file_rows(&changes, true, &collapsed),
+            vec![
+                folder("java/io/app", "java/io/app", 0, false),
+                FileRow::File { index: 3, depth: 1 },
+                folder("src", "src", 0, true),
+                FileRow::File { index: 1, depth: 0 },
             ],
             "a closed folder hides what is in it"
         );

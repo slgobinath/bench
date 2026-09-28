@@ -319,15 +319,6 @@ pub(crate) enum ChangedFileTreeEntry {
     File(ChangedFileTreeStatusEntry),
 }
 
-impl ChangedFileTreeEntry {
-    pub(crate) fn depth(&self) -> usize {
-        match self {
-            Self::Directory(entry) => entry.depth,
-            Self::File(entry) => entry.depth,
-        }
-    }
-}
-
 pub(crate) struct ChangedFileTreeStatusEntry {
     pub(crate) entry: ChangedFileEntry,
     pub(crate) depth: usize,

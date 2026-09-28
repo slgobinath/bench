@@ -26,17 +26,13 @@ use gpui::{
 };
 use language::{Language, LanguageRegistry};
 use project::{
-    git_store::diff_buffer_list::DiffBufferList,
     search::SearchQuery,
     search_history::{SearchHistory, SearchHistoryCursor},
 };
 
-use settings::{SeedQuerySetting, Settings, SettingsStore};
+use settings::{SeedQuerySetting, Settings};
 use std::{any::TypeId, sync::Arc};
-use zed_actions::{
-    git::ToggleDiffFileTree, outline::ToggleOutline, workspace::CopyPath,
-    workspace::CopyRelativePath,
-};
+use zed_actions::{outline::ToggleOutline, workspace::CopyPath, workspace::CopyRelativePath};
 
 use ui::{BASE_REM_SIZE_IN_PX, IconButtonShape, Tooltip, prelude::*, utils::SearchInputWidth};
 use util::{ResultExt, paths::PathMatcher};
@@ -98,8 +94,6 @@ pub struct BufferSearchBar {
     regex_language: Option<Arc<Language>>,
     splittable_editor: Option<WeakEntity<SplittableEditor>>,
     _splittable_editor_subscription: Option<Subscription>,
-    has_diff_file_tree: bool,
-    _diff_file_tree_settings_subscription: Option<Subscription>,
 }
 
 impl EventEmitter<Event> for BufferSearchBar {}
@@ -113,38 +107,6 @@ impl Render for BufferSearchBar {
             .as_ref()
             .and_then(|weak| weak.upgrade())
             .map(DiffStyleControls::new);
-
-        let file_tree_button = self.has_diff_file_tree.then(|| {
-            let is_shown = cx
-                .global::<SettingsStore>()
-                .merged_settings()
-                .git_panel
-                .as_ref()
-                .and_then(|git_panel| git_panel.diff_file_tree)
-                .unwrap_or(true);
-            let tooltip_label = if is_shown {
-                "Hide Changed Files"
-            } else {
-                "Show Changed Files"
-            };
-            let query_editor_focus = self.query_editor.focus_handle(cx);
-            IconButton::new(
-                "toggle-diff-file-tree",
-                if is_shown {
-                    IconName::ThreadsSidebarLeftOpen
-                } else {
-                    IconName::ThreadsSidebarLeftClosed
-                },
-            )
-            .icon_size(IconSize::Small)
-            .toggle_state(is_shown)
-            .tooltip(move |_, cx| {
-                Tooltip::for_action_in(tooltip_label, &ToggleDiffFileTree, &query_editor_focus, cx)
-            })
-            .on_click(|_, window, cx| {
-                window.dispatch_action(Box::new(ToggleDiffFileTree), cx);
-            })
-        });
 
         let collapse_expand_button = if self.needs_expand_collapse_option(cx) {
             let query_editor_focus = self.query_editor.focus_handle(cx);
@@ -182,7 +144,6 @@ impl Render for BufferSearchBar {
                 return h_flex()
                     .pl_0p5()
                     .gap_1()
-                    .children(file_tree_button)
                     .child(collapse_expand_icon_button(
                         "multibuffer-collapse-expand-empty",
                     ))
@@ -193,7 +154,6 @@ impl Render for BufferSearchBar {
             Some(
                 h_flex()
                     .gap_1()
-                    .children(file_tree_button)
                     .child(collapse_expand_icon_button("multibuffer-collapse-expand"))
                     .children(split_buttons)
                     .into_any_element(),
@@ -570,7 +530,6 @@ impl ToolbarItemView for BufferSearchBar {
         self.active_searchable_item_subscriptions.take();
         self.splittable_editor = None;
         self._splittable_editor_subscription = None;
-        self._diff_file_tree_settings_subscription = None;
         self.pending_search.take();
 
         if let Some(item) = self.active_searchable_item.take() {
@@ -586,16 +545,6 @@ impl ToolbarItemView for BufferSearchBar {
                     cx.notify();
                 }));
             self.splittable_editor = Some(splittable_editor.downgrade());
-        }
-
-        // Only the git diff views that list their changed files beside the diff
-        // expose a `DiffBufferList`.
-        self.has_diff_file_tree = item
-            .and_then(|item| item.act_as_type(TypeId::of::<DiffBufferList>(), cx))
-            .is_some();
-        if self.has_diff_file_tree {
-            self._diff_file_tree_settings_subscription =
-                Some(cx.observe_global::<SettingsStore>(|_, cx| cx.notify()));
         }
 
         if let Some(searchable_item_handle) =
@@ -866,8 +815,6 @@ impl BufferSearchBar {
             regex_language: None,
             splittable_editor: None,
             _splittable_editor_subscription: None,
-            has_diff_file_tree: false,
-            _diff_file_tree_settings_subscription: None,
         }
     }
 

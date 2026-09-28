@@ -1,6 +1,7 @@
 use crate::{
     branch_picker,
     diff_multibuffer::DiffMultibuffer,
+    git_panel::GitStatusEntry,
     project_diff::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
         render_send_review_to_agent_button,
@@ -12,7 +13,10 @@ use editor::{
     Addon, Editor, EditorEvent, HiddenDiffHunkRenderer, SplittableEditor,
     actions::SendReviewToAgent,
 };
-use git::{repository::DiffType, status::FileStatus};
+use git::{
+    repository::{DiffType, RepoPath},
+    status::FileStatus,
+};
 use gpui::{
     Action, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
     SharedString, Subscription, Task, WeakEntity,
@@ -201,6 +205,30 @@ impl BranchDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_branch_diff_at_file(
+            workspace,
+            project,
+            intended_repo,
+            base_ref,
+            branch_diff,
+            None,
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the branch diff, or brings back the one already open, scrolled
+    /// to `file` when one is given.
+    pub(crate) fn deploy_branch_diff_at_file(
+        workspace: &mut Workspace,
+        project: Entity<Project>,
+        intended_repo: Entity<Repository>,
+        base_ref: SharedString,
+        branch_diff: Option<Entity<diff_buffer_list::DiffBufferList>>,
+        file: Option<(RepoPath, FileStatus)>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let existing = workspace.items_of_type::<Self>(cx).find(|item| {
             let item = item.read(cx);
             matches!(
@@ -215,6 +243,11 @@ impl BranchDiff {
         });
         if let Some(existing) = existing {
             workspace.activate_item(&existing, true, true, window, cx);
+            if let Some((repo_path, status)) = file {
+                existing.update(cx, |existing, cx| {
+                    existing.move_to_file(repo_path, status, window, cx)
+                });
+            }
             return;
         }
 
@@ -237,12 +270,40 @@ impl BranchDiff {
                     .await?;
                 workspace
                     .update_in(cx, |workspace, window, cx| {
-                        workspace.add_item_to_active_pane(Box::new(this), None, true, window, cx);
+                        workspace.add_item_to_active_pane(
+                            Box::new(this.clone()),
+                            None,
+                            true,
+                            window,
+                            cx,
+                        );
+                        if let Some((repo_path, status)) = file {
+                            this.update(cx, |this, cx| {
+                                this.move_to_file(repo_path, status, window, cx)
+                            });
+                        }
                     })
                     .ok();
                 anyhow::Ok(())
             })
             .detach_and_notify_err(workspace_weak, window, cx);
+    }
+
+    fn move_to_file(
+        &mut self,
+        repo_path: RepoPath,
+        status: FileStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let entry = GitStatusEntry {
+            repo_path,
+            status,
+            staging: status.staging(),
+            diff_stat: None,
+        };
+        self.diff
+            .update(cx, |diff, cx| diff.move_to_entry(entry, window, cx));
     }
 
     #[cfg(any(test, feature = "test-support"))]
