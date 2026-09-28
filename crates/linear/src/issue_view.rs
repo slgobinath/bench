@@ -18,7 +18,7 @@ use workspace::item::{Item, ItemEvent};
 use crate::{CreateWorktree, Issue, IssueDetail, Linear, LinearEvent};
 
 /// The link, with a trailing space so it doesn't fuse with what is typed next.
-pub(crate) fn send_to_agent(url: &str) -> zed_actions::claude::SendText {
+pub fn send_to_agent(url: &str) -> zed_actions::claude::SendText {
     zed_actions::claude::SendText {
         text: format!("{url} "),
     }
@@ -194,6 +194,7 @@ impl IssueView {
                                         focus_handle.dispatch_action(
                                             &CreateWorktree {
                                                 identifier: identifier.clone(),
+                                                start_agent: false,
                                             },
                                             window,
                                             cx,
@@ -408,13 +409,19 @@ impl Item for IssueView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
-        self.url
-            .iter()
-            .map(|url| {
-                let action: Box<dyn gpui::Action> = Box::new(send_to_agent(url));
-                ("Send to Agent".into(), action)
-            })
-            .collect()
+        let Some(url) = &self.url else {
+            return Vec::new();
+        };
+        vec![
+            (
+                "Create Worktree and Start Agent".into(),
+                Box::new(CreateWorktree {
+                    identifier: self.identifier.to_string(),
+                    start_agent: true,
+                }),
+            ),
+            ("Send to Agent".into(), Box::new(send_to_agent(url))),
+        ]
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

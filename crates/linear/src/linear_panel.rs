@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
+    AnyElement, App, AsyncWindowContext, Context, DismissEvent, Entity, EventEmitter, FocusHandle,
     Focusable, Hsla, SharedString, Task, WeakEntity, Window, actions, prelude::*,
 };
 use time::OffsetDateTime;
@@ -64,6 +64,8 @@ pub struct LinearPanel {
     search: Arc<dyn ErasedEditor>,
     api_key: Entity<InputField>,
     connect_error: Option<SharedString>,
+    /// The menu of an issue row, while it is open.
+    context_menu: Option<(Entity<ContextMenu>, gpui::Point<gpui::Pixels>, gpui::Subscription)>,
     _connect: Option<Task<()>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -135,6 +137,15 @@ impl LinearPanel {
             },
         ));
 
+        // Coming back to Bench is when a status moved in Linear is looked
+        // for, so it should not wait for the next poll.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.linear
+                    .update(cx, |linear, cx| linear.poll_if_stale(cx));
+            }
+        }));
+
         let api_key = cx.new(|cx| {
             InputField::new(window, cx, "lin_api_…")
                 .label("Personal API key")
@@ -149,6 +160,7 @@ impl LinearPanel {
             search,
             api_key,
             connect_error: None,
+            context_menu: None,
             _connect: None,
             _subscriptions: subscriptions,
         }
@@ -209,6 +221,44 @@ impl LinearPanel {
     /// Opens an issue's tab. Deferred, for the reason the worktree panel's
     /// `activate` gives: focusing the new tab walks the docks, this panel
     /// among them, and a click handler holds this panel's lease.
+    fn deploy_issue_menu(
+        &mut self,
+        issue: &Issue,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let create_worktree = CreateWorktree {
+            identifier: issue.identifier.to_string(),
+            start_agent: false,
+        };
+        let create_worktree_and_start_agent = CreateWorktree {
+            start_agent: true,
+            ..create_worktree.clone()
+        };
+        let send = send_to_agent(&issue.url);
+        // From the panel's own node rather than whatever has focus: the
+        // handlers are the workspace's, and focus is not always inside it.
+        let focus_handle = self.focus_handle.clone();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.context(focus_handle)
+                .action("Create Worktree", Box::new(create_worktree))
+                .action(
+                    "Create Worktree and Start Agent",
+                    Box::new(create_worktree_and_start_agent),
+                )
+                .action("Send to Agent", Box::new(send))
+        });
+        let focus = menu.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        let subscription = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
+    }
+
     fn open_issue(&self, identifier: SharedString, window: &mut Window, cx: &mut Context<Self>) {
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
@@ -474,11 +524,7 @@ impl LinearPanel {
 
     fn render_issue(&self, issue: &Issue, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let identifier = issue.identifier.clone();
-        let create_identifier = issue.identifier.to_string();
-        let url = issue.url.clone();
-        // From the panel's own node rather than whatever has focus: the
-        // handlers are the workspace's, and focus is not always inside it.
-        let focus_handle = self.focus_handle.clone();
+        let menu_issue = issue.clone();
         ListItem::new(("issue", index))
             .spacing(ListItemSpacing::Sparse)
             .height(ROW_HEIGHT)
@@ -512,40 +558,12 @@ impl LinearPanel {
                 "{} · {}\n{}",
                 issue.identifier, issue.state.name, issue.title
             )))
-            .end_slot_on_hover(
-                h_flex()
-                    .child(
-                        IconButton::new(("send-to-agent", index), IconName::Sparkle)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Send to Agent"))
-                            .on_click({
-                                let focus_handle = focus_handle.clone();
-                                move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    focus_handle.dispatch_action(
-                                        &send_to_agent(&url),
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            }),
-                    )
-                    .child(
-                        IconButton::new(("create-worktree", index), IconName::GitBranchPlus)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::text("Create Worktree"))
-                            .on_click(move |_, window, cx| {
-                                cx.stop_propagation();
-                                focus_handle.dispatch_action(
-                                    &CreateWorktree {
-                                        identifier: create_identifier.clone(),
-                                    },
-                                    window,
-                                    cx,
-                                );
-                            }),
-                    ),
-            )
+            .on_secondary_mouse_down(cx.listener(
+                move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_issue_menu(&menu_issue, event.position, window, cx);
+                },
+            ))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_issue(identifier.clone(), window, cx);
             }))
@@ -971,6 +989,15 @@ impl Render for LinearPanel {
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(body)
+            .children(self.context_menu.as_ref().map(|(menu, position, _)| {
+                gpui::deferred(
+                    gpui::anchored()
+                        .position(*position)
+                        .anchor(gpui::Anchor::TopLeft)
+                        .child(menu.clone()),
+                )
+                .with_priority(1)
+            }))
     }
 }
 

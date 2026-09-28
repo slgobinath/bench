@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 use ui::IconName;
 
 pub use dashboard::{DashboardView, OpenDashboard, open_dashboard};
-pub use issue_view::{IssueView, open_issue};
+pub use issue_view::{IssueView, open_issue, send_to_agent};
 pub use linear_panel::LinearPanel;
 
 /// Creates a worktree for a Linear issue, named after the branch Linear
@@ -49,6 +49,10 @@ pub use linear_panel::LinearPanel;
 pub struct CreateWorktree {
     /// The issue's identifier, such as `ENG-123`.
     pub identifier: String,
+    /// Whether to start Claude Code in the new worktree, with the issue's
+    /// link in its composer.
+    #[serde(default)]
+    pub start_agent: bool,
 }
 
 const API_URL: &str = "https://api.linear.app/graphql";
@@ -76,7 +80,12 @@ const LOOKUP_REFRESH: Duration = Duration::from_secs(300);
 const LOOKUP_RETRY: Duration = Duration::from_secs(15);
 /// How often what Bench shows of Linear is asked about again. Statuses move in
 /// Linear, not here, so they are only as fresh as the last time Bench asked.
-const POLL_EVERY: Duration = Duration::from_secs(60);
+/// Each poll is two requests, well inside Linear's hourly limit for a key.
+const POLL_EVERY: Duration = Duration::from_secs(30);
+/// How recent a poll has to be for coming back to Bench not to start another.
+/// Coming back is when you look, often straight after moving an issue in
+/// Linear, but a window per worktree all coming forward is one look.
+const POLL_ON_RETURN_AFTER: Duration = Duration::from_secs(10);
 
 pub fn init(cx: &mut App) {
     let linear = cx.new(Linear::new);
@@ -497,6 +506,7 @@ pub struct Linear {
     /// knowing to look.
     watched: HashSet<SharedString>,
     _poll: Task<()>,
+    last_poll: Option<Instant>,
     looking_up: bool,
 }
 
@@ -535,6 +545,7 @@ impl Linear {
                     }
                 }
             }),
+            last_poll: None,
             looking_up: false,
         };
         this.load_key(cx);
@@ -984,10 +995,22 @@ impl Linear {
 
     /// Asks again about every issue a panel is showing, and refreshes the
     /// panel's list, so a status changed in Linear shows up here.
+    /// Polls now, unless that was done moments ago; see
+    /// [`POLL_ON_RETURN_AFTER`].
+    pub fn poll_if_stale(&mut self, cx: &mut Context<Self>) {
+        if self
+            .last_poll
+            .is_none_or(|at| at.elapsed() >= POLL_ON_RETURN_AFTER)
+        {
+            self.poll(cx);
+        }
+    }
+
     fn poll(&mut self, cx: &mut Context<Self>) {
         if !self.is_connected() {
             return;
         }
+        self.last_poll = Some(Instant::now());
         self.queued_lookups.extend(self.watched.iter().cloned());
         self.start_lookups(cx);
         if !self.loading {
@@ -1691,6 +1714,7 @@ pub(crate) mod tests {
             queued_lookups: HashSet::new(),
             watched: HashSet::new(),
             _poll: Task::ready(()),
+            last_poll: None,
             looking_up: false,
         })
     }

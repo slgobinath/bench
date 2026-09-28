@@ -133,9 +133,10 @@ pub fn init(cx: &mut App) {
                 return;
             };
             let identifier = SharedString::from(action.identifier.clone());
+            let start_agent = action.start_agent;
             window.defer(cx, move |window, cx| {
                 panel.update(cx, |panel, cx| {
-                    panel.add_worktree_for_issue(identifier, window, cx);
+                    panel.add_worktree_for_issue(identifier, start_agent, window, cx);
                 });
             });
         });
@@ -300,6 +301,9 @@ struct ProjectScans {
     /// The worktrees being pushed or pulled, by root, so that a second click
     /// while one runs does nothing and every panel shows it running.
     syncing: HashSet<PathBuf>,
+    /// When each repository's own checkout was last fetched; see
+    /// [`FETCH_EVERY`].
+    fetched: HashMap<PathBuf, Instant>,
 }
 
 /// What is known about one worktree's status; see
@@ -333,6 +337,13 @@ struct WorktreeStatus {
 /// because an agent at work edits all the time and "edited an hour ago" on a
 /// worktree it is busy in reads as wrong; each ask is one `git status`.
 const STATUS_REFRESH: Duration = Duration::from_secs(30);
+
+/// How often a repository's own checkout is fetched, so that its card knows
+/// what there is to pull. Git only knows the upstream as of the last fetch,
+/// and nothing else in Bench fetches, so without this the sync button would
+/// never offer a teammate's commits. Fetching updates the remote branches every
+/// worktree of the repository shares, so the main checkout's is enough.
+const FETCH_EVERY: Duration = Duration::from_secs(300);
 
 impl Global for ProjectScans {}
 
@@ -820,11 +831,14 @@ impl WorktreePanel {
     /// file last changed, how many have, and how the branch stands against
     /// its upstream. Started from `render`, like the other scans, and as cheap
     /// to call on every draw: a worktree asked about recently is skipped.
-    fn scan_statuses(&mut self, roots: &[PathBuf], cx: &mut Context<Self>) {
+    ///
+    /// A root marked to fetch is the repository's own checkout, fetched first
+    /// when [`FETCH_EVERY`] has passed.
+    fn scan_statuses(&mut self, roots: &[(PathBuf, bool)], cx: &mut Context<Self>) {
         let Some(fs) = self.fs(cx) else {
             return;
         };
-        for root in roots {
+        for (root, may_fetch) in roots {
             match cx.default_global::<ProjectScans>().statuses.get(root) {
                 Some(StatusScan::Pending { .. }) => continue,
                 Some(StatusScan::Found {
@@ -833,11 +847,34 @@ impl WorktreePanel {
                 _ => {}
             }
 
+            let scans = cx.default_global::<ProjectScans>();
+            let fetch = *may_fetch
+                && scans
+                    .fetched
+                    .get(root)
+                    .is_none_or(|at| at.elapsed() >= FETCH_EVERY);
+            if fetch {
+                // Before the fetch rather than after, so that one that fails
+                // waits its turn like one that worked instead of being retried
+                // on every draw.
+                scans.fetched.insert(root.clone(), Instant::now());
+            }
+
             let scan = cx.spawn({
                 let fs = fs.clone();
                 let root = root.clone();
                 async move |_, cx| {
-                    let status = cx.background_spawn(worktree_status(fs, root.clone())).await;
+                    let status = cx
+                        .background_spawn({
+                            let root = root.clone();
+                            async move {
+                                if fetch {
+                                    fetch_upstream(&root).await.log_err();
+                                }
+                                worktree_status(fs, root).await
+                            }
+                        })
+                        .await;
                     cx.update(|cx| {
                         record_scan(cx, |scans| {
                             scans.statuses.insert(
@@ -932,16 +969,21 @@ impl WorktreePanel {
     /// Like [`Self::activate`], this runs on `window.defer` and takes no
     /// `&mut Self` — see there for why a lease on this panel across an
     /// activation is a panic.
+    ///
+    /// `then` is dispatched in the worktree once it is showing, which is how a
+    /// worktree made to start an agent in gets its agent.
     fn open_worktree(
         &mut self,
         key: ProjectGroupKey,
         root: PathBuf,
         name: SharedString,
+        then: Option<Box<dyn gpui::Action>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let multi_workspace = self.multi_workspace.clone();
         window.defer(cx, move |window, cx| {
+            let window_handle = window.window_handle();
             let Some(multi_workspace) = multi_workspace.upgrade() else {
                 return;
             };
@@ -966,11 +1008,29 @@ impl WorktreePanel {
                 if let Some(opening) = opening {
                     opening.update(cx, |_, cx| cx.emit(DismissEvent));
                 }
-                if let Err(error) = opened {
-                    log::error!("opening the worktree {name}: {error:#}");
-                    leaving.update(cx, |workspace, cx| {
-                        workspace.show_error(format!("Could not open “{name}”: {error:#}"), cx);
-                    });
+                match opened {
+                    Ok(workspace) => {
+                        let Some(action) = then else {
+                            return;
+                        };
+                        // After a frame, once the worktree's workspace is the
+                        // one drawn: its actions are only reachable from there.
+                        window_handle
+                            .update(cx, |_, window, _| {
+                                window.on_next_frame(move |window, cx| {
+                                    let focus_handle = workspace.read(cx).focus_handle(cx);
+                                    focus_handle.dispatch_action(&*action, window, cx);
+                                });
+                            })
+                            .log_err();
+                    }
+                    Err(error) => {
+                        log::error!("opening the worktree {name}: {error:#}");
+                        leaving.update(cx, |workspace, cx| {
+                            workspace
+                                .show_error(format!("Could not open “{name}”: {error:#}"), cx);
+                        });
+                    }
                 }
             })
             .detach();
@@ -1139,6 +1199,7 @@ impl WorktreePanel {
         repository: Entity<Repository>,
         key: ProjectGroupKey,
         issue: Option<Arc<Issue>>,
+        start_agent: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1162,7 +1223,14 @@ impl WorktreePanel {
                         panel
                             .update(cx, |panel, cx| {
                                 panel.create_worktree(
-                                    from, repository, key, name, issue, window, cx,
+                                    from,
+                                    repository,
+                                    key,
+                                    name,
+                                    issue,
+                                    start_agent,
+                                    window,
+                                    cx,
                                 );
                             })
                             .ok();
@@ -1178,6 +1246,7 @@ impl WorktreePanel {
     fn add_worktree_for_issue(
         &mut self,
         identifier: SharedString,
+        start_agent: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1237,11 +1306,12 @@ impl WorktreePanel {
                             target.repository,
                             target.key,
                             Some(issue),
+                            start_agent,
                             window,
                             cx,
                         );
                     }
-                    _ => this.choose_project(targets, issue, window, cx),
+                    _ => this.choose_project(targets, issue, start_agent, window, cx),
                 }
             })
         })
@@ -1255,6 +1325,7 @@ impl WorktreePanel {
         &mut self,
         targets: Vec<ProjectTarget>,
         issue: Arc<Issue>,
+        start_agent: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1278,6 +1349,7 @@ impl WorktreePanel {
                                     target.repository,
                                     target.key,
                                     Some(issue),
+                                    start_agent,
                                     window,
                                     cx,
                                 );
@@ -1310,10 +1382,17 @@ impl WorktreePanel {
         key: ProjectGroupKey,
         name: SharedString,
         issue: Option<Arc<Issue>>,
+        start_agent: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (path, target) = new_worktree(&key, &name);
+        // The issue linked in the dialog, which need not be the one the
+        // worktree was asked for: it could have been changed or unlinked.
+        let then: Option<Box<dyn gpui::Action>> = start_agent.then(|| match &issue {
+            Some(issue) => Box::new(linear::send_to_agent(&issue.url)) as Box<dyn gpui::Action>,
+            None => Box::new(zed_actions::claude::NewTerminal),
+        });
         // The project's other worktrees, whose colours the new one avoids.
         let siblings: Vec<PathBuf> = self
             .tree(cx)
@@ -1354,7 +1433,7 @@ impl WorktreePanel {
                     })?;
                     this.update_in(cx, |this, window, cx| {
                         this.rediscover(project_root(&key), cx);
-                        this.open_worktree(key, path, name, window, cx);
+                        this.open_worktree(key, path, name, then, window, cx);
                     })?;
                     let started = issue.and_then(|issue| {
                         let linear = cx.update(|_, cx| Linear::global(cx)).ok()??;
@@ -1811,6 +1890,7 @@ impl WorktreePanel {
                                         repository.clone(),
                                         add_key.clone(),
                                         None,
+                                        false,
                                         window,
                                         cx,
                                     );
@@ -2043,7 +2123,7 @@ impl WorktreePanel {
                 match (activate.clone(), open.clone()) {
                     (Some(workspace), _) => this.activate(workspace, window, cx),
                     (None, Some((key, root))) => {
-                        this.open_worktree(key, root, open_name.clone(), window, cx)
+                        this.open_worktree(key, root, open_name.clone(), None, window, cx)
                     }
                     (None, None) => {}
                 }
@@ -3515,6 +3595,26 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
 /// as likely to be a cache written by a language server as anything anyone
 /// edited. Everything is left at its default when git cannot say: not a
 /// repository, no commits, no git.
+/// `git fetch` in the worktree at `root`, quietly: it runs in the background,
+/// with nobody to answer a credentials prompt.
+async fn fetch_upstream(root: &Path) -> anyhow::Result<()> {
+    let git = which::which("git").map_err(|_| anyhow::anyhow!("git is not installed"))?;
+    let output = util::command::new_command(&git)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .kill_on_drop(true)
+        .args(["fetch", "--quiet"])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "git fetch in {} failed:\n{}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 /// `git pull --ff-only`, then `git push`, as asked, in the worktree at `root`.
 async fn sync_with_upstream(root: PathBuf, push: bool, pull: bool) -> anyhow::Result<()> {
     let git = which::which("git").map_err(|_| anyhow::anyhow!("git is not installed"))?;
@@ -3882,10 +3982,10 @@ impl Render for WorktreePanel {
         let filter = self.filter(cx);
         let roots: Vec<PathBuf> = tree.iter().filter_map(|row| project_root(&row.key)).collect();
         self.scan_pull_requests(&roots, cx);
-        let worktree_roots: Vec<PathBuf> = tree
+        let worktree_roots: Vec<(PathBuf, bool)> = tree
             .iter()
             .flat_map(|row| row.worktrees.iter())
-            .filter_map(|worktree| worktree.root.clone())
+            .filter_map(|worktree| Some((worktree.root.clone()?, worktree.is_main)))
             .collect();
         self.scan_statuses(&worktree_roots, cx);
         // A worktree whose issue Linear has now named, and which has no title
@@ -4710,7 +4810,7 @@ mod tests {
 
         let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
         panels[0].update_in(&mut cx, |panel, window, cx| {
-            panel.open_worktree(key, PathBuf::from("/wt/fix"), "fix".into(), window, cx);
+            panel.open_worktree(key, PathBuf::from("/wt/fix"), "fix".into(), None, window, cx);
         });
         cx.run_until_parked();
 
@@ -4788,6 +4888,7 @@ mod tests {
                 key.clone(),
                 "dev/rb-116-legal-entities".into(),
                 Some(an_issue("RB-116")),
+                false,
                 window,
                 cx,
             );
@@ -4889,6 +4990,7 @@ mod tests {
                 closed.clone(),
                 PathBuf::from("/closed"),
                 "closed".into(),
+                None,
                 window,
                 cx,
             );
