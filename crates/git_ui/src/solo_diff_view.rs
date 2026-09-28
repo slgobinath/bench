@@ -37,10 +37,41 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
+/// What a [`SoloDiffView`] compares its file against.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SoloDiffBase {
+    /// The last commit: the file's uncommitted changes.
+    Head,
+    /// Where the branch left `base_ref`: everything the branch changed in the
+    /// file, committed or not. `base_oid` is the file's blob there, or `None`
+    /// when the branch added the file.
+    Branch {
+        base_ref: SharedString,
+        base_oid: Option<git::Oid>,
+    },
+}
+
+impl SoloDiffBase {
+    fn is_same_view(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Head, Self::Head) => true,
+            (
+                Self::Branch { base_ref, .. },
+                Self::Branch {
+                    base_ref: other_base_ref,
+                    ..
+                },
+            ) => base_ref == other_base_ref,
+            _ => false,
+        }
+    }
+}
+
 pub struct SoloDiffView {
     repository: Entity<Repository>,
     repository_id: RepositoryId,
     repo_path: RepoPath,
+    base: SoloDiffBase,
     buffer: Entity<Buffer>,
     diff: Entity<buffer_diff::BufferDiff>,
     editor: Entity<SplittableEditor>,
@@ -57,6 +88,28 @@ impl SoloDiffView {
         window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Entity<Self>>> {
+        Self::open_or_focus_with_base(
+            entry,
+            repository,
+            SoloDiffBase::Head,
+            None,
+            workspace,
+            window,
+            cx,
+        )
+    }
+
+    /// Like [`Self::open_or_focus`], against `base`. `show_full_file` overrides
+    /// the `file_diff.show_full_file` setting when given.
+    pub fn open_or_focus_with_base(
+        entry: GitStatusEntry,
+        repository: Entity<Repository>,
+        base: SoloDiffBase,
+        show_full_file: Option<bool>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Entity<Self>>> {
         let Some(workspace_entity) = workspace.upgrade() else {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
@@ -64,11 +117,16 @@ impl SoloDiffView {
         let existing = workspace_entity
             .read(cx)
             .items_of_type::<SoloDiffView>(cx)
-            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, cx));
+            .find(|item| item.read(cx).matches(&repository, &entry.repo_path, &base, cx));
         if let Some(existing) = existing {
             workspace_entity.update(cx, |workspace, cx| {
                 workspace.activate_item(&existing, true, true, window, cx);
             });
+            if let Some(show_full_file) = show_full_file {
+                existing.update(cx, |existing, cx| {
+                    existing.set_showing_full_file(show_full_file, cx)
+                });
+            }
             existing.focus_handle(cx).focus(window, cx);
             return Task::ready(Ok(existing));
         }
@@ -91,11 +149,30 @@ impl SoloDiffView {
                     project.open_buffer(project_path.clone(), cx)
                 })
                 .await?;
-            let diff = project
-                .update(cx, |project, cx| {
-                    project.open_uncommitted_diff(buffer.clone(), cx)
-                })
-                .await?;
+            let diff = match &base {
+                SoloDiffBase::Head => {
+                    project
+                        .update(cx, |project, cx| {
+                            project.open_uncommitted_diff(buffer.clone(), cx)
+                        })
+                        .await?
+                }
+                SoloDiffBase::Branch { base_oid, .. } => {
+                    let base_oid = *base_oid;
+                    project
+                        .update(cx, |project, cx| {
+                            project.git_store().update(cx, |git_store, cx| {
+                                git_store.open_diff_since(
+                                    base_oid,
+                                    buffer.clone(),
+                                    repository.clone(),
+                                    cx,
+                                )
+                            })
+                        })
+                        .await?
+                }
+            };
 
             workspace_entity.update_in(cx, |workspace, window, cx| {
                 let workspace_handle = cx.entity();
@@ -104,6 +181,8 @@ impl SoloDiffView {
                         project,
                         repository,
                         repo_path,
+                        base,
+                        show_full_file,
                         buffer,
                         diff,
                         workspace_handle,
@@ -122,6 +201,8 @@ impl SoloDiffView {
         project: Entity<Project>,
         repository: Entity<Repository>,
         repo_path: RepoPath,
+        base: SoloDiffBase,
+        show_full_file: Option<bool>,
         buffer: Entity<Buffer>,
         diff: Entity<buffer_diff::BufferDiff>,
         workspace: Entity<Workspace>,
@@ -129,7 +210,8 @@ impl SoloDiffView {
         cx: &mut Context<Self>,
     ) -> Self {
         let repository_id = repository.read(cx).id;
-        let showing_full_file = EditorSettings::get_global(cx).file_diff.show_full_file;
+        let showing_full_file = show_full_file
+            .unwrap_or_else(|| EditorSettings::get_global(cx).file_diff.show_full_file);
         let multibuffer = cx
             .new(|cx| Self::build_multibuffer(buffer.clone(), diff.clone(), showing_full_file, cx));
         let editor = cx.new(|cx| {
@@ -176,6 +258,7 @@ impl SoloDiffView {
             repository,
             repository_id,
             repo_path,
+            base,
             buffer,
             diff,
             editor,
@@ -261,8 +344,16 @@ impl SoloDiffView {
         cx.notify();
     }
 
-    fn matches(&self, repository: &Entity<Repository>, repo_path: &RepoPath, cx: &App) -> bool {
-        self.repository_id == repository.read(cx).id && &self.repo_path == repo_path
+    fn matches(
+        &self,
+        repository: &Entity<Repository>,
+        repo_path: &RepoPath,
+        base: &SoloDiffBase,
+        cx: &App,
+    ) -> bool {
+        self.repository_id == repository.read(cx).id
+            && &self.repo_path == repo_path
+            && self.base.is_same_view(base)
     }
 
     fn button_states(&self, cx: &App) -> SoloDiffButtonStates {
@@ -399,19 +490,21 @@ impl Item for SoloDiffView {
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
-        Some(
-            self.buffer
-                .read(cx)
-                .file()
-                .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
-                .unwrap_or_else(|| {
-                    self.repo_path
-                        .as_ref()
-                        .display(PathStyle::local())
-                        .into_owned()
-                })
-                .into(),
-        )
+        let path = self
+            .buffer
+            .read(cx)
+            .file()
+            .map(|file| file.full_path(cx).compact().to_string_lossy().into_owned())
+            .unwrap_or_else(|| {
+                self.repo_path
+                    .as_ref()
+                    .display(PathStyle::local())
+                    .into_owned()
+            });
+        Some(match &self.base {
+            SoloDiffBase::Head => path.into(),
+            SoloDiffBase::Branch { base_ref, .. } => format!("{path} vs {base_ref}").into(),
+        })
     }
 
     fn to_item_events(event: &EditorEvent, f: &mut dyn FnMut(ItemEvent)) {
@@ -693,8 +786,11 @@ impl ToolbarItemView for SoloDiffGitToolbar {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> ToolbarItemLocation {
+        // Staging and restoring work on uncommitted hunks, which a diff
+        // against the base branch does not show apart from committed ones.
         self.solo_diff = active_pane_item
             .and_then(|item| item.act_as::<SoloDiffView>(cx))
+            .filter(|entity| entity.read(cx).base == SoloDiffBase::Head)
             .map(|entity| entity.downgrade());
         if self.solo_diff.is_some() {
             ToolbarItemLocation::PrimaryRight
@@ -717,8 +813,103 @@ struct SoloDiffButtonStates {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use editor::test::editor_test_context::assert_state_with_diff;
+    use git::status::{FileStatus, StatusCode, TrackedStatus};
     use gpui::TestAppContext;
     use multi_buffer::MultiBufferRow;
+    use project::FakeFs;
+    use serde_json::json;
+    use settings::DiffViewStyle;
+    use std::path::Path;
+    use unindent::Unindent as _;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_branch_base_shows_the_whole_file_against_the_base(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.editor.diff_view_style = Some(DiffViewStyle::Unified);
+                });
+            });
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let committed = "one\ntwo changed\nthree\nfour\n";
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": committed }))
+            .await;
+        let dot_git = Path::new(path!("/project/.git"));
+        fs.set_head_and_index_for_repo(dot_git, &[("a.txt", committed.into())]);
+        let oids =
+            fs.set_merge_base_content_for_repo(dot_git, &[("a.txt", "one\ntwo\nthree\nfour\n".into())]);
+
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let repository = project.read_with(cx, |project, cx| project.active_repository(cx).unwrap());
+        let entry = GitStatusEntry {
+            repo_path: RepoPath::new("a.txt").unwrap(),
+            status: FileStatus::Tracked(TrackedStatus {
+                index_status: StatusCode::Modified,
+                worktree_status: StatusCode::Unmodified,
+            }),
+            staging: StageStatus::Unstaged,
+            diff_stat: None,
+        };
+
+        let branch_view = cx
+            .update(|window, cx| {
+                SoloDiffView::open_or_focus_with_base(
+                    entry.clone(),
+                    repository.clone(),
+                    SoloDiffBase::Branch {
+                        base_ref: "origin/main".into(),
+                        base_oid: oids.first().copied(),
+                    },
+                    Some(true),
+                    workspace.downgrade(),
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        let editor = branch_view.read_with(cx, |view, cx| view.editor.read(cx).rhs_editor().clone());
+        assert_state_with_diff(
+            &editor,
+            cx,
+            &"
+              one
+            - ˇtwo
+            + two changed
+              three
+              four
+            "
+            .unindent(),
+        );
+
+        cx.update(|window, cx| {
+            SoloDiffView::open_or_focus(entry, repository, workspace.downgrade(), window, cx)
+        })
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.items_of_type::<SoloDiffView>(cx).count(), 2);
+        });
+    }
 
     #[gpui::test]
     fn test_changes_only_multibuffer_has_one_buffer_and_expand_controls(cx: &mut TestAppContext) {

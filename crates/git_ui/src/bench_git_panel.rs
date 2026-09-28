@@ -50,7 +50,7 @@ use language_model::{
     CompletionIntent, ConfiguredModel, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
 };
-use project::git_store::{CommitDataState, Repository};
+use project::git_store::{CommitDataState, Repository, RepositoryEvent};
 use project::{Project, ProjectPath};
 use settings::Settings as _;
 use ui::{
@@ -74,7 +74,7 @@ use crate::git_panel::{GitPanel, GitStatusEntry};
 use crate::git_panel_settings::GitPanelSettings;
 use crate::git_status_icon;
 use crate::repository_selector::RepositorySelector;
-use crate::solo_diff_view::SoloDiffView;
+use crate::solo_diff_view::{SoloDiffBase, SoloDiffView};
 
 /// How many commits of each repository the history tab lists: all you would
 /// scroll through for one, a summary each for several.
@@ -89,6 +89,42 @@ const BRANCH_DIFF_DEBOUNCE: Duration = Duration::from_millis(750);
 const MAX_DIFF_BYTES: usize = 20_000;
 
 const SELECTION_NAMESPACE: &str = "git_repository_selection";
+const VIEW_OPTIONS_NAMESPACE: &str = "bench_git_panel";
+const VIEW_OPTIONS_KEY: &str = "view_options";
+
+/// How the panel shows changes, kept across restarts.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct ViewOptions {
+    tree: bool,
+    zen: bool,
+}
+
+impl ViewOptions {
+    fn load(cx: &App) -> Self {
+        db::kvp::KeyValueStore::global(cx)
+            .scoped(VIEW_OPTIONS_NAMESPACE)
+            .read(VIEW_OPTIONS_KEY)
+            .log_err()
+            .flatten()
+            .and_then(|stored| serde_json::from_str(&stored).log_err())
+            .unwrap_or_default()
+    }
+
+    fn store(&self, cx: &App) {
+        let Some(stored) = serde_json::to_string(self).log_err() else {
+            return;
+        };
+        let store = db::kvp::KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            store
+                .scoped(VIEW_OPTIONS_NAMESPACE)
+                .write(VIEW_OPTIONS_KEY.to_owned(), stored)
+                .await
+                .log_err();
+        })
+        .detach();
+    }
+}
 
 /// The repositories selected beside the active one, per worktree.
 #[derive(Default)]
@@ -299,6 +335,8 @@ enum BranchChanges {
     Loaded {
         base: SharedString,
         files: Vec<(RepoPath, FileStatus)>,
+        /// Each file's blob at the base, for the ones that existed there.
+        base_oids: HashMap<RepoPath, git::Oid>,
     },
     Unavailable(SharedString),
 }
@@ -391,8 +429,13 @@ pub struct BenchGitPanel {
     tab: Tab,
     changes_mode: ChangesMode,
     tree: bool,
+    /// Whether a file opens alone and in full, rather than in the diff of
+    /// every change.
+    zen: bool,
     /// Folders closed in tree view, by repository and folder path.
     collapsed: HashSet<(EntityId, RepoPath)>,
+    /// Repositories whose group is closed, on every tab.
+    collapsed_repositories: HashSet<EntityId>,
     selected_commit: Option<(EntityId, String)>,
     commit_editor: Entity<Editor>,
     amend: bool,
@@ -442,6 +485,7 @@ impl BenchGitPanel {
             editor
         });
         let selection = RepositorySelection::global(cx);
+        let view_options = ViewOptions::load(cx);
         let git_store = project.read(cx).git_store().clone();
         let subscriptions = vec![
             cx.subscribe(&selection, |_, _, _: &SelectionChanged, cx| cx.notify()),
@@ -454,8 +498,10 @@ impl BenchGitPanel {
             focus_handle: cx.focus_handle(),
             tab: Tab::Changes,
             changes_mode: ChangesMode::Working,
-            tree: false,
+            tree: view_options.tree,
+            zen: view_options.zen,
             collapsed: HashSet::new(),
+            collapsed_repositories: HashSet::new(),
             selected_commit: None,
             commit_editor,
             amend: false,
@@ -473,6 +519,14 @@ impl BenchGitPanel {
             repository_subscriptions: HashMap::new(),
             _subscriptions: subscriptions,
         }
+    }
+
+    fn store_view_options(&self, cx: &App) {
+        ViewOptions {
+            tree: self.tree,
+            zen: self.zen,
+        }
+        .store(cx);
     }
 
     fn selected(&self, cx: &mut App) -> Vec<Entity<Repository>> {
@@ -494,12 +548,25 @@ impl BenchGitPanel {
             self.repository_subscriptions
                 .entry(repository.entity_id())
                 .or_insert_with(|| {
-                    cx.observe(repository, |this, repository, cx| {
-                        if this.tab == Tab::Changes && this.changes_mode == ChangesMode::Branch {
-                            this.load_branch_changes(&repository, true, cx);
-                        }
-                        cx.notify();
-                    })
+                    // Every git job notifies the repository, including the ones the
+                    // branch load runs, so reloading on any notify would cancel the
+                    // load in flight over and over. Only a change to what the branch
+                    // contains asks again.
+                    Subscription::join(
+                        cx.observe(repository, |_, _, cx| cx.notify()),
+                        cx.subscribe(repository, |this, repository, event, cx| {
+                            if matches!(
+                                event,
+                                RepositoryEvent::StatusesChanged
+                                    | RepositoryEvent::HeadChanged
+                                    | RepositoryEvent::BranchListChanged
+                            ) && this.tab == Tab::Changes
+                                && this.changes_mode == ChangesMode::Branch
+                            {
+                                this.load_branch_changes(&repository, true, cx);
+                            }
+                        }),
+                    )
                 });
         }
     }
@@ -577,6 +644,46 @@ impl BenchGitPanel {
         };
         SoloDiffView::open_or_focus(entry, repository.clone(), self.workspace.clone(), window, cx)
             .detach_and_log_err(cx);
+    }
+
+    /// One file alone and in full: its uncommitted changes, or with
+    /// `branch_base`, everything the branch changed in it.
+    fn open_zen_diff(
+        &self,
+        repository: &Entity<Repository>,
+        branch_base: Option<&SharedString>,
+        change: &Change,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let base = match branch_base {
+            Some(base_ref) => SoloDiffBase::Branch {
+                base_ref: base_ref.clone(),
+                base_oid: match self.branch_changes.get(&repository.entity_id()) {
+                    Some(BranchChanges::Loaded { base_oids, .. }) => {
+                        base_oids.get(&change.path).copied()
+                    }
+                    Some(BranchChanges::Loading | BranchChanges::Unavailable(_)) | None => None,
+                },
+            },
+            None => SoloDiffBase::Head,
+        };
+        let entry = GitStatusEntry {
+            repo_path: change.path.clone(),
+            status: change.status,
+            staging: change.staging,
+            diff_stat: None,
+        };
+        SoloDiffView::open_or_focus_with_base(
+            entry,
+            repository.clone(),
+            base,
+            Some(true),
+            self.workspace.clone(),
+            window,
+            cx,
+        )
+        .detach_and_log_err(cx);
     }
 
     /// The branch's changes against its base, as one diff, scrolled to
@@ -747,7 +854,11 @@ impl BenchGitPanel {
                 this.branch_changes.insert(
                     id,
                     match changes {
-                        Ok(Some((base, files))) => BranchChanges::Loaded { base, files },
+                        Ok(Some((base, files, base_oids))) => BranchChanges::Loaded {
+                            base,
+                            files,
+                            base_oids,
+                        },
                         Ok(None) => BranchChanges::Unavailable(
                             "No base branch to compare with".into(),
                         ),
@@ -1398,8 +1509,11 @@ impl BenchGitPanel {
         &self,
         repository: &Entity<Repository>,
         detail: Option<SharedString>,
-        cx: &App,
+        is_first: bool,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
+        let repository_id = repository.entity_id();
+        let collapsed = self.collapsed_repositories.contains(&repository_id);
         let repository = repository.read(cx);
         let branch = repository
             .branch
@@ -1407,20 +1521,53 @@ impl BenchGitPanel {
             .map(|branch| branch.name().to_owned())
             .unwrap_or_else(|| "no branch".into());
         h_flex()
+            .id(("repository-header", repository_id.as_u64() as usize))
             .w_full()
             .px_2()
             .pt_2()
             .pb_1()
+            .when(!is_first, |this| this.mt_3())
             .gap_1p5()
-            .child(Icon::new(IconName::Folder).size(IconSize::Small).color(Color::Muted))
-            .child(Label::new(repository.display_name()).size(LabelSize::Small))
+            .cursor_pointer()
+            .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .child(
-                Label::new(detail.unwrap_or_else(|| branch.into()))
-                    .size(LabelSize::Small)
-                    .color(Color::Muted)
-                    .single_line()
-                    .truncate(),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(if collapsed {
+                            IconName::Folder
+                        } else {
+                            IconName::FolderOpen
+                        })
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(Label::new(repository.display_name()).size(LabelSize::Small))
+                    .child(
+                        Label::new(detail.unwrap_or_else(|| branch.into()))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate(),
+                    ),
             )
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::XSmall)
+                .color(Color::Muted),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.collapsed_repositories.remove(&repository_id) {
+                    this.collapsed_repositories.insert(repository_id);
+                }
+                cx.notify();
+            }))
             .into_any_element()
     }
 
@@ -1457,6 +1604,21 @@ impl BenchGitPanel {
                 h_flex()
                     .gap_0p5()
                     .child(
+                        IconButton::new("toggle-zen", IconName::Crosshair)
+                            .icon_size(IconSize::Small)
+                            .toggle_state(self.zen)
+                            .tooltip(Tooltip::text(if self.zen {
+                                "Open Files in the Diff of Every Change"
+                            } else {
+                                "Zen Diff: Open One Whole File at a Time"
+                            }))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.zen = !this.zen;
+                                this.store_view_options(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         IconButton::new("toggle-tree", IconName::ListTree)
                             .icon_size(IconSize::Small)
                             .toggle_state(self.tree)
@@ -1467,6 +1629,7 @@ impl BenchGitPanel {
                             }))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.tree = !this.tree;
+                                this.store_view_options(cx);
                                 cx.notify();
                             })),
                     ),
@@ -1683,6 +1846,9 @@ impl BenchGitPanel {
             )
             .tooltip(Tooltip::text(full_path))
             .on_click(cx.listener(move |this, _, window, cx| match &branch_base {
+                _ if this.zen => {
+                    this.open_zen_diff(&open_repository, branch_base.as_ref(), &open_change, window, cx)
+                }
                 Some(base) => this.open_branch_diff(
                     &open_repository,
                     base.clone(),
@@ -1709,7 +1875,11 @@ impl BenchGitPanel {
     fn render_changes(&mut self, repositories: &[Entity<Repository>], cx: &mut Context<Self>) -> AnyElement {
         let several = repositories.len() > 1;
         let mut rows = Vec::new();
+        let mut content_start = None;
         for (index, repository) in repositories.iter().enumerate() {
+            if let Some(start) = content_start.take() {
+                indent_repository_content(&mut rows, start);
+            }
             match self.changes_mode {
                 ChangesMode::Working => {
                     let changes = Self::changes(repository, cx);
@@ -1723,7 +1893,11 @@ impl BenchGitPanel {
                         .filter(|change| change.staging != StageStatus::Staged)
                         .collect();
                     if several {
-                        rows.push(self.render_repository_header(repository, None, cx));
+                        rows.push(self.render_repository_header(repository, None, index == 0, cx));
+                        content_start = Some(rows.len());
+                        if self.collapsed_repositories.contains(&repository.entity_id()) {
+                            continue;
+                        }
                     }
                     if staged.is_empty() && unstaged.is_empty() {
                         rows.push(render_note("No changes"));
@@ -1749,18 +1923,26 @@ impl BenchGitPanel {
                     match self.branch_changes.get(&repository.entity_id()) {
                         None | Some(BranchChanges::Loading) => {
                             if several {
-                                rows.push(self.render_repository_header(repository, None, cx));
+                                rows.push(self.render_repository_header(repository, None, index == 0, cx));
+                                content_start = Some(rows.len());
+                                if self.collapsed_repositories.contains(&repository.entity_id()) {
+                                    continue;
+                                }
                             }
                             rows.push(render_note("Comparing with the base branch…"));
                         }
                         Some(BranchChanges::Unavailable(message)) => {
                             let message = message.clone();
                             if several {
-                                rows.push(self.render_repository_header(repository, None, cx));
+                                rows.push(self.render_repository_header(repository, None, index == 0, cx));
+                                content_start = Some(rows.len());
+                                if self.collapsed_repositories.contains(&repository.entity_id()) {
+                                    continue;
+                                }
                             }
                             rows.push(render_note(message));
                         }
-                        Some(BranchChanges::Loaded { base, files }) => {
+                        Some(BranchChanges::Loaded { base, files, .. }) => {
                             let base = base.clone();
                             let changes: Vec<Change> = files
                                 .iter()
@@ -1773,8 +1955,13 @@ impl BenchGitPanel {
                             rows.push(self.render_repository_header(
                                 repository,
                                 Some(format!("vs {base}").into()),
+                                index == 0,
                                 cx,
                             ));
+                            content_start = Some(rows.len());
+                            if self.collapsed_repositories.contains(&repository.entity_id()) {
+                                continue;
+                            }
                             if changes.is_empty() {
                                 rows.push(render_note("Nothing changed on this branch"));
                                 continue;
@@ -1793,6 +1980,9 @@ impl BenchGitPanel {
                     }
                 }
             }
+        }
+        if let Some(start) = content_start {
+            indent_repository_content(&mut rows, start);
         }
         v_flex()
             .id("bench-git-changes")
@@ -1815,9 +2005,17 @@ impl BenchGitPanel {
             time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
         let now = time::OffsetDateTime::now_utc();
         let mut rows = Vec::new();
-        for repository in repositories {
+        let mut content_start = None;
+        for (index, repository) in repositories.iter().enumerate() {
+            if let Some(start) = content_start.take() {
+                indent_repository_content(&mut rows, start);
+            }
             if several {
-                rows.push(self.render_repository_header(repository, None, cx));
+                rows.push(self.render_repository_header(repository, None, index == 0, cx));
+                content_start = Some(rows.len());
+                if self.collapsed_repositories.contains(&repository.entity_id()) {
+                    continue;
+                }
             }
             let remote = git_remote(repository, cx);
             let commits = repository.update(cx, |repository, cx| {
@@ -1966,6 +2164,9 @@ impl BenchGitPanel {
                 );
             }
         }
+        if let Some(start) = content_start {
+            indent_repository_content(&mut rows, start);
+        }
         v_flex()
             .id("bench-git-history")
             .flex_1()
@@ -1980,9 +2181,17 @@ impl BenchGitPanel {
         self.load_pull_requests(repositories, cx);
         let several = repositories.len() > 1;
         let mut rows = Vec::new();
+        let mut content_start = None;
         for (index, repository) in repositories.iter().enumerate() {
+            if let Some(start) = content_start.take() {
+                indent_repository_content(&mut rows, start);
+            }
             if several {
-                rows.push(self.render_repository_header(repository, None, cx));
+                rows.push(self.render_repository_header(repository, None, index == 0, cx));
+                content_start = Some(rows.len());
+                if self.collapsed_repositories.contains(&repository.entity_id()) {
+                    continue;
+                }
             }
             let key = (
                 work_directory(repository, cx),
@@ -2034,6 +2243,9 @@ impl BenchGitPanel {
                     }
                 }
             }
+        }
+        if let Some(start) = content_start {
+            indent_repository_content(&mut rows, start);
         }
         v_flex()
             .id("bench-git-pull-requests")
@@ -2377,7 +2589,13 @@ async fn commit_one(
 async fn branch_changes(
     repository: &Entity<Repository>,
     cx: &mut AsyncApp,
-) -> Result<Option<(SharedString, Vec<(RepoPath, FileStatus)>)>> {
+) -> Result<
+    Option<(
+        SharedString,
+        Vec<(RepoPath, FileStatus)>,
+        HashMap<RepoPath, git::Oid>,
+    )>,
+> {
     let base = repository
         .update(cx, |repository, _| repository.default_branch(true))
         .await??;
@@ -2389,6 +2607,16 @@ async fn branch_changes(
             repository.diff_tree(DiffTreeType::MergeBaseWithWorktree { base: base.clone() }, cx)
         })
         .await??;
+    let base_oids = tree
+        .entries
+        .iter()
+        .filter_map(|(path, status)| match status {
+            TreeDiffStatus::Added => None,
+            TreeDiffStatus::Modified { old } | TreeDiffStatus::Deleted { old } => {
+                Some((path.clone(), *old))
+            }
+        })
+        .collect();
     let mut files: BTreeMap<RepoPath, FileStatus> = tree
         .entries
         .into_iter()
@@ -2416,7 +2644,7 @@ async fn branch_changes(
             }
         }
     });
-    Ok(Some((base, files.into_iter().collect())))
+    Ok(Some((base, files.into_iter().collect(), base_oids)))
 }
 
 /// The hosting provider of a repository's default remote, which is where
@@ -2547,6 +2775,15 @@ fn history_source(repository: &Repository) -> Option<LogSource> {
         Some(branch) => Some(LogSource::Branch(branch.name().to_string().into())),
         None => Some(LogSource::Sha(head.sha.as_ref().parse().ok()?)),
     }
+}
+
+/// Sets a repository's rows, everything after its header, in from the header.
+fn indent_repository_content(rows: &mut Vec<AnyElement>, start: usize) {
+    if start >= rows.len() {
+        return;
+    }
+    let content = rows.split_off(start);
+    rows.push(v_flex().w_full().pl_4().pr_2().children(content).into_any_element());
 }
 
 fn render_note(message: impl Into<SharedString>) -> AnyElement {
@@ -2761,6 +2998,54 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn tree_and_zen_are_kept_for_the_next_panel(cx: &mut TestAppContext) {
+        let (_fs, project, workspace, mut cx) = two_repositories(cx).await;
+        let panel = panel_in_window(&project, &workspace, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            assert!(!panel.tree && !panel.zen);
+            panel.tree = true;
+            panel.zen = true;
+            panel.store_view_options(cx);
+        });
+        cx.run_until_parked();
+
+        let next_panel = cx.new_window_entity(|window, cx| {
+            BenchGitPanel::new(workspace.downgrade(), project.clone(), window, cx)
+        });
+        next_panel.update(&mut cx, |panel, _| {
+            assert!(panel.tree && panel.zen);
+        });
+    }
+
+    #[gpui::test]
+    async fn switching_to_the_branch_view_finishes_loading(cx: &mut TestAppContext) {
+        let (_fs, project, workspace, mut cx) = two_repositories(cx).await;
+        let panel = panel_in_window(&project, &workspace, &mut cx);
+        select_all(&project, &mut cx);
+        panel.update(&mut cx, |panel, cx| {
+            panel.changes_mode = ChangesMode::Branch;
+            for repository in panel.selected(cx) {
+                panel.load_branch_changes(&repository, false, cx);
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        panel.update(&mut cx, |panel, cx| {
+            let repositories = panel.selected(cx);
+            assert_eq!(repositories.len(), 2);
+            for repository in repositories {
+                assert!(
+                    matches!(
+                        panel.branch_changes.get(&repository.entity_id()),
+                        Some(BranchChanges::Loaded { .. })
+                    ),
+                    "the branch view should finish loading every repository"
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
     async fn one_repository_commits_without_a_warning(cx: &mut TestAppContext) {
         let (fs, project, workspace, mut cx) = two_repositories(cx).await;
         let panel = panel_in_window(&project, &workspace, &mut cx);
@@ -2894,7 +3179,7 @@ mod tests {
         let found = cx
             .spawn(|mut cx| async move { branch_changes(&outer, &mut cx).await })
             .await;
-        let (base, files) = found.expect("the branch diff").expect("a base branch");
+        let (base, files, _) = found.expect("the branch diff").expect("a base branch");
         assert_eq!(base.as_ref(), "origin/main");
         let listed = |name: &str| files.iter().any(|(path, _)| path.as_unix_str() == name);
         assert!(listed("a.txt"), "a change on the branch: {files:?}");
