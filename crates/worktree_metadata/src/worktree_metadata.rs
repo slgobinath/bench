@@ -1,5 +1,5 @@
 //! What Bench knows about a worktree that git does not: the colour it is
-//! tinted in, and the Linear issue it was made for.
+//! tinted in, the Linear issue it was made for, and the title it is shown by.
 //!
 //! # Where it is kept
 //!
@@ -14,7 +14,8 @@
 //! - Git never looks at it. It cannot show up as a change, be committed by an
 //!   agent's `git add -A`, or make git refuse to remove the worktree for
 //!   holding untracked files.
-//! - It is a file you can read, and other tools can find it.
+//! - It is a file you can read and edit, and other tools can find it. An edit
+//!   made outside Bench is picked up while Bench is running.
 //!
 //! Read in the background the first time a worktree is asked about, and
 //! cached: the title bar asks on every draw. Until it has been read — and for
@@ -33,16 +34,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use fs::{Fs, RemoveOptions};
+use futures::StreamExt as _;
 use gpui::{
-    App, AppContext as _, Context, Entity, EventEmitter, Global, Hsla, WeakEntity, hsla,
+    App, AppContext as _, Context, Entity, EventEmitter, Global, Hsla, Task, WeakEntity, hsla,
 };
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 
 /// The file's name in the worktree's git directory.
 const FILE_NAME: &str = "bench.json";
+
+/// How long after a change to a worktree's git directory its file is read
+/// again. Git writes there in bursts — the index, `HEAD`, a lock and its
+/// removal — and one read at the end of a burst is all it needs.
+const WATCH_LATENCY: Duration = Duration::from_millis(200);
 
 /// How many colours a worktree can have: evenly spaced hues, far enough apart
 /// to tell any two apart at a glance.
@@ -62,6 +70,12 @@ pub struct WorktreeMetadata {
     pub hue: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<LinkedIssue>,
+    /// What the worktree panel shows the worktree as, above its name. Taken
+    /// from its issue's title when Bench first learns it, and then left alone,
+    /// so that it can be edited here. An empty title is "none, and do not fill
+    /// one in".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// The Linear issue a worktree was made for.
@@ -80,6 +94,14 @@ impl WorktreeMetadata {
     pub fn hue_for(&self, worktree: &Path) -> u8 {
         self.hue.unwrap_or_else(|| derived_hue(worktree))
     }
+
+    /// The title to show, if there is one to show.
+    pub fn shown_title(&self) -> Option<&str> {
+        self.title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+    }
 }
 
 pub enum MetadataChanged {
@@ -96,6 +118,10 @@ pub struct WorktreeMetadataStore {
     /// Behind a `RefCell` so a read — which starts loading the first time —
     /// needs only `&self`: the panels that read it draw from `&App`.
     cache: RefCell<HashMap<PathBuf, Cached>>,
+    /// A watch on the git directory of every worktree whose file has been
+    /// read, so that an edit made to it by hand shows up. Behind a `RefCell`
+    /// for the same reason as the cache.
+    watches: RefCell<HashMap<PathBuf, Task<()>>>,
     /// `None` only where no filesystem has been set up, which is some tests;
     /// the store then holds what it is told and keeps it nowhere.
     fs: Option<Arc<dyn Fs>>,
@@ -116,6 +142,7 @@ impl WorktreeMetadataStore {
         let fs = <dyn Fs>::try_global(cx);
         let store = cx.new(|cx| Self {
             cache: RefCell::new(HashMap::new()),
+            watches: RefCell::new(HashMap::new()),
             fs,
             this: cx.weak_entity(),
         });
@@ -151,21 +178,88 @@ impl WorktreeMetadataStore {
         cx.spawn(async move |cx| {
             let metadata = read(fs.as_ref(), &worktree).await;
             this.update(cx, |this, cx| {
-                let mut cache = this.cache.borrow_mut();
-                // Something stored while this was reading is newer.
-                if matches!(cache.get(&worktree), Some(Cached::Loading)) {
-                    cache.insert(worktree.clone(), Cached::Loaded(metadata.clone()));
-                    drop(cache);
-                    if metadata != WorktreeMetadata::default() {
-                        cx.emit(MetadataChanged::Changed(worktree));
-                        cx.refresh_windows();
+                let cached = this.cache.borrow().get(&worktree).map(|cached| {
+                    matches!(cached, Cached::Loading)
+                });
+                match cached {
+                    // Something stored while this was reading is newer.
+                    Some(false) => {}
+                    Some(true) => {
+                        this.cache
+                            .borrow_mut()
+                            .insert(worktree.clone(), Cached::Loaded(metadata.clone()));
+                        if metadata != WorktreeMetadata::default() {
+                            cx.emit(MetadataChanged::Changed(worktree.clone()));
+                            cx.refresh_windows();
+                        }
                     }
+                    // Forgotten while it was being read: the worktree is gone.
+                    None => return,
                 }
+                this.watch(worktree, cx);
             })
             .log_err();
         })
         .detach();
         WorktreeMetadata::default()
+    }
+
+    /// Reads `worktree`'s file again whenever it changes, and takes what it
+    /// says. Bench's own writes come back through here too, and change
+    /// nothing, since the cache already holds what they wrote.
+    ///
+    /// The directory is watched rather than the file: a write replaces the
+    /// file, whoever makes it, and a watch on the file would end with the
+    /// first one.
+    fn watch(&self, worktree: PathBuf, cx: &mut Context<Self>) {
+        let Some(fs) = self.fs.clone() else {
+            return;
+        };
+        if self.watches.borrow().contains_key(&worktree) {
+            return;
+        }
+        let task = cx.spawn({
+            let worktree = worktree.clone();
+            async move |this, cx| {
+                let Some(file) = file_for(fs.as_ref(), &worktree).await else {
+                    return;
+                };
+                let Some(directory) = file.parent() else {
+                    return;
+                };
+                let (mut events, _watcher) = fs.watch(directory, WATCH_LATENCY).await;
+                while let Some(events) = events.next().await {
+                    // By name: the watch may report the directory by another
+                    // spelling of its path, through a symlink.
+                    if !events
+                        .iter()
+                        .any(|event| event.path.file_name() == file.file_name())
+                    {
+                        continue;
+                    }
+                    let metadata = read(fs.as_ref(), &worktree).await;
+                    let updated = this.update(cx, |this, cx| {
+                        let mut cache = this.cache.borrow_mut();
+                        let changed = match cache.get(&worktree) {
+                            Some(Cached::Loaded(cached)) => *cached != metadata,
+                            // Forgotten, or not read yet: whatever is under
+                            // way will have the last word.
+                            Some(Cached::Loading) | None => false,
+                        };
+                        if changed {
+                            cache.insert(worktree.clone(), Cached::Loaded(metadata));
+                            drop(cache);
+                            cx.emit(MetadataChanged::Changed(worktree.clone()));
+                            cx.refresh_windows();
+                        }
+                    });
+                    if updated.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        self.watches.borrow_mut().insert(worktree, task);
     }
 
     /// Changes what is stored for `worktree`, and tells everyone drawing it.
@@ -201,11 +295,25 @@ impl WorktreeMetadataStore {
         cx.refresh_windows();
     }
 
+    /// Gives `worktree` the title of its issue, unless it already has one or
+    /// its file has not been read yet: a title that is there was either put
+    /// there by hand or is the one it was given when it was made.
+    pub fn fill_title(&mut self, worktree: &Path, title: &str, cx: &mut Context<Self>) {
+        let missing = matches!(
+            self.cache.borrow().get(worktree),
+            Some(Cached::Loaded(metadata)) if metadata.title.is_none()
+        );
+        if missing {
+            self.update(worktree, |metadata| metadata.title = Some(title.to_string()), cx);
+        }
+    }
+
     /// Forgets `worktree`, when it is deleted. Its file normally went with
     /// it — `git worktree remove` deletes the worktree's git directory — and
     /// is removed here in case it did not.
     pub fn remove(&mut self, worktree: &Path, cx: &mut Context<Self>) {
         self.cache.borrow_mut().remove(worktree);
+        self.watches.borrow_mut().remove(worktree);
         if let Some(fs) = self.fs.clone() {
             let worktree = worktree.to_path_buf();
             cx.background_spawn(async move {
@@ -432,6 +540,59 @@ mod tests {
         cx.run_until_parked();
         let read = store.read_with(cx, |store, cx| store.get(Path::new("/wt/fix"), cx));
         assert_eq!(read.hue, Some(12));
+    }
+
+    /// An issue's title is filled in once the file has been read, and never
+    /// over one already there: that is either the one it was made with or
+    /// one written by hand, empty included.
+    #[gpui::test]
+    async fn a_title_is_filled_in_only_where_there_is_none(cx: &mut TestAppContext) {
+        let (fs, store) = repository(cx).await;
+        fs.insert_file(
+            "/repo/.git/worktrees/fix/bench.json",
+            br#"{ "hue": 2 }"#.to_vec(),
+        )
+        .await;
+        fs.insert_file("/repo/.git/bench.json", br#"{ "title": "" }"#.to_vec())
+            .await;
+
+        store.update(cx, |store, cx| {
+            store.fill_title(Path::new("/wt/fix"), "Not read yet", cx)
+        });
+        store.read_with(cx, |store, cx| {
+            store.get(Path::new("/wt/fix"), cx);
+            store.get(Path::new("/repo"), cx);
+        });
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.fill_title(Path::new("/wt/fix"), "Fix login", cx);
+            store.fill_title(Path::new("/wt/fix"), "Something else", cx);
+            store.fill_title(Path::new("/repo"), "Fix login", cx);
+        });
+        cx.run_until_parked();
+
+        let fix = store.read_with(cx, |store, cx| store.get(Path::new("/wt/fix"), cx));
+        assert_eq!(fix.hue, Some(2), "the rest of the file is kept");
+        assert_eq!(fix.shown_title(), Some("Fix login"));
+        let main = store.read_with(cx, |store, cx| store.get(Path::new("/repo"), cx));
+        assert_eq!(main.shown_title(), None, "emptied by hand, and left so");
+    }
+
+    #[gpui::test]
+    async fn an_edit_by_hand_is_picked_up(cx: &mut TestAppContext) {
+        let (fs, store) = repository(cx).await;
+        store.read_with(cx, |store, cx| store.get(Path::new("/wt/fix"), cx));
+        cx.run_until_parked();
+
+        fs.insert_file(
+            "/repo/.git/worktrees/fix/bench.json",
+            br#"{ "title": "Renamed by hand" }"#.to_vec(),
+        )
+        .await;
+        cx.run_until_parked();
+
+        let read = store.read_with(cx, |store, cx| store.get(Path::new("/wt/fix"), cx));
+        assert_eq!(read.shown_title(), Some("Renamed by hand"));
     }
 
     #[gpui::test]

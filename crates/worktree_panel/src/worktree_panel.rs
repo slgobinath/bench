@@ -26,10 +26,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use git::repository::{CreateWorktreeTarget, Worktree as GitWorktree};
-use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
+use agent_tracker::{AgentState, AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
 use linear::{Issue, Linear, LinearEvent};
@@ -41,14 +41,14 @@ use gpui::{
     DismissEvent,
     Entity,
     EventEmitter, FocusHandle, Focusable, Global, Task, Transformation, WeakEntity, Window,
-    actions, percentage, prelude::*, svg,
+    actions, percentage, prelude::*, pulsating_between, svg,
 };
 use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
 use ui::{
-    CommonAnimationExt as _, ContextMenu, Indicator, Label, ListItem, ListItemSpacing, Tooltip,
+    CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, Tooltip,
     prelude::*,
 };
 use ui_input::{ErasedEditor, InputField};
@@ -198,6 +198,12 @@ struct WorktreeRow {
     /// one it was made for, or else the one its branch is named after. See
     /// [`Linear::look_up_ids`] and [`Linear::look_up_branches`].
     issue: Option<Arc<Issue>>,
+    /// The title stored for the worktree, which its card leads with; see
+    /// [`worktree_metadata::WorktreeMetadata::title`].
+    title: Option<SharedString>,
+    /// What git says about the worktree's files and branch; see
+    /// [`WorktreePanel::scan_statuses`]. Default until it has said.
+    status: WorktreeStatus,
 }
 
 /// What is known about one project's pull requests; see
@@ -288,7 +294,42 @@ impl Global for PanelView {}
 struct ProjectScans {
     discovered: HashMap<PathBuf, Discovery>,
     pull_requests: HashMap<PathBuf, PullRequestScan>,
+    /// By worktree root rather than by project: each worktree has files of
+    /// its own.
+    statuses: HashMap<PathBuf, StatusScan>,
 }
+
+/// What is known about one worktree's status; see
+/// [`WorktreePanel::scan_statuses`].
+enum StatusScan {
+    Pending { _scan: Task<()> },
+    Found {
+        status: WorktreeStatus,
+        checked: Instant,
+        /// A refresh in flight, while the answer already found stays on
+        /// screen.
+        _refresh: Option<Task<()>>,
+    },
+}
+
+/// What a worktree's card says about its files and branch, from one
+/// `git status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorktreeStatus {
+    /// When a file last changed; see [`worktree_status`].
+    last_edit: Option<SystemTime>,
+    /// How many entries `git status` lists: changed files, and untracked
+    /// files or directories.
+    changes: usize,
+    /// How far the branch is ahead of and behind its upstream, as of the last
+    /// fetch. `None` for a branch with no upstream, or no branch at all.
+    ahead_behind: Option<(u32, u32)>,
+}
+
+/// How long a worktree's status is trusted before git is asked again. Short,
+/// because an agent at work edits all the time and "edited an hour ago" on a
+/// worktree it is busy in reads as wrong; each ask is one `git status`.
+const STATUS_REFRESH: Duration = Duration::from_secs(30);
 
 impl Global for ProjectScans {}
 
@@ -556,6 +597,11 @@ impl WorktreePanel {
                     Some(index) => Some(open_worktrees.get(index)?),
                     None => None,
                 };
+                let stored = plan
+                    .root
+                    .as_deref()
+                    .zip(metadata.as_ref())
+                    .map(|(root, metadata)| metadata.read(cx).get(root, cx));
                 Some(WorktreeRow {
                     key: key.clone(),
                     switch_from: switch_from.clone(),
@@ -590,11 +636,21 @@ impl WorktreePanel {
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).summary_for(root))
                         .unwrap_or_default(),
-                    linked_issue: plan
+                    linked_issue: stored.as_ref().and_then(|stored| stored.issue.clone()),
+                    title: stored
+                        .as_ref()
+                        .and_then(|stored| stored.shown_title())
+                        .map(|title| SharedString::from(title.to_string())),
+                    status: plan
                         .root
-                        .as_deref()
-                        .zip(metadata.as_ref())
-                        .and_then(|(root, metadata)| metadata.read(cx).get(root, cx).issue),
+                        .as_ref()
+                        .and_then(|root| {
+                            match cx.try_global::<ProjectScans>()?.statuses.get(root)? {
+                                StatusScan::Found { status, .. } => Some(*status),
+                                StatusScan::Pending { .. } => None,
+                            }
+                        })
+                        .unwrap_or_default(),
                     issue: None,
                     branch: plan.branch,
                     root: plan.root,
@@ -754,6 +810,55 @@ impl WorktreePanel {
         {
             Some(PullRequestScan::Found { by_branch, .. }) => Some(by_branch),
             Some(PullRequestScan::Pending { .. }) | None => None,
+        }
+    }
+
+    /// Asks git about each worktree's files and branch, for its card: when a
+    /// file last changed, how many have, and how the branch stands against
+    /// its upstream. Started from `render`, like the other scans, and as cheap
+    /// to call on every draw: a worktree asked about recently is skipped.
+    fn scan_statuses(&mut self, roots: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(fs) = self.fs(cx) else {
+            return;
+        };
+        for root in roots {
+            match cx.default_global::<ProjectScans>().statuses.get(root) {
+                Some(StatusScan::Pending { .. }) => continue,
+                Some(StatusScan::Found {
+                    checked, _refresh, ..
+                }) if _refresh.is_some() || checked.elapsed() < STATUS_REFRESH => continue,
+                _ => {}
+            }
+
+            let scan = cx.spawn({
+                let fs = fs.clone();
+                let root = root.clone();
+                async move |_, cx| {
+                    let status = cx.background_spawn(worktree_status(fs, root.clone())).await;
+                    cx.update(|cx| {
+                        record_scan(cx, |scans| {
+                            scans.statuses.insert(
+                                root,
+                                StatusScan::Found {
+                                    status,
+                                    checked: Instant::now(),
+                                    _refresh: None,
+                                },
+                            );
+                        });
+                    });
+                }
+            });
+
+            let scans = cx.default_global::<ProjectScans>();
+            match scans.statuses.get_mut(root) {
+                Some(StatusScan::Found { _refresh, .. }) => *_refresh = Some(scan),
+                _ => {
+                    scans
+                        .statuses
+                        .insert(root.clone(), StatusScan::Pending { _scan: scan });
+                }
+            }
         }
     }
 
@@ -1218,6 +1323,7 @@ impl WorktreePanel {
             id: issue.id.to_string(),
             identifier: issue.identifier.to_string(),
         });
+        let title = issue.as_ref().map(|issue| issue.title.to_string());
         cx.spawn_in(window, async move |this, cx| {
             let created = repository
                 .update(cx, |repository, _| {
@@ -1237,6 +1343,7 @@ impl WorktreePanel {
                                 |metadata| {
                                     metadata.hue = Some(hue);
                                     metadata.issue = linked;
+                                    metadata.title = title;
                                 },
                                 cx,
                             );
@@ -1442,13 +1549,15 @@ impl WorktreePanel {
     }
 
     /// The menu of a worktree row: opening its Linear issue when it has one,
-    /// copying its path, and its colour — the
-    /// colours a worktree can be, the one it is ticked, and going back to the
-    /// one worked out from its folder.
+    /// editing its title, copying its path, its colour — the colours a worktree can be, the one
+    /// it is ticked, and going back to the one worked out from its folder —
+    /// and deleting it, which every worktree but the repository's own
+    /// checkout offers.
     fn deploy_row_menu(
         &mut self,
         root: PathBuf,
         issue: Option<SharedString>,
+        delete: Option<(Entity<Repository>, SharedString)>,
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1460,12 +1569,21 @@ impl WorktreePanel {
         let this = cx.weak_entity();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
             let path = root.to_string_lossy().into_owned();
+            let delete_root = root.clone();
             menu.when_some(issue.clone(), |menu, identifier| {
                 let this = this.clone();
                 menu.entry(format!("Open {identifier}"), None, move |window, cx| {
                     this.update(cx, |this, cx| this.open_issue(identifier.clone(), window, cx))
                         .ok();
                 })
+            })
+            .entry("Edit Title…", None, {
+                let this = this.clone();
+                let root = root.clone();
+                move |window, cx| {
+                    this.update(cx, |this, cx| this.edit_title(root.clone(), window, cx))
+                        .ok();
+                }
             })
             .entry("Copy Path", None, move |_, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
@@ -1514,6 +1632,22 @@ impl WorktreePanel {
                         });
                     },
                 )
+            })
+            .when_some(delete, |menu, (repository, name)| {
+                let this = this.clone();
+                menu.separator()
+                    .entry("Delete Worktree", None, move |window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.delete_worktree(
+                                repository.clone(),
+                                delete_root.clone(),
+                                name.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    })
             })
         });
         let focus = menu.focus_handle(cx);
@@ -1692,6 +1826,13 @@ impl WorktreePanel {
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(&key, cx)))
     }
 
+    /// A worktree as a card: what it is for above, which worktree it is below.
+    ///
+    /// The card leads with the worktree's stored title — its issue's, unless
+    /// that was edited — and the worktree's name goes under it. Without a
+    /// title the name leads, and the line under it holds only what else there
+    /// is to say. The icon is always the branch, since every worktree is one;
+    /// where its issue stands is on the issue's pill.
     fn render_worktree(
         &self,
         row: &WorktreeRow,
@@ -1702,10 +1843,9 @@ impl WorktreePanel {
         // Deleting needs the repository that owns the worktree, and git will
         // not remove the repository's own checkout.
         let delete = (!row.is_main)
-            .then(|| row.repository.clone().zip(row.root.clone()))
+            .then(|| row.repository.clone())
             .flatten()
-            ;
-        let delete_name = row.name.clone();
+            .map(|repository| (repository, row.name.clone()));
         // What a click does: go to the worktree if the window has it open,
         // otherwise open it.
         let activate = row.workspace.clone();
@@ -1715,34 +1855,49 @@ impl WorktreePanel {
             .filter(|_| !is_open)
             .map(|root| (row.key.clone(), root));
         let open_name = row.name.clone();
-        ListItem::new(("worktree", index))
-            .spacing(ListItemSpacing::Sparse)
-            .height(ROW_HEIGHT)
-            .indent_level(1)
-            .indent_step_size(px(12.))
-            .selectable(true)
-            .toggle_state(row.is_active)
-            .start_slot(match &row.issue {
-                // A worktree made for an issue is about the issue: where it
-                // stands says more than that it is a branch, which every row
-                // is. Drawn as Linear draws it, so the two panels agree.
-                Some(issue) => render_issue_state(issue).into_any_element(),
-                None => Icon::new(IconName::GitBranch)
-                    .size(IconSize::Small)
-                    .color(if row.is_active {
-                        // The worktree the window is showing. One accented
-                        // icon says which of them you are in from across the
-                        // tree.
-                        Color::Accent
-                    } else if is_open {
-                        Color::Muted
-                    } else {
-                        // A worktree that exists but is not open in this
-                        // window: the row is there to be clicked, and should
-                        // not read as one of the window's own.
-                        Color::Ignored
-                    })
-                    .into_any_element(),
+
+        let name = match &row.issue {
+            Some(issue) => name_without_identifier(&row.name, &issue.identifier),
+            None => row.name.clone(),
+        };
+        let (heading, subheading) = match row.title.clone() {
+            Some(title) => (title, Some(name)),
+            // Without a title the name leads, and the line under it names the
+            // branch — which says something only when it is not the name
+            // again: the repository's own checkout switched to a feature
+            // branch, or a worktree whose branch was renamed.
+            None => {
+                let branch = row.branch.clone().filter(|branch| *branch != name);
+                (name, branch)
+            }
+        };
+        let text_color = if is_open {
+            Color::Default
+        } else {
+            Color::Muted
+        };
+        let colors = cx.theme().colors();
+
+        v_flex()
+            .id(("worktree", index))
+            .ml_3()
+            .mr_1p5()
+            .my_0p5()
+            .px_2()
+            .py_1p5()
+            .gap_0p5()
+            .rounded_md()
+            .border_1()
+            .cursor_pointer()
+            .map(|card| {
+                if row.is_active {
+                    card.border_color(colors.border_selected)
+                        .bg(colors.ghost_element_selected)
+                } else {
+                    card.border_color(colors.border_variant)
+                        .bg(colors.ghost_element_background)
+                        .hover(|card| card.bg(colors.ghost_element_hover))
+                }
             })
             .when_some(row_tooltip(row), |this, tooltip| {
                 this.tooltip(Tooltip::text(tooltip))
@@ -1752,88 +1907,90 @@ impl WorktreePanel {
                     .w_full()
                     .min_w_0()
                     .gap_1p5()
-                    .justify_between()
                     .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1p5()
-                            .children(row.issue.as_ref().map(|issue| {
-                                Label::new(issue.identifier.clone())
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted)
-                                    .flex_none()
-                            }))
-                            .child(
-                                // Truncated: a worktree named after a long
-                                // branch would otherwise widen the row past the
-                                // panel and carry the delete button off the
-                                // edge with it.
-                                Label::new(match &row.issue {
-                                    Some(issue) => {
-                                        name_without_identifier(&row.name, &issue.identifier)
-                                    }
-                                    None => row.name.clone(),
-                                })
-                                .single_line()
-                                .truncate()
-                                .color(if is_open {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                }),
-                            ),
+                        Icon::new(IconName::GitBranch)
+                            .size(IconSize::Small)
+                            .color(if row.is_active {
+                                // The worktree the window is showing. One
+                                // accented icon says which of them you are in
+                                // from across the tree.
+                                Color::Accent
+                            } else if is_open {
+                                Color::Muted
+                            } else {
+                                // A worktree that exists but is not open in
+                                // this window: the card is there to be
+                                // clicked, and should not read as one of the
+                                // window's own.
+                                Color::Ignored
+                            }),
                     )
                     .child(
-                        h_flex()
-                            .flex_none()
-                            .gap_1p5()
-                            .children(row.pull_request.map(|state| {
-                                render_pull_request(state, index)
-                            }))
-                            .children(render_agents(index, &row.agents)),
-                    ),
+                        // Truncated: a long title would otherwise widen the
+                        // card past the panel.
+                        div().flex_1().min_w_0().child(
+                            Label::new(heading)
+                                .single_line()
+                                .truncate()
+                                .color(text_color),
+                        ),
+                    )
+                    .children(row.status.last_edit.and_then(|at| {
+                        let ago = SystemTime::now().duration_since(at).ok()?;
+                        Some(
+                            Label::new(edited_ago(ago))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted)
+                                .flex_none(),
+                        )
+                    }))
+                    .children(render_agents(index, &row.agents)),
             )
-            .end_slot_on_hover(h_flex().map(|this| match delete {
-                Some((repository, root)) => this.child(
-                    IconButton::new(("delete-worktree", index), IconName::Trash)
-                        .icon_size(IconSize::Small)
-                        .tooltip(Tooltip::text("Delete Worktree"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.delete_worktree(
-                                repository.clone(),
-                                root.clone(),
-                                delete_name.clone(),
-                                window,
-                                cx,
-                            );
-                        })),
-                ),
-                // The row keeps the room the delete button takes even while
-                // the button is hidden, so a row that has none — the
-                // repository's own checkout — holds the same room, or its
-                // agent dot sits further right than every other row's.
-                None => this.child(
-                    div().opacity(0.).child(
-                        IconButton::new(("no-delete-worktree", index), IconName::Trash)
-                            .icon_size(IconSize::Small)
-                            .disabled(true),
-                    ),
-                ),
-            }))
+            // Always drawn, empty or not, so that every card is the same
+            // height: a card with nothing more to say — the repository's own
+            // checkout, usually — would otherwise sit shorter than the rest.
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .h_5()
+                    .gap_1p5()
+                    // Holds the icon's room, so the name sits under the
+                    // title rather than under the icon.
+                    .child(div().flex_none().size(IconSize::Small.rems()))
+                    .child(div().flex_1().min_w_0().children(subheading.map(|name| {
+                        Label::new(name)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .single_line()
+                            .truncate()
+                    })))
+                    .children(render_changes(index, row.status.changes))
+                    .children(row.status.ahead_behind.and_then(|(ahead, behind)| {
+                        render_ahead_behind(index, ahead, behind)
+                    }))
+                    .children(
+                        row.pull_request
+                            .map(|state| render_pull_request(state, index)),
+                    )
+                    .children(row.issue.as_deref().map(render_issue_pill)),
+            )
             .when_some(row.root.clone(), |this, root| {
                 let issue = row.issue.as_ref().map(|issue| issue.identifier.clone());
-                this.on_secondary_mouse_down(cx.listener(
-                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                this.on_mouse_down(
+                    gpui::MouseButton::Right,
+                    cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         this.deploy_row_menu(
                             root.clone(),
                             issue.clone(),
+                            delete.clone(),
                             event.position,
                             window,
                             cx,
                         );
-                    },
-                ))
+                    }),
+                )
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 match (activate.clone(), open.clone()) {
@@ -1848,6 +2005,31 @@ impl WorktreePanel {
 }
 
 impl WorktreePanel {
+    /// Asks for a worktree's title, starting from the one it has. Opened on
+    /// the workspace the window is showing, which is the one whose panel was
+    /// clicked, and deferred for the reason given on [`Self::activate`].
+    fn edit_title(&mut self, root: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let multi_workspace = self.multi_workspace.clone();
+        let title = WorktreeMetadataStore::global(cx)
+            .read(cx)
+            .get(&root, cx)
+            .title
+            .unwrap_or_default();
+        window.defer(cx, move |window, cx| {
+            let Some(workspace) = multi_workspace
+                .upgrade()
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+            else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                workspace.toggle_modal(window, cx, move |window, cx| {
+                    EditTitle::new(root, &title, window, cx)
+                });
+            });
+        });
+    }
+
     /// Opens an issue's tab in the worktree the window is showing. Deferred
     /// for the reason given on [`Self::activate`]: focusing the tab walks the
     /// docks, and a click handler holds this panel's lease.
@@ -1932,45 +2114,132 @@ const ROW_HEIGHT: Rems = Rems(2.25);
 /// like a direct response to the click, long enough to be seen.
 const CHEVRON_TURN: Duration = Duration::from_millis(120);
 
-/// The agents running in a worktree: a dot for what they are doing, and a
-/// count once there is more than one of them.
-///
-/// It sits at the end of the row rather than beside the branch icon, because
-/// the branch icon already says something about the branch itself. This says
-/// what is happening in it right now.
-fn render_agents(index: usize, agents: &AgentSummary) -> Option<impl IntoElement> {
+/// Whether an agent is at work in the worktree, and what it is doing: Claude's
+/// mark, in the colour of whatever wants you most, breathing while it works.
+/// How many agents there are is left to the tooltip; the card only needs to
+/// say that one is there and whether it is waiting on you.
+fn render_agents(index: usize, agents: &AgentSummary) -> Option<AnyElement> {
     let state = agents.state()?;
     let total = agents.total();
     let summary = if agents.needs_input > 0 {
-        format!(
-            "{} of {total} waiting for you",
-            agents.needs_input
-        )
+        format!("{} of {total} waiting for you", agents.needs_input)
     } else if agents.working > 0 {
         format!("{} of {total} working", agents.working)
     } else {
         format!("{total} idle")
     };
 
-    Some(
-        h_flex()
-            .id(("agents", index))
-            .gap_0p5()
-            // The count before the dot, so the dot is always last and sits
-            // at the same edge on every row, one agent or several.
-            .when(total > 1, |this| {
-                this.child(
-                    Label::new(total.to_string())
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                )
-            })
-            .child(Indicator::dot().color(agent_state_color(state)))
+    let mark = div()
+        .id(("agents", index))
+        .flex_none()
+        .child(
+            Icon::new(IconName::AiClaude)
+                .size(IconSize::Small)
+                .color(agent_state_color(state)),
+        )
+        .tooltip(Tooltip::text(format!(
+            "{total} agent{}: {summary}",
+            if total == 1 { "" } else { "s" }
+        )));
+    Some(match state {
+        AgentState::Working => mark
+            .with_animation(
+                ("agents-working", index),
+                Animation::new(AGENT_BREATH)
+                    .repeat()
+                    .with_easing(pulsating_between(0.35, 1.)),
+                |mark, delta| mark.opacity(delta),
+            )
+            .into_any_element(),
+        AgentState::Idle | AgentState::NeedsInput => mark.into_any_element(),
+    })
+}
+
+/// How long one breath of a working agent's mark takes. Slow, because it runs
+/// for as long as the agent does, at the edge of your eye.
+const AGENT_BREATH: Duration = Duration::from_secs(2);
+
+/// A worktree's Linear issue: where it stands, as Linear draws it, and its
+/// identifier. Plain, with no box around it, because the title above is what
+/// the card is about and this is a detail of it.
+fn render_issue_pill(issue: &Issue) -> impl IntoElement {
+    h_flex()
+        .flex_none()
+        .gap_0p5()
+        .child(render_issue_state(issue).size(IconSize::XSmall))
+        .child(
+            Label::new(issue.identifier.clone())
+                .size(LabelSize::XSmall)
+                .color(Color::Muted),
+        )
+}
+
+/// How many changes a worktree has that are not committed, when it has any.
+fn render_changes(index: usize, changes: usize) -> Option<impl IntoElement> {
+    (changes > 0).then(|| {
+        div()
+            .id(("changes", index))
+            .flex_none()
+            .child(
+                Label::new(format!("{changes} changed"))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
             .tooltip(Tooltip::text(format!(
-                "{total} agent{}: {summary}",
-                if total == 1 { "" } else { "s" }
-            ))),
+                "{changes} uncommitted change{}",
+                if changes == 1 { "" } else { "s" }
+            )))
+    })
+}
+
+/// How the branch stands against its upstream, when it is anywhere but level
+/// with it: commits to push, and commits to pull as of the last fetch.
+fn render_ahead_behind(index: usize, ahead: u32, behind: u32) -> Option<impl IntoElement> {
+    if ahead == 0 && behind == 0 {
+        return None;
+    }
+    let mut counts = Vec::new();
+    let mut explained = Vec::new();
+    if ahead > 0 {
+        counts.push(format!("↑{ahead}"));
+        explained.push(format!("{ahead} to push"));
+    }
+    if behind > 0 {
+        counts.push(format!("↓{behind}"));
+        explained.push(format!("{behind} to pull, as of the last fetch"));
+    }
+    Some(
+        div()
+            .id(("ahead-behind", index))
+            .flex_none()
+            .child(
+                Label::new(counts.join(" "))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(Tooltip::text(format!("Commits {}", explained.join("; ")))),
     )
+}
+
+/// How long ago a worktree was last edited, as briefly as a card has room for.
+fn edited_ago(elapsed: Duration) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..MINUTE => "just now".to_string(),
+        MINUTE..HOUR => format!("{}m ago", seconds / MINUTE),
+        HOUR..DAY => format!("{}h ago", seconds / HOUR),
+        DAY..WEEK => format!("{}d ago", seconds / DAY),
+        WEEK..MONTH => format!("{}w ago", seconds / WEEK),
+        MONTH..YEAR => format!("{}mo ago", seconds / MONTH),
+        _ => format!("{}y ago", seconds / YEAR),
+    }
 }
 
 /// The disclosure chevron, turning a quarter circle as the repository opens and
@@ -2474,6 +2743,65 @@ impl Render for NameWorktree {
             .child(self.name.clone())
             .child(
                 Label::new(format!("{}/<name>", self.directory.display()))
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted),
+            )
+    }
+}
+
+/// Asks for the title a worktree's card leads with. What it is given is stored
+/// as it is, empty included: an empty title is one the issue's title is not
+/// put back into, and the card shows the worktree's name.
+struct EditTitle {
+    root: PathBuf,
+    title: Entity<InputField>,
+}
+
+impl EditTitle {
+    fn new(root: PathBuf, title: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let field = cx.new(|cx| InputField::new(window, cx, "Title"));
+        field.read(cx).editor().clone().set_text(title, window, cx);
+        Self { root, title: field }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        let title = self.title.read(cx).text(cx).trim().to_owned();
+        let root = self.root.clone();
+        WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+            store.update(&root, |metadata| metadata.title = Some(title), cx);
+        });
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Focusable for EditTitle {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.title.focus_handle(cx)
+    }
+}
+
+impl EventEmitter<DismissEvent> for EditTitle {}
+
+impl ModalView for EditTitle {}
+
+impl Render for EditTitle {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .key_context("EditWorktreeTitle")
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .child(Label::new("Worktree Title"))
+            .child(self.title.clone())
+            .child(
+                Label::new("Leave it empty to show the worktree's name instead.")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )
@@ -3065,6 +3393,124 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
     }
 }
 
+/// What git says about a worktree, from one `git status`: its changes, its
+/// branch against its upstream, and when a file last changed.
+///
+/// The last edit is the newest of the changed files, or the last commit when
+/// nothing has changed. Git's word rather than a walk of the directory, which
+/// would visit every build artefact and dependency, and whose newest file is
+/// as likely to be a cache written by a language server as anything anyone
+/// edited. Everything is left at its default when git cannot say: not a
+/// repository, no commits, no git.
+async fn worktree_status(fs: Arc<dyn Fs>, root: PathBuf) -> WorktreeStatus {
+    let Some(git) = which::which("git").ok() else {
+        return WorktreeStatus::default();
+    };
+    let run = |args: &'static [&'static str]| {
+        let mut command = util::command::new_command(&git);
+        command.current_dir(&root).kill_on_drop(true).args(args);
+        async move {
+            let output = command.output().await.log_err()?;
+            output.status.success().then_some(output.stdout)
+        }
+    };
+
+    let committed = run(&["log", "-1", "--format=%ct"])
+        .await
+        .and_then(|stdout| String::from_utf8(stdout).ok()?.trim().parse::<u64>().ok())
+        .map(|seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds));
+
+    // Without optional locks: a plain `git status` refreshes the index, and
+    // the lock it takes to do that can make an agent's own git command in the
+    // same worktree fail.
+    let output = run(&[
+        "--no-optional-locks",
+        "status",
+        "--porcelain=v1",
+        "--branch",
+        "-z",
+        "--untracked-files=normal",
+    ])
+    .await
+    .unwrap_or_default();
+    let parsed = parse_status(&output);
+
+    let mut last_edit = committed;
+    for path in &parsed.paths {
+        // A deleted file has no time of its own, and is not what anyone
+        // means by the last edit.
+        let Some(metadata) = fs.metadata(&root.join(path)).await.ok().flatten() else {
+            continue;
+        };
+        let modified = metadata.mtime.timestamp_for_user();
+        if last_edit.is_none_or(|newest| modified > newest) {
+            last_edit = Some(modified);
+        }
+    }
+    WorktreeStatus {
+        last_edit,
+        changes: parsed.paths.len(),
+        ahead_behind: parsed.ahead_behind,
+    }
+}
+
+struct ParsedStatus<'a> {
+    paths: Vec<&'a str>,
+    ahead_behind: Option<(u32, u32)>,
+}
+
+/// `git status --porcelain=v1 --branch -z`: first a `## ` entry naming the
+/// branch and its upstream, then each changed path as two status letters, a
+/// space and the path. A rename or copy is followed by an entry of its own
+/// holding the path it came from, which is skipped.
+fn parse_status(status: &[u8]) -> ParsedStatus<'_> {
+    let mut parsed = ParsedStatus {
+        paths: Vec::new(),
+        ahead_behind: None,
+    };
+    let mut entries = status.split(|byte| *byte == 0);
+    while let Some(entry) = entries.next() {
+        let Ok(entry_text) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(branch) = entry_text.strip_prefix("## ") {
+            parsed.ahead_behind = ahead_behind(branch);
+            continue;
+        }
+        let Some(path) = entry_text.get(3..).filter(|path| !path.is_empty()) else {
+            continue;
+        };
+        parsed.paths.push(path);
+        if matches!(entry.first(), Some(b'R' | b'C')) {
+            entries.next();
+        }
+    }
+    parsed
+}
+
+/// The ahead and behind counts out of the branch line of `git status
+/// --branch`: `main...origin/main [ahead 2, behind 5]`, with either count left
+/// out when it is zero, and no brackets when both are. A branch whose line
+/// names no upstream — no `...` — has none to be ahead of, and neither does
+/// one whose upstream is `[gone]`.
+fn ahead_behind(branch: &str) -> Option<(u32, u32)> {
+    let (_, tracking) = branch.split_once("...")?;
+    let counts = match tracking.split_once(" [") {
+        Some((_, counts)) => counts.strip_suffix(']')?,
+        None => return Some((0, 0)),
+    };
+    let mut ahead = 0;
+    let mut behind = 0;
+    for count in counts.split(", ") {
+        match count.split_once(' ') {
+            Some(("ahead", number)) => ahead = number.parse().ok()?,
+            Some(("behind", number)) => behind = number.parse().ok()?,
+            _ => return None,
+        }
+    }
+    Some((ahead, behind))
+}
+
 /// Where the panel's one width is kept.
 ///
 /// A dock's size is stored per workspace — the key is `<workspace>:<panel>` —
@@ -3292,6 +3738,31 @@ impl Render for WorktreePanel {
         let filter = self.filter(cx);
         let roots: Vec<PathBuf> = tree.iter().filter_map(|row| project_root(&row.key)).collect();
         self.scan_pull_requests(&roots, cx);
+        let worktree_roots: Vec<PathBuf> = tree
+            .iter()
+            .flat_map(|row| row.worktrees.iter())
+            .filter_map(|worktree| worktree.root.clone())
+            .collect();
+        self.scan_statuses(&worktree_roots, cx);
+        // A worktree whose issue Linear has now named, and which has no title
+        // yet, takes the issue's: one made before titles were stored, or for
+        // a branch named after an issue. After this draw, since storing it
+        // tells every panel to draw again.
+        let untitled: Vec<(PathBuf, SharedString)> = tree
+            .iter()
+            .flat_map(|row| row.worktrees.iter())
+            .filter(|worktree| worktree.title.is_none())
+            .filter_map(|worktree| Some((worktree.root.clone()?, worktree.issue.as_ref()?.title.clone())))
+            .collect();
+        if !untitled.is_empty() {
+            cx.defer(move |cx| {
+                WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+                    for (root, title) in &untitled {
+                        store.fill_title(root, title, cx);
+                    }
+                });
+            });
+        }
         if let Some(linear) = Linear::global(cx) {
             let branches: Vec<SharedString> = tree
                 .iter()
@@ -4212,15 +4683,23 @@ mod tests {
         drop(workspaces);
     }
 
-    /// Right-clicking a worktree opens its menu, which draws.
+    /// Right-clicking a worktree opens its menu, which draws, delete and all.
     #[gpui::test]
     async fn the_row_menu_opens(cx: &mut TestAppContext) {
         let (_fs, _multi_workspace, _fix, panel, mut cx) =
             worktree_with_a_nested_repository(cx).await;
         panel.update_in(&mut cx, |panel, window, cx| {
+            let delete = panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .find(|worktree| worktree.root.as_deref() == Some(Path::new("/wt/fix")))
+                .and_then(|worktree| Some((worktree.repository?, worktree.name)));
+            assert!(delete.is_some(), "a linked worktree can be deleted");
             panel.deploy_row_menu(
                 PathBuf::from("/wt/fix"),
                 Some("RB-116".into()),
+                delete,
                 gpui::point(px(10.), px(10.)),
                 window,
                 cx,
@@ -4563,6 +5042,74 @@ mod tests {
                 vec!["main".to_owned(), "outer-fix".to_owned()]
             )]
         );
+    }
+
+    /// The title is stored as typed, trimmed, and an empty one stays empty.
+    #[gpui::test]
+    async fn editing_a_title_stores_it(cx: &mut TestAppContext) {
+        let (_fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        panel.update_in(&mut cx, |panel, window, cx| {
+            panel.edit_title(PathBuf::from("/wt/fix"), window, cx);
+        });
+        cx.run_until_parked();
+        let modal = multi_workspace.update(&mut cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_modal::<EditTitle>(cx)
+                .expect("the title modal")
+        });
+        modal.update_in(&mut cx, |modal, window, cx| {
+            modal
+                .title
+                .read(cx)
+                .editor()
+                .clone()
+                .set_text("  Fix the login  ", window, cx);
+            modal.confirm(&menu::Confirm, window, cx);
+        });
+        cx.run_until_parked();
+        let stored = cx.update(|_, cx| {
+            WorktreeMetadataStore::global(cx)
+                .read(cx)
+                .get(Path::new("/wt/fix"), cx)
+        });
+        assert_eq!(stored.title.as_deref(), Some("Fix the login"));
+    }
+
+    #[test]
+    fn the_last_edit_is_said_briefly() {
+        assert_eq!(edited_ago(Duration::from_secs(20)), "just now");
+        assert_eq!(edited_ago(Duration::from_secs(5 * 60 + 10)), "5m ago");
+        assert_eq!(edited_ago(Duration::from_secs(3 * 3600)), "3h ago");
+        assert_eq!(edited_ago(Duration::from_secs(2 * 86400)), "2d ago");
+        assert_eq!(edited_ago(Duration::from_secs(15 * 86400)), "2w ago");
+        assert_eq!(edited_ago(Duration::from_secs(95 * 86400)), "3mo ago");
+        assert_eq!(edited_ago(Duration::from_secs(800 * 86400)), "2y ago");
+    }
+
+    #[test]
+    fn a_renamed_files_old_path_is_not_a_changed_file() {
+        let status =
+            b"## main...origin/main [ahead 2]\0 M src/main.rs\0R  new.rs\0old.rs\0?? notes/\0";
+        let parsed = parse_status(status);
+        assert_eq!(parsed.paths, ["src/main.rs", "new.rs", "notes/"]);
+        assert_eq!(parsed.ahead_behind, Some((2, 0)));
+        assert!(parse_status(b"").paths.is_empty());
+    }
+
+    #[test]
+    fn a_branch_is_ahead_or_behind_only_with_an_upstream() {
+        assert_eq!(
+            ahead_behind("main...origin/main [ahead 2, behind 5]"),
+            Some((2, 5))
+        );
+        assert_eq!(ahead_behind("main...origin/main [behind 1]"), Some((0, 1)));
+        assert_eq!(ahead_behind("main...origin/main"), Some((0, 0)));
+        assert_eq!(ahead_behind("fix-login"), None, "no upstream");
+        assert_eq!(ahead_behind("fix...origin/fix [gone]"), None);
+        assert_eq!(ahead_behind("HEAD (no branch)"), None);
     }
 
     #[test]

@@ -15,6 +15,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 fs.workspace = true
+futures.workspace = true
 gpui.workspace = true
 log.workspace = true
 serde.workspace = true
