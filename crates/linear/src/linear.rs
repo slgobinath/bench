@@ -74,6 +74,9 @@ const LOOKUP_REFRESH: Duration = Duration::from_secs(300);
 /// launched before it was up — so it is retried soon, and on its own rather
 /// than waiting for the next draw.
 const LOOKUP_RETRY: Duration = Duration::from_secs(15);
+/// How often what Bench shows of Linear is asked about again. Statuses move in
+/// Linear, not here, so they are only as fresh as the last time Bench asked.
+const POLL_EVERY: Duration = Duration::from_secs(60);
 
 pub fn init(cx: &mut App) {
     let linear = cx.new(Linear::new);
@@ -219,10 +222,16 @@ pub struct Named {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Cycle {
     pub id: SharedString,
     pub number: f64,
     pub name: Option<SharedString>,
+    /// RFC 3339.
+    #[serde(default)]
+    pub starts_at: Option<SharedString>,
+    #[serde(default)]
+    pub is_active: bool,
 }
 
 impl Cycle {
@@ -441,6 +450,15 @@ struct Lookup {
     fresh_until: Instant,
 }
 
+/// How the panel groups the issues it lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum IssueGrouping {
+    #[default]
+    None,
+    Status,
+    Cycle,
+}
+
 pub enum LinearEvent {
     /// Something the panel, a tab, or a worktree row draws has changed.
     Changed,
@@ -452,6 +470,11 @@ pub struct Linear {
     connection: Connection,
     catalog: Catalog,
     filters: IssueFilters,
+    grouping: IssueGrouping,
+    /// The groups closed in the panel, by [`IssueGrouping`] and group key.
+    /// Here rather than on a panel, like the filters, so that every
+    /// worktree's panel shows the same list.
+    collapsed_groups: HashSet<(IssueGrouping, SharedString)>,
     query: String,
     issues: Vec<Arc<Issue>>,
     /// Whether a list request is in flight. The previous list stays on screen
@@ -468,6 +491,11 @@ pub struct Linear {
     /// [`Self::look_up_branches`].
     lookups: HashMap<SharedString, Lookup>,
     queued_lookups: HashSet<SharedString>,
+    /// Every key a panel has asked about, which [`POLL_EVERY`] asks about
+    /// again: an issue's status changes in Linear without anything here
+    /// knowing to look.
+    watched: HashSet<SharedString>,
+    _poll: Task<()>,
     looking_up: bool,
 }
 
@@ -486,6 +514,8 @@ impl Linear {
             connection: Connection::Loading,
             catalog: Catalog::default(),
             filters: IssueFilters::default(),
+            grouping: IssueGrouping::default(),
+            collapsed_groups: HashSet::new(),
             query: String::new(),
             issues: Vec::new(),
             loading: false,
@@ -495,6 +525,15 @@ impl Linear {
             _load_key: None,
             lookups: HashMap::new(),
             queued_lookups: HashSet::new(),
+            watched: HashSet::new(),
+            _poll: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(POLL_EVERY).await;
+                    if this.update(cx, |this, cx| this.poll(cx)).is_err() {
+                        return;
+                    }
+                }
+            }),
             looking_up: false,
         };
         this.load_key(cx);
@@ -659,10 +698,37 @@ impl Linear {
         self._list = None;
         self.lookups.clear();
         self.queued_lookups.clear();
+        self.watched.clear();
     }
 
     pub fn filters(&self) -> &IssueFilters {
         &self.filters
+    }
+
+    pub fn grouping(&self) -> IssueGrouping {
+        self.grouping
+    }
+
+    pub fn set_grouping(&mut self, grouping: IssueGrouping, cx: &mut Context<Self>) {
+        if grouping != self.grouping {
+            self.grouping = grouping;
+            cx.emit(LinearEvent::Changed);
+            cx.notify();
+        }
+    }
+
+    pub fn is_group_collapsed(&self, key: &SharedString) -> bool {
+        self.collapsed_groups
+            .contains(&(self.grouping, key.clone()))
+    }
+
+    pub fn toggle_group(&mut self, key: SharedString, cx: &mut Context<Self>) {
+        let group = (self.grouping, key);
+        if !self.collapsed_groups.remove(&group) {
+            self.collapsed_groups.insert(group);
+        }
+        cx.emit(LinearEvent::Changed);
+        cx.notify();
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -915,6 +981,19 @@ impl Linear {
         })
     }
 
+    /// Asks again about every issue a panel is showing, and refreshes the
+    /// panel's list, so a status changed in Linear shows up here.
+    fn poll(&mut self, cx: &mut Context<Self>) {
+        if !self.is_connected() {
+            return;
+        }
+        self.queued_lookups.extend(self.watched.iter().cloned());
+        self.start_lookups(cx);
+        if !self.loading {
+            self.refresh(cx);
+        }
+    }
+
     /// The issue with Linear's own `id`, once it has been looked up; see
     /// [`Self::look_up_ids`].
     pub fn issue_for_id(&self, id: &str) -> Option<Arc<Issue>> {
@@ -929,6 +1008,7 @@ impl Linear {
             return;
         }
         for id in ids {
+            self.watched.insert(SharedString::from(id.to_owned()));
             let fresh = self
                 .lookups
                 .get(id)
@@ -969,6 +1049,7 @@ impl Linear {
             let Some(identifier) = identifier_in_branch(branch) else {
                 continue;
             };
+            self.watched.insert(identifier.clone());
             let fresh = self
                 .lookups
                 .get(&identifier)
@@ -1002,25 +1083,7 @@ impl Linear {
                 if batch.is_empty() {
                     break;
                 }
-                // Linear's own ids and identifiers share the queue; they
-                // are told apart by shape, and asked about in one request each.
-                let (ids, identifiers): (Vec<SharedString>, Vec<SharedString>) = batch
-                    .iter()
-                    .cloned()
-                    .partition(|key| is_issue_id(key));
-                let found = async {
-                    let mut found = Vec::new();
-                    if !identifiers.is_empty() {
-                        found.extend(
-                            issues_by_identifier(http_client.as_ref(), &key, &identifiers).await?,
-                        );
-                    }
-                    if !ids.is_empty() {
-                        found.extend(issues_by_id(http_client.as_ref(), &key, &ids).await?);
-                    }
-                    anyhow::Ok(found)
-                }
-                .await;
+                let found = issues_by_key(http_client.as_ref(), &key, &batch).await;
                 this.update(cx, |this, cx| match found {
                     Ok(found) => {
                         log::info!(
@@ -1215,7 +1278,7 @@ pub fn hex_color(hex: &str) -> Option<Hsla> {
 
 const ISSUE_FIELDS: &str = "id identifier title url branchName priority priorityLabel \
     state { id name color type } assignee { id name displayName } team { id key name } \
-    project { id name } cycle { id number name } labels { nodes { id name color } }";
+    project { id name } cycle { id number name startsAt isActive } labels { nodes { id name color } }";
 
 #[derive(Deserialize)]
 struct Nodes<T> {
@@ -1266,12 +1329,14 @@ struct GraphqlErrorExtensions {
     user_presentable_message: Option<String>,
 }
 
-async fn graphql<T: DeserializeOwned>(
+/// Sends a GraphQL request and returns Linear's answer as it came, for
+/// callers that read partial answers; see [`issues_by_key`].
+async fn post_graphql(
     http_client: &dyn HttpClient,
     key: &str,
     query: &str,
     variables: Value,
-) -> Result<T> {
+) -> Result<(StatusCode, String)> {
     let body = serde_json::to_string(&json!({ "query": query, "variables": variables }))?;
     // A personal API key goes in the header bare. `Bearer` is for OAuth
     // tokens, and Linear refuses a personal key that carries it.
@@ -1290,11 +1355,18 @@ async fn graphql<T: DeserializeOwned>(
             "Linear refused the API key. It may have been revoked."
         ));
     }
+    Ok((response.status(), body))
+}
+
+async fn graphql<T: DeserializeOwned>(
+    http_client: &dyn HttpClient,
+    key: &str,
+    query: &str,
+    variables: Value,
+) -> Result<T> {
+    let (status, body) = post_graphql(http_client, key, query, variables).await?;
     let parsed: GraphqlResponse<T> = serde_json::from_str(&body).with_context(|| {
-        format!(
-            "Linear answered {} with something that is not GraphQL",
-            response.status()
-        )
+        format!("Linear answered {status} with something that is not GraphQL")
     })?;
     if let Some(error) = parsed.errors.into_iter().next() {
         let message = error
@@ -1305,7 +1377,7 @@ async fn graphql<T: DeserializeOwned>(
     }
     parsed
         .data
-        .ok_or_else(|| anyhow!("Linear answered {} with no data", response.status()))
+        .ok_or_else(|| anyhow!("Linear answered {status} with no data"))
 }
 
 async fn fetch_viewer(http_client: &dyn HttpClient, key: &str) -> Result<User> {
@@ -1368,73 +1440,68 @@ async fn search_issues(
     Ok(response.search_issues)
 }
 
-/// Whether a lookup key is Linear's own id — a UUID — rather than an
-/// identifier such as `ENG-123`.
-fn is_issue_id(key: &str) -> bool {
-    key.len() == 36 && key.chars().filter(|character| *character == '-').count() == 4
-}
+/// How many issues one lookup request asks for.
+const LOOKUP_BATCH: usize = 10;
 
-/// Several issues by Linear's own id in one request, archived ones included:
-/// a worktree outlives the issue it was made for being archived.
-async fn issues_by_id(
+/// Issues by exact key — an identifier such as `ENG-123` or Linear's own id —
+/// each asked for under an alias of its own, several to a request.
+///
+/// `issue(id:)` takes either kind of key, finds archived issues, and finds an
+/// issue by its id after its identifier has changed. A filter on team key and
+/// number looks like it would do the same for identifiers in one query, but
+/// Linear does not apply the number inside `or`, and answers with the team's
+/// newest issues instead. A key with no issue is an error for its alias alone;
+/// the others in the request are still answered.
+async fn issues_by_key(
     http_client: &dyn HttpClient,
     key: &str,
-    ids: &[SharedString],
+    keys: &[SharedString],
 ) -> Result<Vec<Issue>> {
-    #[derive(Deserialize)]
-    struct Issues {
-        #[serde(deserialize_with = "nodes")]
-        issues: Vec<Issue>,
+    let mut found = Vec::new();
+    for batch in keys.chunks(LOOKUP_BATCH) {
+        let parameters = (0..batch.len())
+            .map(|index| format!("$k{index}: String!"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let fields = (0..batch.len())
+            .map(|index| format!("i{index}: issue(id: $k{index}) {{ {ISSUE_FIELDS} }}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let variables: serde_json::Map<String, Value> = batch
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (format!("k{index}"), json!(key.as_ref())))
+            .collect();
+        let (status, body) = post_graphql(
+            http_client,
+            key,
+            &format!("query({parameters}) {{ {fields} }}"),
+            Value::Object(variables),
+        )
+        .await?;
+        let response: Value = serde_json::from_str(&body).with_context(|| {
+            format!("Linear answered {status} with something that is not GraphQL")
+        })?;
+        let Some(data) = response.get("data").and_then(Value::as_object) else {
+            // No data at all is the request failing, not an issue missing.
+            let message = response
+                .pointer("/errors/0/message")
+                .and_then(Value::as_str)
+                .unwrap_or("no data");
+            return Err(anyhow!("Linear answered {status}: {message}"));
+        };
+        for index in 0..batch.len() {
+            let Some(issue) = data.get(&format!("i{index}")).filter(|issue| !issue.is_null())
+            else {
+                continue;
+            };
+            match serde_json::from_value::<Issue>(issue.clone()) {
+                Ok(issue) => found.push(issue),
+                Err(error) => log::warn!("reading a Linear issue: {error:#}"),
+            }
+        }
     }
-    let ids: Vec<&str> = ids.iter().map(|id| id.as_ref()).collect();
-    let response: Issues = graphql(
-        http_client,
-        key,
-        &format!(
-            "query($filter: IssueFilter, $first: Int) {{ \
-             issues(filter: $filter, first: $first, includeArchived: true) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
-        ),
-        json!({ "filter": { "id": { "in": ids } }, "first": ids.len() }),
-    )
-    .await?;
-    Ok(response.issues)
-}
-
-/// Several issues by identifier in one request. `issue(id:)` takes one at a
-/// time, but an identifier is a team key and a number, and the issue filter
-/// can match any of several of those.
-async fn issues_by_identifier(
-    http_client: &dyn HttpClient,
-    key: &str,
-    identifiers: &[SharedString],
-) -> Result<Vec<Issue>> {
-    let any_of: Vec<Value> = identifiers
-        .iter()
-        .filter_map(|identifier| {
-            let (team, number) = identifier.split_once('-')?;
-            let number: u64 = number.parse().ok()?;
-            Some(json!({ "team": { "key": { "eq": team } }, "number": { "eq": number } }))
-        })
-        .collect();
-    if any_of.is_empty() {
-        return Ok(Vec::new());
-    }
-    #[derive(Deserialize)]
-    struct Issues {
-        #[serde(deserialize_with = "nodes")]
-        issues: Vec<Issue>,
-    }
-    let response: Issues = graphql(
-        http_client,
-        key,
-        &format!(
-            "query($filter: IssueFilter, $first: Int) {{ \
-             issues(filter: $filter, first: $first, includeArchived: true) {{ nodes {{ {ISSUE_FIELDS} }} }} }}"
-        ),
-        json!({ "filter": { "or": any_of }, "first": identifiers.len() }),
-    )
-    .await?;
-    Ok(response.issues)
+    Ok(found)
 }
 
 async fn fetch_catalog(http_client: &dyn HttpClient, key: &str) -> Result<Catalog> {
@@ -1586,7 +1653,7 @@ pub(crate) mod tests {
                 if call < failures {
                     return Err(anyhow!("dns error: failed to lookup address information"));
                 }
-                let body = json!({ "data": { "issues": { "nodes": [issue_json(identifier)] } } });
+                let body = json!({ "data": { "i0": issue_json(identifier) } });
                 Ok(Response::builder()
                     .status(200)
                     .body(AsyncBody::from(body.to_string()))?)
@@ -1610,6 +1677,8 @@ pub(crate) mod tests {
             },
             catalog: Catalog::default(),
             filters: IssueFilters::default(),
+            grouping: IssueGrouping::default(),
+            collapsed_groups: HashSet::new(),
             query: String::new(),
             issues: Vec::new(),
             loading: false,
@@ -1619,6 +1688,8 @@ pub(crate) mod tests {
             _load_key: None,
             lookups: HashMap::new(),
             queued_lookups: HashSet::new(),
+            watched: HashSet::new(),
+            _poll: Task::ready(()),
             looking_up: false,
         })
     }
@@ -1664,12 +1735,14 @@ pub(crate) mod tests {
                     let mut body = String::new();
                     let mut request_body = request.into_body();
                     futures::AsyncReadExt::read_to_string(&mut request_body, &mut body).await?;
-                    if body.contains("includeArchived: true") {
+                    // `issue(id:)` is what finds archived issues, and an
+                    // issue whose identifier has changed.
+                    if body.contains("issue(id: $k0)") && body.contains(ID) {
                         asked_for_archived.store(true, Ordering::SeqCst);
                     }
                     let mut issue = issue_json("RB2-7");
                     issue["id"] = json!(ID);
-                    let response = json!({ "data": { "issues": { "nodes": [issue] } } });
+                    let response = json!({ "data": { "i0": issue } });
                     Ok(Response::builder()
                         .status(200)
                         .body(AsyncBody::from(response.to_string()))?)
@@ -1691,6 +1764,69 @@ pub(crate) mod tests {
             );
         });
         assert!(asked_for_archived.load(Ordering::SeqCst));
+    }
+
+    /// The bug this replaced: asking for RB-116, RB-154 and RB-134 by team
+    /// and number came back with the team's three newest issues. Each key is
+    /// asked for exactly now, and one with no issue leaves the others found.
+    #[gpui::test]
+    async fn each_issue_is_found_by_its_own_key(cx: &mut TestAppContext) {
+        let http_client = FakeHttpClient::create(|_| async {
+            let body = json!({
+                "data": { "i0": null, "i1": issue_json("RB-134") },
+                "errors": [{ "message": "Entity not found", "path": ["i0"] }],
+            });
+            Ok(Response::builder()
+                .status(200)
+                .body(AsyncBody::from(body.to_string()))?)
+        });
+        let linear = connected_linear(http_client, cx);
+        linear.update(cx, |linear, cx| {
+            linear.look_up_branches(["dev/rb-999-gone", "rb-134-new-website"], cx)
+        });
+        cx.run_until_parked();
+        linear.read_with(cx, |linear, _| {
+            assert!(linear.issue_for_branch("rb-134-new-website").is_some());
+            assert!(linear.issue_for_branch("dev/rb-999-gone").is_none());
+        });
+    }
+
+    /// Statuses change in Linear: what a panel shows is asked about again on
+    /// the poll, without anything redrawing.
+    #[gpui::test]
+    async fn watched_issues_are_asked_about_again(cx: &mut TestAppContext) {
+        let states = Arc::new(std::sync::Mutex::new(vec!["unstarted", "started"]));
+        let http_client = FakeHttpClient::create({
+            let states = states.clone();
+            move |_| {
+                let states = states.clone();
+                async move {
+                    let state = {
+                        let mut states = states.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if states.len() > 1 { states.remove(0) } else { states[0] }
+                    };
+                    let mut issue = issue_json("RB-134");
+                    issue["state"]["type"] = json!(state);
+                    let body = json!({ "data": { "i0": issue } });
+                    Ok(Response::builder()
+                        .status(200)
+                        .body(AsyncBody::from(body.to_string()))?)
+                }
+            }
+        });
+        let linear = connected_linear(http_client, cx);
+        linear.update(cx, |linear, cx| linear.look_up_branches(["rb-134-x"], cx));
+        cx.run_until_parked();
+        let state = |cx: &mut TestAppContext| {
+            linear.read_with(cx, |linear, _| {
+                linear.issue_for_branch("rb-134-x").map(|issue| issue.state.kind)
+            })
+        };
+        assert_eq!(state(cx), Some(StateType::Unstarted));
+
+        linear.update(cx, |linear, cx| linear.poll(cx));
+        cx.run_until_parked();
+        assert_eq!(state(cx), Some(StateType::Started));
     }
 
     /// A refresh that fails leaves the issue on screen rather than making the

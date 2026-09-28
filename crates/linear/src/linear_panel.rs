@@ -5,13 +5,16 @@
 //! so a panel is only the search box and the drawing. There is one per
 //! worktree, and each keeps its search box in step with the others'.
 
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, SharedString, Task, WeakEntity, Window, actions, prelude::*,
+    Focusable, Hsla, SharedString, Task, WeakEntity, Window, actions, prelude::*,
 };
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use ui::{ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*};
 use ui_input::{ErasedEditor, InputField};
 use workspace::{
@@ -21,7 +24,8 @@ use workspace::{
 
 use crate::{
     API_KEY_ENV_VAR, API_KEY_SETTINGS_URL, AssigneeFilter, Connection, CreateWorktree,
-    CycleFilter, Issue, IssueFilters, KeySource, Linear, LinearEvent, Named, StateType,
+    CycleFilter, Issue, IssueFilters, IssueGrouping, KeySource, Linear, LinearEvent, Named,
+    StateType,
     issue_view::open_issue_in,
 };
 
@@ -322,6 +326,7 @@ impl LinearPanel {
                         });
                     })),
             )
+            .child(self.render_grouping_button(cx))
             .child(filters_button(
                 "linear-filters",
                 self.filter_target(),
@@ -376,6 +381,95 @@ impl LinearPanel {
                         }))
                     }),
             )
+    }
+
+    fn render_grouping_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let grouping = self.linear.read(cx).grouping();
+        let linear = self.linear.clone();
+        PopoverMenu::new("linear-grouping")
+            .trigger_with_tooltip(
+                IconButton::new("linear-grouping-trigger", IconName::ListTree)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(grouping != IssueGrouping::None),
+                Tooltip::text("Group By"),
+            )
+            .anchor(gpui::Anchor::TopRight)
+            .menu(move |window, cx| {
+                let linear = linear.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    menu = menu.header("Group By");
+                    for (label, choice) in [
+                        ("No Grouping", IssueGrouping::None),
+                        ("Status", IssueGrouping::Status),
+                        ("Cycle", IssueGrouping::Cycle),
+                    ] {
+                        let linear = linear.clone();
+                        menu = menu.toggleable_entry(
+                            label,
+                            grouping == choice,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                linear.update(cx, |linear, cx| linear.set_grouping(choice, cx))
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
+    fn render_group_header(
+        &self,
+        group: &IssueGroup,
+        collapsed: bool,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = group.key.clone();
+        ListItem::new(("issue-group", index))
+            .spacing(ListItemSpacing::Sparse)
+            .height(ROW_HEIGHT)
+            .start_slot(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .size(IconSize::Small)
+                .color(Color::Muted),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .gap_1p5()
+                    .when_some(group.icon, |this, (icon, color)| {
+                        this.child(Icon::new(icon).size(IconSize::Small).map(
+                            |icon| match color {
+                                Some(color) => icon.color(Color::Custom(color)),
+                                None => icon.color(Color::Muted),
+                            },
+                        ))
+                    })
+                    .child(
+                        Label::new(group.label.clone())
+                            .size(LabelSize::Small)
+                            .weight(gpui::FontWeight::MEDIUM)
+                            .single_line()
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(group.issues.len().to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.linear
+                    .update(cx, |linear, cx| linear.toggle_group(key.clone(), cx));
+            }))
+            .into_any_element()
     }
 
     fn render_issue(&self, issue: &Issue, index: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -468,9 +562,26 @@ impl LinearPanel {
                 )
                 .into_any_element();
         }
+        let grouping = linear.grouping();
         let mut rows = Vec::with_capacity(issues.len());
-        for (index, issue) in issues.iter().enumerate() {
-            rows.push(self.render_issue(issue, index, cx).into_any_element());
+        if grouping == IssueGrouping::None {
+            for (index, issue) in issues.iter().enumerate() {
+                rows.push(self.render_issue(issue, index, cx).into_any_element());
+            }
+        } else {
+            let groups = group_issues(&issues, grouping, OffsetDateTime::now_utc());
+            let mut index = 0;
+            for (group_index, group) in groups.iter().enumerate() {
+                let collapsed = self.linear.read(cx).is_group_collapsed(&group.key);
+                rows.push(self.render_group_header(group, collapsed, group_index, cx));
+                if collapsed {
+                    continue;
+                }
+                for issue in &group.issues {
+                    rows.push(self.render_issue(issue, index, cx).into_any_element());
+                    index += 1;
+                }
+            }
         }
         v_flex()
             .id("linear-issues")
@@ -481,6 +592,118 @@ impl LinearPanel {
             .children(rows)
             .into_any_element()
     }
+}
+
+/// The issues under one heading of a grouped list.
+#[derive(Debug)]
+struct IssueGroup {
+    /// What the group is remembered as closed by.
+    key: SharedString,
+    label: SharedString,
+    icon: Option<(IconName, Option<Hsla>)>,
+    issues: Vec<Arc<Issue>>,
+}
+
+/// The issues under their headings, each group keeping the list's order.
+///
+/// Statuses come in the order Linear's own list puts them: work under way
+/// first, then what is next, then what is finished. Each team names its own
+/// states, so a group is a state's name within its type, and teams whose
+/// states share a name share a group.
+///
+/// Cycles come current first, then the ones to come, soonest first, then the
+/// past ones, latest first, and issues in no cycle last.
+fn group_issues(
+    issues: &[Arc<Issue>],
+    grouping: IssueGrouping,
+    now: OffsetDateTime,
+) -> Vec<IssueGroup> {
+    let mut groups: BTreeMap<(u8, i64, SharedString), IssueGroup> = BTreeMap::new();
+    for issue in issues {
+        let (order, group) = match grouping {
+            IssueGrouping::None => return Vec::new(),
+            IssueGrouping::Status => {
+                let state = &issue.state;
+                let rank = match state.kind {
+                    StateType::Started => 0,
+                    StateType::Unstarted => 1,
+                    StateType::Backlog => 2,
+                    StateType::Triage => 3,
+                    StateType::Completed => 4,
+                    StateType::Canceled => 5,
+                    StateType::Other => 6,
+                };
+                (
+                    (rank, 0, state.name.clone()),
+                    IssueGroup {
+                        key: format!("{}:{}", state.kind.as_str(), state.name).into(),
+                        label: state.name.clone(),
+                        icon: Some((state.kind.icon(), state.color())),
+                        issues: Vec::new(),
+                    },
+                )
+            }
+            IssueGrouping::Cycle => match &issue.cycle {
+                None => (
+                    (4, 0, SharedString::default()),
+                    IssueGroup {
+                        key: "none".into(),
+                        label: "No Cycle".into(),
+                        icon: None,
+                        issues: Vec::new(),
+                    },
+                ),
+                Some(cycle) => {
+                    let starts_at = cycle
+                        .starts_at
+                        .as_ref()
+                        .and_then(|starts_at| OffsetDateTime::parse(starts_at, &Rfc3339).ok());
+                    let (bucket, position) = match starts_at {
+                        _ if cycle.is_active => (0, 0),
+                        Some(starts_at) if starts_at > now => (1, starts_at.unix_timestamp()),
+                        Some(starts_at) => (2, -starts_at.unix_timestamp()),
+                        None => (3, 0),
+                    };
+                    let label = if cycle.is_active {
+                        format!("{} (Current)", cycle.label()).into()
+                    } else {
+                        cycle.label()
+                    };
+                    (
+                        (bucket, position, cycle.id.clone()),
+                        IssueGroup {
+                            key: cycle.id.clone(),
+                            label,
+                            icon: None,
+                            issues: Vec::new(),
+                        },
+                    )
+                }
+            },
+        };
+        groups
+            .entry(order)
+            .or_insert(group)
+            .issues
+            .push(issue.clone());
+    }
+    let mut groups: Vec<IssueGroup> = groups.into_values().collect();
+
+    // Each team numbers its own cycles, so two teams' "Cycle 12" are told
+    // apart by team.
+    if grouping == IssueGrouping::Cycle {
+        let mut label_counts: HashMap<SharedString, usize> = HashMap::new();
+        for group in &groups {
+            *label_counts.entry(group.label.clone()).or_default() += 1;
+        }
+        for group in &mut groups {
+            let shared = label_counts.get(&group.label).is_some_and(|count| *count > 1);
+            if let (true, Some(issue)) = (shared, group.issues.first()) {
+                group.label = format!("{} {}", issue.team.key, group.label).into();
+            }
+        }
+    }
+    groups
 }
 
 /// Whose filters a filter menu shows and changes: the panel's, or a
@@ -789,5 +1012,128 @@ impl Panel for LinearPanel {
 
     fn activation_priority(&self) -> u32 {
         8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::issue_json;
+    use serde_json::{Value, json};
+    use time::macros::datetime;
+
+    fn issue(identifier: &str, change: impl FnOnce(&mut Value)) -> Arc<Issue> {
+        let mut value = issue_json(identifier);
+        change(&mut value);
+        Arc::new(serde_json::from_value(value).expect("an issue"))
+    }
+
+    fn in_state(identifier: &str, name: &str, kind: &str) -> Arc<Issue> {
+        issue(identifier, |value| {
+            value["state"] = json!({ "id": name, "name": name, "color": "#ffffff", "type": kind });
+        })
+    }
+
+    fn in_cycle(identifier: &str, team: &str, cycle: Option<(&str, u32, &str, bool)>) -> Arc<Issue> {
+        issue(identifier, |value| {
+            value["team"]["key"] = json!(team);
+            value["cycle"] = match cycle {
+                Some((id, number, starts_at, is_active)) => json!({
+                    "id": id,
+                    "number": number,
+                    "name": null,
+                    "startsAt": starts_at,
+                    "isActive": is_active,
+                }),
+                None => Value::Null,
+            };
+        })
+    }
+
+    fn summary(groups: &[IssueGroup]) -> Vec<(String, Vec<String>)> {
+        groups
+            .iter()
+            .map(|group| {
+                (
+                    group.label.to_string(),
+                    group
+                        .issues
+                        .iter()
+                        .map(|issue| issue.identifier.to_string())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn issues_are_grouped_by_status_work_under_way_first() {
+        let issues = [
+            in_state("RB-1", "Done", "completed"),
+            in_state("RB-2", "Todo", "unstarted"),
+            in_state("RB-3", "In Review", "started"),
+            in_state("RB-4", "In Progress", "started"),
+            in_state("RB-5", "Todo", "unstarted"),
+            in_state("RB-6", "Backlog", "backlog"),
+        ];
+        let groups = group_issues(&issues, IssueGrouping::Status, datetime!(2026-09-27 0:00 UTC));
+        assert_eq!(
+            summary(&groups),
+            [
+                ("In Progress", vec!["RB-4"]),
+                ("In Review", vec!["RB-3"]),
+                ("Todo", vec!["RB-2", "RB-5"]),
+                ("Backlog", vec!["RB-6"]),
+                ("Done", vec!["RB-1"]),
+            ]
+            .map(|(label, issues)| (
+                label.to_owned(),
+                issues.into_iter().map(str::to_owned).collect::<Vec<_>>()
+            ))
+        );
+    }
+
+    #[test]
+    fn issues_are_grouped_by_cycle_current_then_upcoming_then_past() {
+        let issues = [
+            in_cycle("RB-1", "RB", None),
+            in_cycle("RB-2", "RB", Some(("c10", 10, "2026-09-01T00:00:00.000Z", false))),
+            in_cycle("RB-3", "RB", Some(("c13", 13, "2026-10-20T00:00:00.000Z", false))),
+            in_cycle("RB-4", "RB", Some(("c12", 12, "2026-10-06T00:00:00.000Z", false))),
+            in_cycle("RB-5", "RB", Some(("c11", 11, "2026-09-22T00:00:00.000Z", true))),
+            in_cycle("RB-6", "RB", Some(("c9", 9, "2026-08-18T00:00:00.000Z", false))),
+            in_cycle("OPS-1", "OPS", Some(("o12", 12, "2026-10-06T00:00:00.000Z", false))),
+        ];
+        let groups = group_issues(&issues, IssueGrouping::Cycle, datetime!(2026-09-27 0:00 UTC));
+        let labels: Vec<String> = summary(&groups).into_iter().map(|(label, _)| label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Cycle 11 (Current)",
+                "RB Cycle 12",
+                "OPS Cycle 12",
+                "Cycle 13",
+                "Cycle 10",
+                "Cycle 9",
+                "No Cycle",
+            ],
+            "two teams' cycles with one number are told apart"
+        );
+    }
+
+    #[gpui::test]
+    fn a_closed_group_stays_closed_only_in_its_own_grouping(cx: &mut gpui::TestAppContext) {
+        let linear =
+            crate::tests::connected_linear(http_client::FakeHttpClient::with_404_response(), cx);
+        linear.update(cx, |linear, cx| {
+            linear.set_grouping(IssueGrouping::Status, cx);
+            linear.toggle_group("started:In Progress".into(), cx);
+            assert!(linear.is_group_collapsed(&"started:In Progress".into()));
+            linear.set_grouping(IssueGrouping::Cycle, cx);
+            assert!(!linear.is_group_collapsed(&"started:In Progress".into()));
+            linear.set_grouping(IssueGrouping::Status, cx);
+            linear.toggle_group("started:In Progress".into(), cx);
+            assert!(!linear.is_group_collapsed(&"started:In Progress".into()));
+        });
     }
 }
