@@ -482,7 +482,7 @@ pub struct GitSettings {
     pub branch_picker: BranchPickerSettings,
     /// How hunks are displayed visually in the editor.
     ///
-    /// Default: staged_hollow
+    /// Default: filled
     pub hunk_style: settings::GitHunkStyleSetting,
     /// Which base git features diff against.
     ///

@@ -659,11 +659,11 @@ pub struct GitSettings {
     pub file_diff: Option<FileDiffSettingsContent>,
     /// How hunks are displayed visually in the editor.
     ///
-    /// Default: staged_hollow
+    /// Default: filled
     pub hunk_style: Option<GitHunkStyleSetting>,
     /// Which base git features (gutter, file colors, git::Diff) diff against.
     ///
-    /// Default: head
+    /// Default: default_branch
     pub diff_base: Option<GitDiffBaseSetting>,
     /// How file paths are displayed in the git gutter.
     ///
@@ -837,8 +837,10 @@ pub struct FileDiffSettingsContent {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum GitHunkStyleSetting {
-    /// Show unstaged hunks with a filled background and staged hunks hollow.
+    /// Show every hunk with a filled background, staged or not.
     #[default]
+    Filled,
+    /// Show unstaged hunks with a filled background and staged hunks hollow.
     StagedHollow,
     /// Show unstaged hunks hollow and staged hunks with a filled background.
     UnstagedHollow,
@@ -860,13 +862,13 @@ pub enum GitHunkStyleSetting {
 #[serde(rename_all = "snake_case")]
 pub enum GitDiffBaseSetting {
     /// Diff against HEAD: show working (uncommitted) changes.
-    #[default]
     Head,
     /// Diff against the merge base between HEAD and the repository's
     /// default branch: show all changes on the branch.
     ///
     /// Repositories where no default branch can be resolved fall back
     /// to `head` behavior.
+    #[default]
     DefaultBranch,
 }
 

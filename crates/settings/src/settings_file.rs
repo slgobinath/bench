@@ -143,6 +143,9 @@ pub fn test_settings() -> &'static str {
                 "buffer_font_size": 14,
                 "buffer_font_fallbacks": [],
                 "theme": EMPTY_THEME_NAME,
+                // Most git tests expect working changes against HEAD, which
+                // Bench no longer diffs against by default.
+                "git": { "diff_base": "head" },
             }),
             &mut value,
         );
@@ -159,6 +162,9 @@ pub fn test_settings() -> &'static str {
                 "buffer_font_size": 14,
                 "buffer_font_fallbacks": [],
                 "theme": EMPTY_THEME_NAME,
+                // Most git tests expect working changes against HEAD, which
+                // Bench no longer diffs against by default.
+                "git": { "diff_base": "head" },
             }),
             &mut value,
         );

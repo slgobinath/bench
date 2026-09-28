@@ -2636,7 +2636,7 @@ To interpret all `.c` files as C++, files called `MyLockFile` as TOML and files 
     "branch_picker": {
       "show_author_name": true
     },
-    "hunk_style": "staged_hollow"
+    "hunk_style": "filled"
   }
 }
 ```
@@ -2819,14 +2819,24 @@ Example:
 ```json [settings]
 {
   "git": {
-    "hunk_style": "staged_hollow"
+    "hunk_style": "filled"
   }
 }
 ```
 
 **Options**
 
-1. Show the staged hunks faded out and with a border:
+1. Show every hunk with a filled background:
+
+```json [settings]
+{
+  "git": {
+    "hunk_style": "filled"
+  }
+}
+```
+
+2. Show the staged hunks faded out and with a border:
 
 ```json [settings]
 {
@@ -2836,7 +2846,7 @@ Example:
 }
 ```
 
-2. Show unstaged hunks faded out and with a border:
+3. Show unstaged hunks faded out and with a border:
 
 ```json [settings]
 {
@@ -2855,7 +2865,7 @@ Example:
 ```json [settings]
 {
   "git": {
-    "diff_base": "head"
+    "diff_base": "default_branch"
   }
 }
 ```

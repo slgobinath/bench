@@ -20,6 +20,7 @@ use language::Capability;
 use multi_buffer::MultiBuffer;
 use project::{
     Project, ProjectPath,
+    project_settings::ProjectSettings,
     git_store::{
         Repository,
         diff_buffer_list::{self, DiffBase},
@@ -27,7 +28,7 @@ use project::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use settings::GitDiffBaseSetting;
+use settings::{GitDiffBaseSetting, Settings as _};
 use std::any::{Any, TypeId};
 use std::sync::Arc;
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
@@ -81,15 +82,17 @@ impl ProjectDiff {
             Self::deploy_at(workspace, None, window, cx);
         });
         workspace.register_action(|workspace, _: &ToggleDiffBase, _window, cx| {
+            // Flip the value in effect, which may come from project settings or
+            // the defaults rather than the user settings file being written.
+            let diff_base = match ProjectSettings::get_global(cx).git.diff_base {
+                GitDiffBaseSetting::Head => GitDiffBaseSetting::DefaultBranch,
+                GitDiffBaseSetting::DefaultBranch => GitDiffBaseSetting::Head,
+            };
             settings::update_settings_file(
                 workspace.app_state().fs.clone(),
                 cx,
                 move |settings, _| {
-                    let git = settings.git.get_or_insert_default();
-                    git.diff_base = Some(match git.diff_base.unwrap_or_default() {
-                        GitDiffBaseSetting::Head => GitDiffBaseSetting::DefaultBranch,
-                        GitDiffBaseSetting::DefaultBranch => GitDiffBaseSetting::Head,
-                    });
+                    settings.git.get_or_insert_default().diff_base = Some(diff_base);
                 },
             );
         });
@@ -1147,7 +1150,7 @@ mod tests {
         project.read_with(cx, |project, cx| {
             assert_eq!(
                 project.git_store().read(cx).diff_base(),
-                GitDiffBaseSetting::DefaultBranch
+                GitDiffBaseSetting::Head
             );
         });
 
@@ -1158,14 +1161,9 @@ mod tests {
         project.read_with(cx, |project, cx| {
             assert_eq!(
                 project.git_store().read(cx).diff_base(),
-                GitDiffBaseSetting::Head
+                GitDiffBaseSetting::DefaultBranch
             );
         });
-
-        cx.update(|window, cx| {
-            window.dispatch_action(ToggleDiffBase.boxed_clone(), cx);
-        });
-        cx.run_until_parked();
 
         cx.update(|window, cx| {
             window.dispatch_action(Diff.boxed_clone(), cx);

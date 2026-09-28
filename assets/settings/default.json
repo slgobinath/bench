@@ -1860,13 +1860,15 @@
     // How git hunks are displayed visually in the editor.
     // This setting can take two values:
     //
-    // 1. Show unstaged hunks filled and staged hunks hollow:
+    // 1. Show every hunk filled:
+    //    "hunk_style": "filled"
+    // 2. Show unstaged hunks filled and staged hunks hollow:
     //    "hunk_style": "staged_hollow"
-    // 2. Show unstaged hunks hollow and staged hunks filled:
+    // 3. Show unstaged hunks hollow and staged hunks filled:
     //    "hunk_style": "unstaged_hollow"
-    "hunk_style": "staged_hollow",
+    "hunk_style": "filled",
     // Whether git features diff against HEAD ("head") or the default branch ("default_branch").
-    "diff_base": "head",
+    "diff_base": "default_branch",
     // Should the name or path be displayed first in the git view.
     // "path_style": "file_name_first" or "file_path_first"
     "path_style": "file_name_first",

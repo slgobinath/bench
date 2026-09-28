@@ -6992,15 +6992,16 @@ impl EditorElement {
     }
 
     fn diff_hunk_hollow(&self, status: DiffHunkStatus, cx: &mut App) -> bool {
+        let unstaged_hollow = match ProjectSettings::get_global(cx).git.hunk_style {
+            GitHunkStyleSetting::Filled => return false,
+            GitHunkStyleSetting::StagedHollow => false,
+            GitHunkStyleSetting::UnstagedHollow => true,
+        };
         let unstaged = !self
             .editor
             .read(cx)
             .diff_hunk_renderer()
             .render_hunk_as_staged(&status, cx);
-        let unstaged_hollow = matches!(
-            ProjectSettings::get_global(cx).git.hunk_style,
-            GitHunkStyleSetting::UnstagedHollow
-        );
 
         unstaged == unstaged_hollow
     }

@@ -261,7 +261,7 @@ TBD: Centered layout related settings
       "padding": 7,                // Padding between code and inline blame (em)
       "show_commit_summary": false // Show/hide commit summary
     },
-    "hunk_style": "staged_hollow"  // staged_hollow, unstaged_hollow
+    "hunk_style": "filled"  // filled, staged_hollow, unstaged_hollow
   }
 ```
 
