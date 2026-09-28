@@ -37,7 +37,8 @@ use worktree_metadata::{
     HUE_NAMES, HUES, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
 };
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, Context, DismissEvent,
+    Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClipboardItem, Context,
+    DismissEvent,
     Entity,
     EventEmitter, FocusHandle, Focusable, Global, Task, Transformation, WeakEntity, Window,
     actions, percentage, prelude::*, svg,
@@ -312,7 +313,7 @@ pub struct WorktreePanel {
     /// bordered box: the panel's header is chrome, and a box with a border
     /// around it there competes with the rows for attention.
     filter: Arc<dyn ErasedEditor>,
-    /// The colour menu of a worktree row, while it is open.
+    /// The menu of a worktree row, while it is open.
     context_menu: Option<(Entity<ContextMenu>, gpui::Point<gpui::Pixels>, gpui::Subscription)>,
     _subscriptions: Vec<gpui::Subscription>,
 }
@@ -1440,11 +1441,14 @@ impl WorktreePanel {
         .detach_and_log_err(cx);
     }
 
-    /// The colour menu of a worktree: the colours a worktree can be, the one
-    /// it is ticked, and going back to the one worked out from its folder.
-    fn deploy_colour_menu(
+    /// The menu of a worktree row: opening its Linear issue when it has one,
+    /// copying its path, and its colour — the
+    /// colours a worktree can be, the one it is ticked, and going back to the
+    /// one worked out from its folder.
+    fn deploy_row_menu(
         &mut self,
         root: PathBuf,
+        issue: Option<SharedString>,
         position: gpui::Point<gpui::Pixels>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1453,50 +1457,64 @@ impl WorktreePanel {
         let metadata = store.read(cx).get(&root, cx);
         let current = metadata.hue_for(&root);
         let chosen = metadata.hue.is_some();
-        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
-            menu = menu.header("Colour");
-            for hue in 0..HUES {
-                let name = HUE_NAMES.get(usize::from(hue)).copied().unwrap_or_default();
+        let this = cx.weak_entity();
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let path = root.to_string_lossy().into_owned();
+            menu.when_some(issue.clone(), |menu, identifier| {
+                let this = this.clone();
+                menu.entry(format!("Open {identifier}"), None, move |window, cx| {
+                    this.update(cx, |this, cx| this.open_issue(identifier.clone(), window, cx))
+                        .ok();
+                })
+            })
+            .entry("Copy Path", None, move |_, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+            })
+            .separator()
+            .submenu("Colour", move |mut menu, _, _| {
+                for hue in 0..HUES {
+                    let name = HUE_NAMES.get(usize::from(hue)).copied().unwrap_or_default();
+                    let store = store.clone();
+                    let root = root.clone();
+                    menu = menu.custom_entry(
+                        move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(div().size_3().rounded_full().bg(hue_color(hue)))
+                                .child(Label::new(name))
+                                .when(hue == current, |this| {
+                                    this.child(
+                                        div().flex_1().flex().justify_end().child(
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        ),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                        move |_, cx| {
+                            store.update(cx, |store, cx| {
+                                store.update(&root, |metadata| metadata.hue = Some(hue), cx)
+                            });
+                        },
+                    );
+                }
                 let store = store.clone();
                 let root = root.clone();
-                menu = menu.custom_entry(
-                    move |_, _| {
-                        h_flex()
-                            .w_full()
-                            .gap_2()
-                            .child(div().size_3().rounded_full().bg(hue_color(hue)))
-                            .child(Label::new(name))
-                            .when(hue == current, |this| {
-                                this.child(
-                                    div().flex_1().flex().justify_end().child(
-                                        Icon::new(IconName::Check)
-                                            .size(IconSize::Small)
-                                            .color(Color::Accent),
-                                    ),
-                                )
-                            })
-                            .into_any_element()
-                    },
+                menu.separator().toggleable_entry(
+                    "Automatic",
+                    !chosen,
+                    IconPosition::Start,
+                    None,
                     move |_, cx| {
                         store.update(cx, |store, cx| {
-                            store.update(&root, |metadata| metadata.hue = Some(hue), cx)
+                            store.update(&root, |metadata| metadata.hue = None, cx)
                         });
                     },
-                );
-            }
-            let store = store.clone();
-            let root = root.clone();
-            menu.separator().toggleable_entry(
-                "Automatic",
-                !chosen,
-                IconPosition::Start,
-                None,
-                move |_, cx| {
-                    store.update(cx, |store, cx| {
-                        store.update(&root, |metadata| metadata.hue = None, cx)
-                    });
-                },
-            )
+                )
+            })
         });
         let focus = menu.focus_handle(cx);
         window.defer(cx, move |window, cx| window.focus(&focus, cx));
@@ -1708,17 +1726,7 @@ impl WorktreePanel {
                 // A worktree made for an issue is about the issue: where it
                 // stands says more than that it is a branch, which every row
                 // is. Drawn as Linear draws it, so the two panels agree.
-                Some(issue) => {
-                    let identifier = issue.identifier.clone();
-                    div()
-                        .id(("issue-state", index))
-                        .child(render_issue_state(issue))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.open_issue(identifier.clone(), window, cx);
-                        }))
-                        .into_any_element()
-                }
+                Some(issue) => render_issue_state(issue).into_any_element(),
                 None => Icon::new(IconName::GitBranch)
                     .size(IconSize::Small)
                     .color(if row.is_active {
@@ -1750,7 +1758,10 @@ impl WorktreePanel {
                             .min_w_0()
                             .gap_1p5()
                             .children(row.issue.as_ref().map(|issue| {
-                                self.render_issue_identifier(issue, index, cx)
+                                Label::new(issue.identifier.clone())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted)
+                                    .flex_none()
                             }))
                             .child(
                                 // Truncated: a worktree named after a long
@@ -1810,10 +1821,17 @@ impl WorktreePanel {
                 ),
             }))
             .when_some(row.root.clone(), |this, root| {
+                let issue = row.issue.as_ref().map(|issue| issue.identifier.clone());
                 this.on_secondary_mouse_down(cx.listener(
                     move |this, event: &gpui::MouseDownEvent, window, cx| {
                         cx.stop_propagation();
-                        this.deploy_colour_menu(root.clone(), event.position, window, cx);
+                        this.deploy_row_menu(
+                            root.clone(),
+                            issue.clone(),
+                            event.position,
+                            window,
+                            cx,
+                        );
                     },
                 ))
             })
@@ -1830,29 +1848,6 @@ impl WorktreePanel {
 }
 
 impl WorktreePanel {
-    /// The identifier of the Linear issue a worktree's branch is named after.
-    /// Clicking it opens the issue rather than the worktree.
-    fn render_issue_identifier(
-        &self,
-        issue: &Issue,
-        index: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let identifier = issue.identifier.clone();
-        div()
-            .id(("issue", index))
-            .flex_none()
-            .child(
-                Label::new(issue.identifier.clone())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                cx.stop_propagation();
-                this.open_issue(identifier.clone(), window, cx);
-            }))
-    }
-
     /// Opens an issue's tab in the worktree the window is showing. Deferred
     /// for the reason given on [`Self::activate`]: focusing the tab walks the
     /// docks, and a click handler holds this panel's lease.
@@ -1961,7 +1956,8 @@ fn render_agents(index: usize, agents: &AgentSummary) -> Option<impl IntoElement
         h_flex()
             .id(("agents", index))
             .gap_0p5()
-            .child(Indicator::dot().color(agent_state_color(state)))
+            // The count before the dot, so the dot is always last and sits
+            // at the same edge on every row, one agent or several.
             .when(total > 1, |this| {
                 this.child(
                     Label::new(total.to_string())
@@ -1969,6 +1965,7 @@ fn render_agents(index: usize, agents: &AgentSummary) -> Option<impl IntoElement
                         .color(Color::Muted),
                 )
             })
+            .child(Indicator::dot().color(agent_state_color(state)))
             .tooltip(Tooltip::text(format!(
                 "{total} agent{}: {summary}",
                 if total == 1 { "" } else { "s" }
@@ -4215,13 +4212,19 @@ mod tests {
         drop(workspaces);
     }
 
-    /// Right-clicking a worktree opens its colour menu, which draws.
+    /// Right-clicking a worktree opens its menu, which draws.
     #[gpui::test]
-    async fn the_colour_menu_opens(cx: &mut TestAppContext) {
+    async fn the_row_menu_opens(cx: &mut TestAppContext) {
         let (_fs, _multi_workspace, _fix, panel, mut cx) =
             worktree_with_a_nested_repository(cx).await;
         panel.update_in(&mut cx, |panel, window, cx| {
-            panel.deploy_colour_menu(PathBuf::from("/wt/fix"), gpui::point(px(10.), px(10.)), window, cx);
+            panel.deploy_row_menu(
+                PathBuf::from("/wt/fix"),
+                Some("RB-116".into()),
+                gpui::point(px(10.), px(10.)),
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         panel.read_with(&mut cx, |panel, _| assert!(panel.context_menu.is_some()));
