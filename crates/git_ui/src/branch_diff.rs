@@ -251,6 +251,22 @@ impl BranchDiff {
             return;
         }
 
+        // The git store keeps the default branch's file list loaded in the background,
+        // so reusing it lets the diff show up without waiting on `git diff` again.
+        let branch_diff = branch_diff.or_else(|| {
+            project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .display_diff_for_repo(intended_repo.read(cx).id)
+                .filter(|display_diff| {
+                    matches!(
+                        display_diff.read(cx).diff_base(),
+                        DiffBase::Merge { base_ref: display_base_ref } if display_base_ref == &base_ref
+                    )
+                })
+        });
+
         let workspace = cx.entity();
         let workspace_weak = workspace.downgrade();
         window
@@ -1329,5 +1345,99 @@ mod tests {
 
         assert_eq!(active_base_ref, "origin/main");
         assert_eq!(base_refs, vec!["origin/main", "topic"]);
+    }
+
+    #[gpui::test]
+    async fn test_deploy_at_file_reuses_display_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        project
+            .update(cx, |project, cx| project.git_scans_complete(cx))
+            .await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+
+        cx.update(|_window, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git.get_or_insert_default().diff_base =
+                        Some(GitDiffBaseSetting::DefaultBranch);
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        let (repository, display_diff) = project.read_with(cx, |project, cx| {
+            let repository = project.active_repository(cx).unwrap();
+            let display_diff = project
+                .git_store()
+                .read(cx)
+                .display_diff_for_repo(repository.read(cx).id)
+                .unwrap();
+            (repository, display_diff)
+        });
+        let base_ref = match display_diff.read_with(cx, |display_diff, _| {
+            display_diff.diff_base().clone()
+        }) {
+            DiffBase::Merge { base_ref } => base_ref,
+            DiffBase::Head | DiffBase::Index | DiffBase::Staged => {
+                panic!("expected the display diff to be a branch diff")
+            }
+        };
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            BranchDiff::deploy_branch_diff_at_file(
+                workspace,
+                project.clone(),
+                repository.clone(),
+                base_ref,
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let branch_diff = workspace.active_item_as::<BranchDiff>(cx).unwrap();
+            assert_eq!(
+                branch_diff.read(cx).diff.read(cx).branch_diff().entity_id(),
+                display_diff.entity_id()
+            );
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            BranchDiff::deploy_branch_diff_at_file(
+                workspace,
+                project.clone(),
+                repository,
+                "topic".into(),
+                None,
+                None,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        workspace.update(cx, |workspace, cx| {
+            let branch_diff = workspace.active_item_as::<BranchDiff>(cx).unwrap();
+            assert_ne!(
+                branch_diff.read(cx).diff.read(cx).branch_diff().entity_id(),
+                display_diff.entity_id()
+            );
+        });
     }
 }
