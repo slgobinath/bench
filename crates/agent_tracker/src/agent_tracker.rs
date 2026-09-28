@@ -94,9 +94,12 @@ const SWEEP: Duration = Duration::from_secs(1);
 /// that an agent has finished when it has not.
 const WORKING_FOR: Duration = Duration::from_secs(4);
 
-/// How long a hook's report outranks the heuristic. Past this, the session is
-/// assumed to have ended without saying so — a crash, a `kill`, hooks removed
-/// — and the PTY goes back to being the source of truth.
+/// How long a hook's report of work, or of a question, outranks the heuristic.
+/// Past this, the turn is assumed to have ended without saying so — an
+/// interrupt, a crash, hooks removed — and the PTY goes back to being the
+/// source of truth.
+///
+/// A report that the agent is idle does not run out: see [`is_trusted`].
 const REPORT_TRUSTED_FOR: Duration = Duration::from_secs(300);
 
 /// How large the hook events file may grow before it is truncated, and how
@@ -350,7 +353,7 @@ impl AgentTracker {
             let reported = directory
                 .as_deref()
                 .and_then(|directory| self.reports.for_directory(directory))
-                .filter(|report| now.duration_since(report.at) < REPORT_TRUSTED_FOR);
+                .filter(|report| is_trusted(report, now));
 
             let state = match reported {
                 Some(report) => report.state,
@@ -537,6 +540,18 @@ fn announcement(
 
 /// Posts the banner, unless the user is plainly already watching.
 ///
+/// Whether a hook's report still outranks the heuristic.
+///
+/// An idle report stays trusted for as long as it is kept. Nothing ends
+/// idleness but a prompt, and a prompt is a hook of its own; while the agent
+/// sits at its prompt the heuristic has nothing true to add, and plenty false —
+/// the prompt redraws as you type in it, and redrawing is what the heuristic
+/// calls work. A session that ended is no agent at all, which the foreground
+/// process says, whatever its last report was.
+fn is_trusted(report: &hooks::Report, now: Instant) -> bool {
+    report.state == AgentState::Idle || now.duration_since(report.at) < REPORT_TRUSTED_FOR
+}
+
 /// A notification for an agent that has stopped to ask is shown whatever the
 /// user is doing: it is blocking, and being in another Bench window is exactly
 /// when it is easy to miss. "Done" is not blocking, so it is held back while
@@ -557,6 +572,21 @@ fn announce(announcement: Announcement, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_report_outlasts_a_busy_one() {
+        let now = Instant::now();
+        let report = |state, age| hooks::Report {
+            cwd: PathBuf::from("/repo"),
+            state,
+            at: now.checked_sub(age).unwrap_or(now),
+        };
+        let long_ago = REPORT_TRUSTED_FOR + Duration::from_secs(60);
+        assert!(is_trusted(&report(AgentState::Working, Duration::ZERO), now));
+        assert!(!is_trusted(&report(AgentState::Working, long_ago), now));
+        assert!(!is_trusted(&report(AgentState::NeedsInput, long_ago), now));
+        assert!(is_trusted(&report(AgentState::Idle, long_ago), now));
+    }
 
     #[test]
     fn a_summary_shows_whatever_wants_you_most() {

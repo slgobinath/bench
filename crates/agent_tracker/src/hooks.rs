@@ -193,10 +193,13 @@ impl HookReports {
         self.sessions.is_empty()
     }
 
-    /// Drops reports too old to mean anything.
+    /// Drops reports too old to mean anything. An idle report is kept however
+    /// old it is, because it is the one report that stays true until the next;
+    /// there is one per session, so they do not add up to much.
     pub fn prune(&mut self, now: Instant, keep: std::time::Duration) {
-        self.sessions
-            .retain(|_, report| now.duration_since(report.at) < keep);
+        self.sessions.retain(|_, report| {
+            report.state == AgentState::Idle || now.duration_since(report.at) < keep
+        });
     }
 }
 
