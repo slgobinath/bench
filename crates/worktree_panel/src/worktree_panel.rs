@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use git::repository::{CreateWorktreeTarget, Worktree as GitWorktree};
-use agent_tracker::{AgentState, AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
+use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
 use linear::{Issue, Linear, LinearEvent};
@@ -41,7 +41,7 @@ use gpui::{
     DismissEvent,
     Entity,
     EventEmitter, FocusHandle, Focusable, Global, Task, Transformation, WeakEntity, Window,
-    actions, percentage, prelude::*, pulsating_between, svg,
+    actions, percentage, prelude::*, svg,
 };
 use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
@@ -2298,7 +2298,7 @@ const ROW_HEIGHT: Rems = Rems(2.25);
 const CHEVRON_TURN: Duration = Duration::from_millis(120);
 
 /// Whether an agent is at work in the worktree, and what it is doing: Claude's
-/// mark, in the colour of whatever wants you most, breathing while it works.
+/// mark, in the colour of whatever wants you most.
 /// How many agents there are is left to the tooltip; the card only needs to
 /// say that one is there and whether it is waiting on you.
 fn render_agents(index: usize, agents: &AgentSummary) -> Option<AnyElement> {
@@ -2312,35 +2312,24 @@ fn render_agents(index: usize, agents: &AgentSummary) -> Option<AnyElement> {
         format!("{total} idle")
     };
 
-    let mark = div()
-        .id(("agents", index))
-        .flex_none()
-        .child(
-            Icon::new(IconName::AiClaude)
-                .size(IconSize::Small)
-                .color(agent_state_color(state)),
-        )
-        .tooltip(Tooltip::text(format!(
-            "{total} agent{}: {summary}",
-            if total == 1 { "" } else { "s" }
-        )));
-    Some(match state {
-        AgentState::Working => mark
-            .with_animation(
-                ("agents-working", index),
-                Animation::new(AGENT_BREATH)
-                    .repeat()
-                    .with_easing(pulsating_between(0.35, 1.)),
-                |mark, delta| mark.opacity(delta),
+    // Not animated: a repeating animation requests a frame on every refresh,
+    // which redraws the whole window for as long as an agent is working.
+    Some(
+        div()
+            .id(("agents", index))
+            .flex_none()
+            .child(
+                Icon::new(IconName::AiClaude)
+                    .size(IconSize::Small)
+                    .color(agent_state_color(state)),
             )
+            .tooltip(Tooltip::text(format!(
+                "{total} agent{}: {summary}",
+                if total == 1 { "" } else { "s" }
+            )))
             .into_any_element(),
-        AgentState::Idle | AgentState::NeedsInput => mark.into_any_element(),
-    })
+    )
 }
-
-/// How long one breath of a working agent's mark takes. Slow, because it runs
-/// for as long as the agent does, at the edge of your eye.
-const AGENT_BREATH: Duration = Duration::from_secs(2);
 
 /// A worktree's Linear issue: where it stands, as Linear draws it, and its
 /// identifier. Plain, with no box around it, because the title above is what
