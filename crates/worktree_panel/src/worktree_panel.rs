@@ -564,9 +564,13 @@ impl WorktreePanel {
             .iter()
             .map(|(worktree, _)| worktree.clone())
             .collect();
-        let mut anchor = linked
-            .first()
-            .and_then(|(_, repository)| repository_anchor(repository, cx));
+        // From the open workspaces' repository rather than from `linked`: a
+        // repository with no linked worktrees lists none, and its checkout is
+        // still the project's own.
+        let mut anchor = open_worktrees
+            .iter()
+            .find_map(|open| workspace_repository(open, cx))
+            .and_then(|repository| repository_anchor(&repository, cx));
 
         if open_worktrees.is_empty() {
             let root = project_root(key);
@@ -1216,7 +1220,7 @@ impl WorktreePanel {
             let host = from.clone();
             host.update(cx, |host, cx| {
                 host.toggle_modal(window, cx, move |window, cx| {
-                    NameWorktree::new(directory, issue, window, cx, move |name, issue, window, cx| {
+                    NameWorktree::new(directory, issue, window, cx, move |name, description, issue, window, cx| {
                         let from = from.clone();
                         let repository = repository.clone();
                         let key = key.clone();
@@ -1227,6 +1231,7 @@ impl WorktreePanel {
                                     repository,
                                     key,
                                     name,
+                                    description,
                                     issue,
                                     start_agent,
                                     window,
@@ -1369,6 +1374,10 @@ impl WorktreePanel {
     /// answer — two worktrees cannot share one branch — so it is shown rather
     /// than worked around.
     ///
+    /// A `description` is what the user typed when it was not a branch name;
+    /// see [`name_from_description`]. It is the worktree's title, ahead of its
+    /// issue's, being the one the user wrote for this worktree.
+    ///
     /// `git worktree add` creates the directories on the way to the worktree,
     /// so the project's directory under `~/bench` need not exist yet.
     ///
@@ -1381,6 +1390,7 @@ impl WorktreePanel {
         repository: Entity<Repository>,
         key: ProjectGroupKey,
         name: SharedString,
+        description: Option<SharedString>,
         issue: Option<Arc<Issue>>,
         start_agent: bool,
         window: &mut Window,
@@ -1405,7 +1415,9 @@ impl WorktreePanel {
             id: issue.id.to_string(),
             identifier: issue.identifier.to_string(),
         });
-        let title = issue.as_ref().map(|issue| issue.title.to_string());
+        let title = description
+            .map(|description| description.to_string())
+            .or_else(|| issue.as_ref().map(|issue| issue.title.to_string()));
         cx.spawn_in(window, async move |this, cx| {
             let created = repository
                 .update(cx, |repository, _| {
@@ -1845,6 +1857,18 @@ impl WorktreePanel {
         let add_key = row.key.clone();
 
         let remove_key = row.key.clone();
+        // The icon is kept with the repository's own checkout, which is the
+        // one worktree every project has for as long as it is a project.
+        let main_root = row
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .and_then(|worktree| worktree.root.clone());
+        let stored_icon = main_root.as_deref().and_then(|root| {
+            WorktreeMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).get(root, cx).icon)
+        });
+        let icon = project_icon(stored_icon.as_deref());
 
         ListItem::new(("repository", index))
             .spacing(ListItemSpacing::Sparse)
@@ -1853,10 +1877,11 @@ impl WorktreePanel {
                 h_flex()
                     .gap_1()
                     .child(render_chevron(index, collapsed, turning, cx))
-                    // A project is a directory; a worktree is a branch. The
-                    // rows are told apart by their icons before they are read.
+                    // A project is a directory, or whatever the user said it
+                    // is; a worktree is a branch. The rows are told apart by
+                    // their icons before they are read.
                     .child(
-                        Icon::new(IconName::Folder)
+                        Icon::new(icon)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     ),
@@ -1906,7 +1931,79 @@ impl WorktreePanel {
                             })),
                     ),
             )
+            .when_some(main_root, |this, root| {
+                this.on_secondary_mouse_down(cx.listener(
+                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.deploy_project_menu(root.clone(), icon, event.position, window, cx);
+                    },
+                ))
+            })
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(&key, cx)))
+    }
+
+    /// The menu of a project row: the icons a project can be drawn with, the
+    /// one it has ticked.
+    fn deploy_project_menu(
+        &mut self,
+        root: PathBuf,
+        current: IconName,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = WorktreeMetadataStore::global(cx);
+        let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            menu.submenu("Icon", move |mut menu, _, _| {
+                for (icon, label) in PROJECT_ICONS {
+                    let store = store.clone();
+                    let root = root.clone();
+                    menu = menu.custom_entry(
+                        move |_, _| {
+                            h_flex()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    Icon::new(icon)
+                                        .size(IconSize::Small)
+                                        .color(Color::Muted),
+                                )
+                                .child(Label::new(label))
+                                .when(icon == current, |this| {
+                                    this.child(
+                                        div().flex_1().flex().justify_end().child(
+                                            Icon::new(IconName::Check)
+                                                .size(IconSize::Small)
+                                                .color(Color::Accent),
+                                        ),
+                                    )
+                                })
+                                .into_any_element()
+                        },
+                        move |_, cx| {
+                            // The folder is what a project is drawn with when
+                            // nothing is stored, so choosing it stores nothing.
+                            let stored = (icon != IconName::Folder).then(|| {
+                                let name: &'static str = icon.into();
+                                name.to_string()
+                            });
+                            store.update(cx, |store, cx| {
+                                store.update(&root, |metadata| metadata.icon = stored, cx)
+                            });
+                        },
+                    );
+                }
+                menu
+            })
+        });
+        let focus = menu.focus_handle(cx);
+        window.defer(cx, move |window, cx| window.focus(&focus, cx));
+        let subscription = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, _, cx| {
+            this.context_menu.take();
+            cx.notify();
+        });
+        self.context_menu = Some((menu, position, subscription));
+        cx.notify();
     }
 
     /// A worktree as a card: what it is for above, which worktree it is below.
@@ -1961,10 +2058,17 @@ impl WorktreePanel {
             // Without a title the name leads, and the line under it names the
             // branch — which says something only when it is not the name
             // again: the repository's own checkout switched to a feature
-            // branch, or a worktree whose branch was renamed.
+            // branch, or a worktree whose branch was renamed. When the branch
+            // doesn't diverge there is nothing else to say there, so it shows
+            // the worktree's filesystem path instead of sitting empty.
             None => {
                 let branch = row.branch.clone().filter(|branch| *branch != name);
-                (name, branch)
+                let subheading = branch.or_else(|| {
+                    row.root
+                        .as_deref()
+                        .map(|root| SharedString::from(root.display().to_string()))
+                });
+                (name, subheading)
             }
         };
         let text_color = if is_open {
@@ -2297,6 +2401,48 @@ const ROW_HEIGHT: Rems = Rems(2.25);
 /// like a direct response to the click, long enough to be seen.
 const CHEVRON_TURN: Duration = Duration::from_millis(120);
 
+/// The icons a project can be drawn with, by what each one says it is. A few
+/// that read as kinds of project rather than the whole icon set, most of which
+/// are actions and would make a project look like a button.
+const PROJECT_ICONS: [(IconName, &str); 28] = [
+    (IconName::Folder, "Folder"),
+    (IconName::Code, "Code"),
+    (IconName::Terminal, "Terminal"),
+    (IconName::Server, "Server"),
+    (IconName::DatabaseZap, "Database"),
+    (IconName::Public, "Web"),
+    (IconName::Screen, "App"),
+    (IconName::Smartphone, "Mobile"),
+    (IconName::Box, "Package"),
+    (IconName::Blocks, "Library"),
+    (IconName::Workflow, "Flow"),
+    (IconName::Book, "Docs"),
+    (IconName::ToolHammer, "Tools"),
+    (IconName::Settings, "Config"),
+    (IconName::ChartBar, "Data"),
+    (IconName::Sparkle, "AI"),
+    (IconName::House, "Home"),
+    (IconName::Building, "Business"),
+    (IconName::Banknote, "Money"),
+    (IconName::Wallet, "Wallet"),
+    (IconName::Receipt, "Invoice"),
+    (IconName::ShoppingCart, "Shop"),
+    (IconName::Calendar, "Calendar"),
+    (IconName::GraduationCap, "Learning"),
+    (IconName::Heart, "Heart"),
+    (IconName::Rocket, "Rocket"),
+    (IconName::Flame, "Flame"),
+    (IconName::Star, "Star"),
+];
+
+/// The icon stored for a project, or the folder when none is, or when the one
+/// stored is not an icon Bench has.
+fn project_icon(stored: Option<&str>) -> IconName {
+    stored
+        .and_then(|name| name.parse::<IconName>().ok())
+        .unwrap_or(IconName::Folder)
+}
+
 /// Whether an agent is at work in the worktree, and what it is doing: Claude's
 /// mark, in the colour of whatever wants you most.
 /// How many agents there are is left to the tooltip; the card only needs to
@@ -2582,6 +2728,9 @@ fn plan_rows(
 /// in and the branch that is created with it. Where it goes is shown rather
 /// than asked; see [`worktrees_directory`].
 ///
+/// A description can be typed in place of a name. It becomes the worktree's
+/// title, and the name is made from it; see [`name_from_description`].
+///
 /// With Linear connected, an issue can be linked first, and linking one names
 /// the worktree after the branch Linear suggests for it. The name stays
 /// editable — the issue is linked through the branch name, so a name that no
@@ -2595,7 +2744,8 @@ struct NameWorktree {
     /// Absent when Linear is not connected, and the modal is just the name.
     issue_search: Option<IssueSearch>,
     linked: Option<Arc<Issue>>,
-    confirm: Box<dyn Fn(SharedString, Option<Arc<Issue>>, &mut Window, &mut App)>,
+    confirm:
+        Box<dyn Fn(SharedString, Option<SharedString>, Option<Arc<Issue>>, &mut Window, &mut App)>,
 }
 
 struct IssueSearch {
@@ -2622,7 +2772,8 @@ impl NameWorktree {
         issue: Option<Arc<Issue>>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        confirm: impl Fn(SharedString, Option<Arc<Issue>>, &mut Window, &mut App) + 'static,
+        confirm: impl Fn(SharedString, Option<SharedString>, Option<Arc<Issue>>, &mut Window, &mut App)
+        + 'static,
     ) -> Self {
         let name = cx.new(|cx| InputField::new(window, cx, "Worktree name"));
         if let Some(issue) = &issue {
@@ -2765,12 +2916,17 @@ impl NameWorktree {
             return;
         }
 
-        let name = self.name.read(cx).text(cx).trim().to_owned();
+        let typed = self.name.read(cx).text(cx).trim().to_owned();
+        let (name, description) = if is_branch_name(&typed) {
+            (typed, None)
+        } else {
+            (name_from_description(&typed), Some(typed.into()))
+        };
         // Nothing to do with a name git would refuse but wait for a better one.
         if !is_branch_name(&name) {
             return;
         }
-        (self.confirm)(name.into(), self.linked.clone(), window, cx);
+        (self.confirm)(name.into(), description, self.linked.clone(), window, cx);
         cx.emit(DismissEvent);
     }
 
@@ -3193,20 +3349,54 @@ fn worktree_directory_name(name: &str) -> String {
     name.replace('/', "-")
 }
 
-/// Whether git will take this as a branch name.
+/// Whether git will take this as a branch name, by the rules of
+/// `git check-ref-format --branch`.
 ///
-/// Only the parts that decide whether to ask at all: a name git is certain to
-/// refuse is one the panel should keep waiting on rather than send, since the
-/// answer is an error notification either way. `/` is allowed — it is what
-/// makes `feature/foo` one name — but not at either end, and not doubled,
-/// which are the forms git rejects. Everything subtler than that is git's to
-/// judge, and its refusal is shown.
+/// All of them, because what is not a branch name is taken as a description
+/// and a name is made from it; see [`name_from_description`]. `/` is allowed —
+/// it is what makes `feature/foo` one name — but not at either end, and not
+/// doubled, which are the forms git rejects.
 fn is_branch_name(name: &str) -> bool {
     !name.is_empty()
-        && !name.contains('\\')
-        && !name.starts_with('/')
-        && !name.ends_with('/')
-        && !name.contains("//")
+        && name != "@"
+        && !name.starts_with('-')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.chars().any(|character| {
+            character.is_ascii_control()
+                || matches!(character, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
+        && name.split('/').all(|component| {
+            !component.is_empty() && !component.starts_with('.') && !component.ends_with(".lock")
+        })
+}
+
+/// How long a name made from a description may be. A description can be a
+/// sentence, and the name is also a directory, which a filesystem limits.
+const DESCRIBED_NAME_LENGTH: usize = 60;
+
+/// The name of a worktree that was described rather than named: the
+/// description's words, in lowercase, joined by hyphens.
+///
+/// Empty when the description has no letters or digits to make a name of.
+fn name_from_description(description: &str) -> String {
+    let mut name = String::new();
+    let words = description
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty());
+    for word in words {
+        let word = word.to_lowercase();
+        let length = name.chars().count() + word.chars().count() + 1;
+        if !name.is_empty() && length > DESCRIBED_NAME_LENGTH {
+            break;
+        }
+        if !name.is_empty() {
+            name.push('-');
+        }
+        name.extend(word.chars().take(DESCRIBED_NAME_LENGTH));
+    }
+    name
 }
 
 /// Where Bench keeps one project's worktrees: `~/bench/<project>`.
@@ -3668,7 +3858,19 @@ async fn worktree_status(fs: Arc<dyn Fs>, root: PathBuf) -> WorktreeStatus {
     .unwrap_or_default();
     let parsed = parse_status(&output);
 
-    let mut last_edit = committed;
+    // A new worktree's HEAD is the commit it branched from, which can be
+    // days old. The `.git` file git writes into a linked worktree when it is
+    // made dates the worktree itself. Not the main checkout's `.git`
+    // directory, whose time moves with whatever git last did there.
+    let created = fs
+        .metadata(&root.join(".git"))
+        .await
+        .ok()
+        .flatten()
+        .filter(|metadata| !metadata.is_dir)
+        .map(|metadata| metadata.mtime.timestamp_for_user());
+
+    let mut last_edit = committed.max(created);
     for path in &parsed.paths {
         // A deleted file has no time of its own, and is not what anyone
         // means by the last edit.
@@ -4091,6 +4293,9 @@ impl Render for WorktreePanel {
                     return div().into_any_element();
                 }
                 v_flex()
+                    // Worktree cards are spaced like project rows, so without
+                    // a gap the next project reads as one more worktree.
+                    .when(index > 0, |this| this.mt_3())
                     .child(self.render_repository(row, index, cx))
                     .children(worktrees)
                     .into_any_element()
@@ -4876,6 +5081,7 @@ mod tests {
                 repository,
                 key.clone(),
                 "dev/rb-116-legal-entities".into(),
+                None,
                 Some(an_issue("RB-116")),
                 false,
                 window,
@@ -4941,6 +5147,16 @@ mod tests {
         });
         cx.run_until_parked();
         panel.read_with(&mut cx, |panel, _| assert!(panel.context_menu.is_some()));
+    }
+
+    #[test]
+    fn a_project_icon_survives_being_stored_by_name() {
+        for (icon, _) in PROJECT_ICONS {
+            let name: &'static str = icon.into();
+            assert_eq!(project_icon(Some(name)), icon);
+        }
+        assert_eq!(project_icon(None), IconName::Folder);
+        assert_eq!(project_icon(Some("no_such_icon")), IconName::Folder);
     }
 
     #[test]
@@ -5277,6 +5493,33 @@ mod tests {
                 vec!["main".to_owned(), "outer-fix".to_owned()]
             )]
         );
+    }
+
+    /// A repository with no linked worktrees has a checkout of its own all
+    /// the same, which is where the project's icon is kept.
+    #[gpui::test]
+    async fn a_repository_without_linked_worktrees_has_its_own_checkout(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/solo", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+
+        let project = Project::test(fs.clone(), ["/solo".as_ref()], &mut cx).await;
+        multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+
+        let rows = panels[0].read_with(&mut cx, |panel, cx| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .flat_map(|row| row.worktrees)
+                .map(|worktree| (worktree.root, worktree.is_main))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(rows, vec![(Some(PathBuf::from("/solo")), true)]);
     }
 
     /// The title is stored as typed, trimmed, and an empty one stays empty.
@@ -5708,8 +5951,8 @@ mod tests {
         );
     }
 
-    /// Only the names git is certain to refuse are refused here; the rest is
-    /// git's to judge, and the panel shows what it says.
+    /// What git refuses as a branch name is refused here, so that it is taken
+    /// as a description instead of being sent.
     #[test]
     fn a_name_git_would_refuse_is_not_sent() {
         assert!(is_branch_name("fix-login"));
@@ -5727,6 +5970,42 @@ mod tests {
             !is_branch_name("feature\\foo"),
             "a backslash is not a separator"
         );
+        assert!(
+            !is_branch_name("MCP tools for reconciliation"),
+            "nor a space"
+        );
+        assert!(!is_branch_name("-fix"), "it would be read as an option");
+        assert!(!is_branch_name("fix..login"));
+        assert!(!is_branch_name("fix.lock"));
+        assert!(!is_branch_name(".fix"));
+        assert!(!is_branch_name("fix."));
+        assert!(!is_branch_name("fix@{1}"));
+        assert!(!is_branch_name("@"));
+    }
+
+    /// A description is not a branch name, but one is made from it.
+    #[test]
+    fn a_description_becomes_a_name_git_takes() {
+        assert_eq!(
+            name_from_description("MCP tools for reconciliation"),
+            "mcp-tools-for-reconciliation"
+        );
+        assert_eq!(
+            name_from_description("  Fix: the login/logout flow?  "),
+            "fix-the-login-logout-flow"
+        );
+        assert_eq!(
+            name_from_description("?? ~~"),
+            "",
+            "nothing to name it after"
+        );
+
+        let long = name_from_description(&"reconcile the ledger ".repeat(20));
+        assert!(long.chars().count() <= DESCRIBED_NAME_LENGTH);
+        assert!(is_branch_name(&long), "cut between words: {long}");
+
+        let one_word = name_from_description(&"a".repeat(200));
+        assert_eq!(one_word.chars().count(), DESCRIBED_NAME_LENGTH);
     }
 
     /// A project git says nothing about — one that is not a repository, or one

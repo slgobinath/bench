@@ -907,9 +907,9 @@ pub enum GoToDefinitionFallback {
 #[serde(rename_all = "snake_case")]
 pub enum OpenResultsIn {
     /// Open the results in a multibuffer.
-    #[default]
     MultiBuffer,
     /// Open the results in a filterable picker.
+    #[default]
     Picker,
 }
 

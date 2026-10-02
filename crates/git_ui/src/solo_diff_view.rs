@@ -550,6 +550,29 @@ impl Item for SoloDiffView {
         self.editor.read(cx).active_project_path(cx)
     }
 
+    // Not `ItemBufferKind::Singleton`: the pane dedupes singleton tabs by
+    // project entry id, which would collapse separate diff tabs opened
+    // against different bases (e.g. HEAD and a branch) for the same file
+    // into one. "Send to Agent" is added directly below instead, since the
+    // tab context menu only offers it to items it resolves as singletons.
+    fn tab_extra_context_menu_actions(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<(SharedString, Box<dyn gpui::Action>)> {
+        let Some(abs_path) =
+            project::bookmark_store::BookmarkStore::abs_path_from_buffer(&self.buffer, cx)
+        else {
+            return Vec::new();
+        };
+        vec![(
+            "Send to Agent".into(),
+            Box::new(zed_actions::claude::SendFile {
+                path: abs_path.to_string_lossy().into_owned(),
+            }),
+        )]
+    }
+
     fn set_nav_history(
         &mut self,
         nav_history: ItemNavHistory,

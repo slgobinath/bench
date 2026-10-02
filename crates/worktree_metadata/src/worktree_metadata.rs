@@ -76,6 +76,12 @@ pub struct WorktreeMetadata {
     /// one in".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The icon the worktree panel draws its project with, by icon name. Only
+    /// read off a repository's own checkout. A name rather than the icon
+    /// itself so that this crate need not know the icon set, and a name the
+    /// set no longer has falls back to the folder instead of failing the read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// The Linear issue a worktree was made for.
