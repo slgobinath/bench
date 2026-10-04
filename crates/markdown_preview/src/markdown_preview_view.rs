@@ -19,13 +19,13 @@ use gpui::{
     RetainAllImageCache, ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity,
     Window, point, px,
 };
-use language::{Buffer, LanguageRegistry};
+use language::{Bias, Buffer, LanguageRegistry};
 use markdown::{
     CodeBlockRenderer, CopyButtonVisibility, Markdown, MarkdownElement, MarkdownFont,
     MarkdownOptions, MarkdownStyle,
 };
 use project::search::SearchQuery;
-use project::{Project, ProjectPath, image_store};
+use project::{DisableAiSettings, Project, ProjectPath, image_store};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
@@ -46,7 +46,10 @@ use workspace::searchable::{
     Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
 };
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, delete_unloaded_items};
-use zed_actions::{DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize};
+use zed_actions::{
+    DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
+    claude::{SendLines, SendSelection},
+};
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
 use crate::{
@@ -1003,6 +1006,39 @@ impl MarkdownPreviewView {
         cx.notify();
     }
 
+    /// The source lines the selection covers, as the action that sends them
+    /// to the agent. The preview's source is the file's text, so a selection
+    /// in the rendered page is a range of the file's lines.
+    fn selected_lines(&self, cx: &App) -> Option<SendLines> {
+        let range = self.markdown.read(cx).selected_source_range()?;
+        let buffer = self
+            .active_editor
+            .as_ref()?
+            .editor
+            .read(cx)
+            .buffer()
+            .read(cx)
+            .as_singleton()?;
+        if DisableAiSettings::is_ai_disabled_for_buffer(Some(&buffer), cx) {
+            return None;
+        }
+        let buffer = buffer.read(cx);
+        let path = buffer.file()?.as_local()?.abs_path(cx);
+        let (start_line, end_line) = lines_for_source_range(&buffer.snapshot(), range);
+        Some(SendLines {
+            path: path.to_string_lossy().into_owned(),
+            start_line,
+            end_line,
+        })
+    }
+
+    fn send_selection(&mut self, _: &SendSelection, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected_lines(cx) {
+            Some(lines) => window.dispatch_action(Box::new(lines), cx),
+            None => cx.propagate(),
+        }
+    }
+
     fn close_and_return_to_editor(
         &mut self,
         _: &CloseAndReturnToEditor,
@@ -1751,6 +1787,21 @@ impl Item for MarkdownPreviewView {
     }
 }
 
+/// The one-based lines of `snapshot` that a range of the preview's source
+/// covers.
+fn lines_for_source_range(snapshot: &language::BufferSnapshot, range: Range<usize>) -> (u32, u32) {
+    // The preview's copy of the source can trail an edit by a moment.
+    let start = snapshot.offset_to_point(snapshot.clip_offset(range.start, Bias::Left));
+    let end = snapshot.offset_to_point(snapshot.clip_offset(range.end, Bias::Left));
+    // A selection that runs up to the start of a line does not take it.
+    let end_row = if end.row > start.row && end.column == 0 {
+        end.row - 1
+    } else {
+        end.row
+    };
+    (start.row + 1, end_row + 1)
+}
+
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview_theme = self.resolve_preview_theme(cx);
@@ -1779,6 +1830,7 @@ impl Render for MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_top))
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_bottom))
             .on_action(cx.listener(MarkdownPreviewView::close_and_return_to_editor))
+            .on_action(cx.listener(MarkdownPreviewView::send_selection))
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
@@ -1800,6 +1852,7 @@ impl Render for MarkdownPreviewView {
                             let markdown_element =
                                 self.render_markdown_element(&preview_theme, window, cx);
                             let markdown = self.markdown.clone();
+                            let view = cx.weak_entity();
                             let max_width = MarkdownPreviewSettings::get_global(cx).max_width;
                             let content = right_click_menu("markdown-preview-context-menu")
                                 .trigger(move |_, _, _| markdown_element)
@@ -1811,14 +1864,31 @@ impl Render for MarkdownPreviewView {
                                         markdown.context_menu_selected_text().cloned();
                                     let selected_markdown =
                                         markdown.context_menu_selected_markdown().cloned();
+                                    let send_lines = view
+                                        .upgrade()
+                                        .and_then(|view| view.read(cx).selected_lines(cx));
                                     if context_menu_link.is_none()
                                         && selected_text.is_none()
                                         && selected_markdown.is_none()
+                                        && send_lines.is_none()
                                     {
                                         return None;
                                     }
                                     Some(ContextMenu::build(window, cx, move |menu, _, _cx| {
                                         menu.when_some(focus, |menu, focus| menu.context(focus))
+                                            .when_some(send_lines, |menu, lines| {
+                                                menu.entry(
+                                                    "Send to Agent",
+                                                    Some(Box::new(SendSelection)),
+                                                    move |window, cx| {
+                                                        window.dispatch_action(
+                                                            Box::new(lines.clone()),
+                                                            cx,
+                                                        );
+                                                    },
+                                                )
+                                                .separator()
+                                            })
                                             .when_some(selected_text, |menu, text| {
                                                 menu.entry(
                                                     "Copy",
@@ -3150,6 +3220,27 @@ mod tests {
         assert_eq!(
             editor.read_with(cx, |editor, cx| editor.buffer().read(cx).read(cx).text()),
             "- [x] Finish work\n"
+        );
+    }
+
+    #[gpui::test]
+    fn a_selection_maps_to_the_source_lines_it_covers(cx: &mut TestAppContext) {
+        use crate::markdown_preview_view::lines_for_source_range;
+        let buffer = cx.new(|cx| Buffer::local("# Plan\n\nStep one\nStep two\n\nDone\n", cx));
+        let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
+        let step_one = "# Plan\n\n".len();
+        let step_two_end = "# Plan\n\nStep one\nStep two".len();
+        assert_eq!(lines_for_source_range(&snapshot, step_one..step_two_end), (3, 4));
+        assert_eq!(
+            lines_for_source_range(&snapshot, step_one..step_two_end + 1),
+            (3, 4),
+            "running up to the next line does not take it"
+        );
+        assert_eq!(lines_for_source_range(&snapshot, 2..4), (1, 1));
+        assert_eq!(
+            lines_for_source_range(&snapshot, step_one..10_000),
+            (3, 6),
+            "a source that trails the buffer is clipped to it"
         );
     }
 

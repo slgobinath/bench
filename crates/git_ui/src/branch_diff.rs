@@ -52,7 +52,7 @@ use zed_actions::agent::ReviewBranchDiff;
 pub struct BranchDiff {
     diff: Entity<DiffMultibuffer>,
     project: Entity<Project>,
-    workspace: WeakEntity<Workspace>,
+    pub(crate) workspace: WeakEntity<Workspace>,
     _diff_event_subscription: Subscription,
 }
 

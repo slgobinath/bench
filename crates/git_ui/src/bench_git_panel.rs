@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_settings::{AgentSettings, UserAgentsMd};
 use anyhow::{Result, anyhow};
@@ -329,6 +329,20 @@ enum PullRequests {
     Unavailable(SharedString),
 }
 
+/// One branch's pull requests, as last asked of `gh`.
+struct PullRequestScan {
+    found: PullRequests,
+    /// When `found` was asked for; `None` once it should be asked again.
+    checked: Option<Instant>,
+    /// A refresh in flight. What was already found stays on screen until it
+    /// lands, so the list does not blink back to "Loading…".
+    _refresh: Option<Task<()>>,
+}
+
+/// How long a branch's pull requests are trusted before they are asked for
+/// again, so that one merged while Bench is open stops saying "Open".
+const PULL_REQUEST_REFRESH: Duration = Duration::from_secs(60);
+
 /// A repository's branch compared with its base; see [`ChangesMode::Branch`].
 enum BranchChanges {
     Loading,
@@ -448,8 +462,7 @@ pub struct BenchGitPanel {
     branch_changes: HashMap<EntityId, BranchChanges>,
     _branch_tasks: HashMap<EntityId, Task<()>>,
     /// By work directory and branch, so a branch switch asks again.
-    pull_requests: HashMap<(PathBuf, Option<String>), PullRequests>,
-    _pull_request_tasks: Vec<Task<()>>,
+    pull_requests: HashMap<(PathBuf, Option<String>), PullRequestScan>,
     /// What a remote operation or commit is doing, while it is; the buttons
     /// wait for it.
     busy: Option<&'static str>,
@@ -512,7 +525,6 @@ impl BenchGitPanel {
             branch_changes: HashMap::new(),
             _branch_tasks: HashMap::new(),
             pull_requests: HashMap::new(),
-            _pull_request_tasks: Vec::new(),
             busy: None,
             _busy_task: None,
             context_menu: None,
@@ -1318,30 +1330,53 @@ impl BenchGitPanel {
                 .as_ref()
                 .map(|branch| branch.name().to_owned());
             let key = (root.clone(), branch.clone());
-            if self.pull_requests.contains_key(&key) {
-                continue;
+            if let Some(scan) = self.pull_requests.get(&key) {
+                let fresh = scan
+                    .checked
+                    .is_some_and(|checked| checked.elapsed() < PULL_REQUEST_REFRESH);
+                if scan._refresh.is_some() || fresh {
+                    continue;
+                }
             }
-            self.pull_requests.insert(key.clone(), PullRequests::Loading);
-            let task = cx.spawn(async move |this, cx| {
-                let found = cx
-                    .background_spawn(async move {
-                        github_cli::pull_requests(&root, branch.as_deref(), github_cli::DEFAULT_LIMIT)
-                            .await
+            let task = cx.spawn({
+                let key = key.clone();
+                async move |this, cx| {
+                    let found = cx
+                        .background_spawn(async move {
+                            github_cli::pull_requests(&root, branch.as_deref(), github_cli::DEFAULT_LIMIT)
+                                .await
+                        })
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.pull_requests.insert(
+                            key,
+                            PullRequestScan {
+                                found: match found {
+                                    Ok(found) => PullRequests::Loaded(found),
+                                    Err(unavailable) => PullRequests::Unavailable(unavailable.message()),
+                                },
+                                checked: Some(Instant::now()),
+                                _refresh: None,
+                            },
+                        );
+                        cx.notify();
                     })
-                    .await;
-                this.update(cx, |this, cx| {
-                    this.pull_requests.insert(
+                    .ok();
+                }
+            });
+            match self.pull_requests.get_mut(&key) {
+                Some(scan) => scan._refresh = Some(task),
+                None => {
+                    self.pull_requests.insert(
                         key,
-                        match found {
-                            Ok(found) => PullRequests::Loaded(found),
-                            Err(unavailable) => PullRequests::Unavailable(unavailable.message()),
+                        PullRequestScan {
+                            found: PullRequests::Loading,
+                            checked: None,
+                            _refresh: Some(task),
                         },
                     );
-                    cx.notify();
-                })
-                .ok();
-            });
-            self._pull_request_tasks.push(task);
+                }
+            }
         }
     }
 
@@ -1499,6 +1534,11 @@ impl BenchGitPanel {
                         Color::Muted
                     }))
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if tab == Tab::PullRequests {
+                            for scan in this.pull_requests.values_mut() {
+                                scan.checked = None;
+                            }
+                        }
                         this.tab = tab;
                         cx.notify();
                     }))
@@ -2201,7 +2241,7 @@ impl BenchGitPanel {
                     .as_ref()
                     .map(|branch| branch.name().to_owned()),
             );
-            match self.pull_requests.get(&key) {
+            match self.pull_requests.get(&key).map(|scan| &scan.found) {
                 None | Some(PullRequests::Loading) => rows.push(render_note("Loading…")),
                 Some(PullRequests::Unavailable(message)) => rows.push(render_note(message.clone())),
                 Some(PullRequests::Loaded(pull_requests)) if pull_requests.is_empty() => {

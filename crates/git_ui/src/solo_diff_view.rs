@@ -16,6 +16,7 @@ use gpui::{
     HighlightStyle, IntoElement, Render, Subscription, Task, WeakEntity, Window,
 };
 use language::{Anchor, Buffer, HighlightedText, OffsetRangeExt as _, Point};
+use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use project::{
     Project, ProjectPath,
@@ -28,7 +29,10 @@ use std::{
     sync::Arc,
 };
 use ui::{DiffStat, Divider, Tooltip, prelude::*};
-use util::paths::{PathExt as _, PathStyle};
+use util::{
+    ResultExt as _,
+    paths::{PathExt as _, PathStyle},
+};
 use workspace::{
     Item, ItemHandle, ItemNavHistory, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView,
     Workspace,
@@ -662,6 +666,115 @@ impl Item for SoloDiffView {
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.editor.save(options, project, window, cx)
+    }
+}
+
+/// Buttons that leave a diff for the file it shows: opening the file itself,
+/// and for Markdown, its preview, which the quick action bar only offers for
+/// an editor of the file. At the far right of the toolbar, after the diff's
+/// own controls.
+pub struct DiffOpenFileToolbar {
+    active_item: Option<Box<dyn ItemHandle>>,
+}
+
+impl DiffOpenFileToolbar {
+    pub fn new(_: &mut Context<Self>) -> Self {
+        Self { active_item: None }
+    }
+
+    /// The file the diff shows, and the workspace to open it in. A diff of
+    /// the whole branch shows many, so it is the one the cursor is in.
+    fn target(&self, cx: &App) -> Option<(ProjectPath, WeakEntity<Workspace>)> {
+        let item = self.active_item.as_ref()?;
+        if let Some(solo_diff) = item.act_as::<SoloDiffView>(cx) {
+            let solo_diff = solo_diff.read(cx);
+            let project_path = solo_diff
+                .repository
+                .read(cx)
+                .repo_path_to_project_path(&solo_diff.repo_path, cx)?;
+            return Some((project_path, solo_diff.workspace.clone()));
+        }
+        let branch_diff = item.act_as::<crate::branch_diff::BranchDiff>(cx)?;
+        let branch_diff = branch_diff.read(cx);
+        Some((branch_diff.active_project_path(cx)?, branch_diff.workspace.clone()))
+    }
+}
+
+impl EventEmitter<ToolbarItemEvent> for DiffOpenFileToolbar {}
+
+impl ToolbarItemView for DiffOpenFileToolbar {
+    fn set_active_pane_item(
+        &mut self,
+        active_pane_item: Option<&dyn ItemHandle>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> ToolbarItemLocation {
+        self.active_item = active_pane_item
+            .filter(|item| {
+                item.act_as::<SoloDiffView>(cx).is_some()
+                    || item.act_as::<crate::branch_diff::BranchDiff>(cx).is_some()
+            })
+            .map(|item| item.boxed_clone());
+        if self.active_item.is_some() {
+            ToolbarItemLocation::PrimaryRight
+        } else {
+            ToolbarItemLocation::Hidden
+        }
+    }
+}
+
+impl Render for DiffOpenFileToolbar {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some((project_path, workspace)) = self.target(cx) else {
+            return Empty.into_any_element();
+        };
+        let is_markdown = workspace.upgrade().is_some_and(|workspace| {
+            MarkdownPreviewView::is_markdown_path(
+                project_path.path.as_std_path(),
+                workspace.read(cx).project().read(cx).languages(),
+            )
+        });
+        h_flex()
+            .gap_0p5()
+            .child(Divider::vertical().mr_1())
+            .child(
+                IconButton::new("diff-open-file", IconName::FileTextOutlined)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Open File"))
+                    .on_click({
+                        let workspace = workspace.clone();
+                        let project_path = project_path.clone();
+                        move |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace
+                                        .open_path(project_path.clone(), None, true, window, cx)
+                                        .detach_and_log_err(cx);
+                                })
+                                .log_err();
+                        }
+                    }),
+            )
+            .when(is_markdown, |this| {
+                this.child(
+                    IconButton::new("diff-preview-markdown", IconName::Eye)
+                        .icon_size(IconSize::Small)
+                        .tooltip(Tooltip::text("Preview Markdown"))
+                        .on_click(move |_, window, cx| {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    MarkdownPreviewView::open_for_project_path(
+                                        project_path.clone(),
+                                        workspace,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .log_err();
+                        }),
+                )
+            })
+            .into_any_element()
     }
 }
 

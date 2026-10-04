@@ -1,6 +1,8 @@
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use acp_thread::line_range_suffix;
 use anyhow::{Context as _, Result, anyhow};
 use collections::HashMap;
 use futures::FutureExt as _;
@@ -14,7 +16,7 @@ use terminal_view::terminal_panel::TerminalPanel;
 use util::ResultExt as _;
 use workspace::Workspace;
 use zed_actions::claude::{
-    NewTerminal, SendCommit, SendDiagnostic, SendFile, SendSelection, SendText,
+    NewTerminal, SendCommit, SendDiagnostic, SendFile, SendLines, SendSelection, SendText,
 };
 
 use crate::agent_panel::format_selection_for_terminal;
@@ -69,6 +71,13 @@ pub fn init(cx: &mut App) {
                 let payload = Payload::File(PathBuf::from(action.path.clone()));
                 send(workspace, payload, window, cx);
             })
+            .register_action(|workspace, action: &SendLines, window, cx| {
+                let payload = Payload::Lines {
+                    path: PathBuf::from(action.path.clone()),
+                    rows: action.start_line.saturating_sub(1)..=action.end_line.saturating_sub(1),
+                };
+                send(workspace, payload, window, cx);
+            })
             .register_action(|workspace, action: &SendCommit, window, cx| {
                 send(workspace, Payload::Commit(action.sha.clone()), window, cx);
             })
@@ -91,6 +100,11 @@ pub fn init(cx: &mut App) {
 enum Payload {
     Selection(AgentContextSelection),
     File(PathBuf),
+    /// Zero-based rows, as `line_range_suffix` takes them.
+    Lines {
+        path: PathBuf,
+        rows: RangeInclusive<u32>,
+    },
     Commit(String),
     Diagnostic {
         path: PathBuf,
@@ -188,6 +202,11 @@ fn paste(
         Payload::File(path) => {
             format!("{} ", mention_path(path, &working_directory, workspace, cx))
         }
+        Payload::Lines { path, rows } => format!(
+            "{}{} ",
+            mention_path(path, &working_directory, workspace, cx),
+            line_range_suffix(rows)
+        ),
         Payload::Commit(sha) => format!("{sha} "),
         Payload::Text(text) => text.clone(),
         Payload::Diagnostic {

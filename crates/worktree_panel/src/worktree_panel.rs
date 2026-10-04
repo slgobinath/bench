@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use git::repository::{CreateWorktreeTarget, Worktree as GitWorktree};
+use git::repository::{CreateWorktreeTarget, GitRepository, Worktree as GitWorktree};
 use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
@@ -69,6 +69,8 @@ actions!(
         ToggleFocus,
         /// Opens or closes the worktree panel.
         Toggle,
+        /// Moves focus to the worktree panel's filter box.
+        FocusFilter,
     ]
 );
 
@@ -246,13 +248,20 @@ struct OpenWorktree {
 /// What the panel knows about the worktrees of a project the window has no
 /// workspace open for; see [`WorktreePanel::discover`].
 enum Discovery {
-    /// The scan is running.
+    /// The first scan is running. Nothing is drawn from it until it lands,
+    /// which is why a refresh keeps the old answer instead of going back
+    /// through here.
     Pending { _scan: Task<()> },
     /// What git reported. Empty means the project is not a git repository, or
     /// that git could not be asked.
     Found {
         worktrees: Vec<GitWorktree>,
-        at: Instant,
+        /// When this was asked; `None` once it should be asked again.
+        checked: Option<Instant>,
+        /// A refresh in flight. The rows already found stay on screen until
+        /// it lands, because rows that vanish for the length of a
+        /// `git worktree list` every minute are a flicker.
+        _refresh: Option<Task<()>>,
     },
 }
 
@@ -467,10 +476,19 @@ impl WorktreePanel {
             cx,
         ));
 
+        let focus_handle = cx.focus_handle();
+        // On the way into the panel rather than whenever the box is focused,
+        // so a click inside the box still puts the cursor where it landed.
+        subscriptions.push(cx.on_focus_in(&focus_handle, window, |this, window, cx| {
+            if this.filter.focus_handle(cx).is_focused(window) {
+                this.filter.select_all(window, cx);
+            }
+        }));
+
         Self {
             workspace,
             multi_workspace,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             filter,
             context_menu: None,
             _subscriptions: subscriptions,
@@ -730,7 +748,13 @@ impl WorktreePanel {
         for root in roots {
             match cx.default_global::<ProjectScans>().discovered.get(root) {
                 Some(Discovery::Pending { .. }) => continue,
-                Some(Discovery::Found { at, .. }) if at.elapsed() < DISCOVERY_REFRESH => continue,
+                Some(Discovery::Found {
+                    checked, _refresh, ..
+                }) if _refresh.is_some()
+                    || checked.is_some_and(|checked| checked.elapsed() < DISCOVERY_REFRESH) =>
+                {
+                    continue;
+                }
                 _ => {}
             }
 
@@ -747,26 +771,38 @@ impl WorktreePanel {
                                 root,
                                 Discovery::Found {
                                     worktrees: found,
-                                    at: Instant::now(),
+                                    checked: Some(Instant::now()),
+                                    _refresh: None,
                                 },
                             );
                         });
                     });
                 }
             });
-            cx.default_global::<ProjectScans>()
-                .discovered
-                .insert(root.clone(), Discovery::Pending { _scan: scan });
+            let scans = cx.default_global::<ProjectScans>();
+            match scans.discovered.get_mut(root) {
+                Some(Discovery::Found { _refresh, .. }) => *_refresh = Some(scan),
+                _ => {
+                    scans
+                        .discovered
+                        .insert(root.clone(), Discovery::Pending { _scan: scan });
+                }
+            }
         }
     }
 
-    /// Forgets what git said about a project, so that the next draw asks
-    /// again. Used when Bench itself has just changed a project's worktrees.
+    /// Marks what git said about a project as stale, so that the next draw
+    /// asks again while still showing it. Used when Bench itself has just
+    /// changed a project's worktrees.
     fn rediscover(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
         let Some(root) = root else {
             return;
         };
-        cx.default_global::<ProjectScans>().discovered.remove(&root);
+        if let Some(Discovery::Found { checked, .. }) =
+            cx.default_global::<ProjectScans>().discovered.get_mut(&root)
+        {
+            *checked = None;
+        }
         cx.notify();
     }
 
@@ -1396,7 +1432,13 @@ impl WorktreePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (path, target) = new_worktree(&key, &name);
+        let Some(fs) = self.fs(cx) else {
+            return;
+        };
+        let (path, mut target) = new_worktree(&key, &name);
+        let snapshot = repository.read(cx).snapshot();
+        let common_dir = snapshot.common_dir_abs_path.to_path_buf();
+        let work_directory = snapshot.work_directory_abs_path.to_path_buf();
         // The issue linked in the dialog, which need not be the one the
         // worktree was asked for: it could have been changed or unlinked.
         let then: Option<Box<dyn gpui::Action>> = start_agent.then(|| match &issue {
@@ -1419,6 +1461,85 @@ impl WorktreePanel {
             .map(|description| description.to_string())
             .or_else(|| issue.as_ref().map(|issue| issue.title.to_string()));
         cx.spawn_in(window, async move |this, cx| {
+            let branches = repository
+                .update(cx, |repository, _| repository.branches())
+                .await??;
+            let existing = branches
+                .branches
+                .into_iter()
+                .find(|branch| !branch.is_remote() && branch.name() == name.as_ref());
+            if let Some(existing) = existing {
+                let worktrees = repository
+                    .update(cx, |repository, _| repository.worktrees())
+                    .await??;
+                let checked_out = worktrees
+                    .into_iter()
+                    .find(|worktree| worktree.branch_name() == Some(name.as_ref()));
+                if let Some(checked_out) = checked_out {
+                    from.update(cx, |workspace, cx| {
+                        workspace.show_error(
+                            format!(
+                                "Could not create the worktree “{name}”: the branch is already checked out at {}",
+                                checked_out.path.display()
+                            ),
+                            cx,
+                        );
+                    });
+                    return anyhow::Ok(());
+                }
+
+                let last_commit = existing
+                    .most_recent_commit
+                    .map(|commit| format!(" Its last commit is “{}”.", commit.subject))
+                    .unwrap_or_default();
+                let answer = cx.update(|window, cx| {
+                    window.prompt(
+                        gpui::PromptLevel::Warning,
+                        &format!("A branch named “{name}” already exists."),
+                        Some(&format!(
+                            "No worktree has it checked out.{last_commit}\n\nUse it to carry on \
+                             from where it is, or replace it with a new branch from the latest \
+                             default branch, which discards its commits that are not on another \
+                             branch."
+                        )),
+                        &["Use Existing Branch", "Replace Branch", "Cancel"],
+                        cx,
+                    )
+                })?;
+                match answer.await? {
+                    0 => {
+                        target = CreateWorktreeTarget::ExistingBranch {
+                            branch_name: name.to_string(),
+                        };
+                    }
+                    1 => {
+                        let deleted = repository
+                            .update(cx, |repository, _| {
+                                repository.delete_branch(false, name.to_string(), true)
+                            })
+                            .await?;
+                        if let Err(refused) = deleted {
+                            log::error!("deleting the branch {name}: {refused:#}");
+                            from.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!("Could not replace the branch “{name}”: {}", git_reason(&refused)),
+                                    cx,
+                                );
+                            });
+                            return anyhow::Ok(());
+                        }
+                    }
+                    _ => return anyhow::Ok(()),
+                }
+            }
+
+            if let CreateWorktreeTarget::NewBranch { base_sha, .. } = &mut target {
+                let git_directory = fs.open_repo(&common_dir, which::which("git").ok().as_deref())?;
+                *base_sha = cx
+                    .background_spawn(new_branch_base(git_directory, work_directory))
+                    .await;
+            }
+
             let created = repository
                 .update(cx, |repository, _| {
                     repository.create_worktree(target, path.clone())
@@ -1521,12 +1642,24 @@ impl WorktreePanel {
         // The project git will be asked about again once this worktree is
         // gone; see `rediscover`.
         let project = repository_anchor(&repository, cx);
+        // Asked of the repository's git directory rather than of `repository`,
+        // which can be the worktree's own checkout and so gone by then.
+        let common_dir = repository.read(cx).snapshot().common_dir_abs_path.to_path_buf();
+        let branch = self
+            .tree(cx)
+            .into_iter()
+            .flat_map(|row| row.worktrees)
+            .find(|worktree| worktree.root.as_deref() == Some(root.as_path()))
+            .and_then(|worktree| worktree.branch);
 
         cx.spawn_in(window, async move |this, cx| {
             let nested = cx
                 .background_spawn(nested_worktrees(fs.clone(), root.clone()))
                 .await;
             let mut detail = format!("{} will be removed from disk.", root.display());
+            if let Some(branch) = &branch {
+                detail.push_str(&format!(" Its branch “{branch}” is deleted too."));
+            }
             if !nested.is_empty() {
                 detail.push_str(&format!(
                     "\n\nThe repositories inside it are removed from their own repositories \
@@ -1624,6 +1757,12 @@ impl WorktreePanel {
                         .update(cx, |repository, _| repository.remove_worktree(root.clone(), true))
                         .await??;
                 }
+            }
+
+            if let Some(branch) = branch {
+                fs.open_repo(&common_dir, git.as_deref())?
+                    .delete_branch(false, branch.to_string(), true)
+                    .await?;
             }
 
             multi_workspace
@@ -3774,6 +3913,41 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
 /// as likely to be a cache written by a language server as anything anyone
 /// edited. Everything is left at its default when git cannot say: not a
 /// repository, no commits, no git.
+/// The commit a new worktree's branch starts from: the tip of the
+/// repository's default branch as the remote has it, fetched first, or the
+/// local default branch when the remote cannot say.
+///
+/// Not `HEAD`: the repository a worktree is made in can be another worktree,
+/// whose `HEAD` is that worktree's own branch, and the main checkout's branch
+/// is only as recent as its last pull. A commit rather than `origin/main`,
+/// because a branch started from a remote branch tracks it, and pushing it
+/// would then aim at the default branch.
+async fn new_branch_base(
+    git_directory: Arc<dyn GitRepository>,
+    work_directory: PathBuf,
+) -> Option<String> {
+    fetch_upstream(&work_directory).await.log_err();
+    for include_remote_name in [true, false] {
+        let Some(branch) = git_directory
+            .default_branch(include_remote_name)
+            .await
+            .log_err()
+            .flatten()
+        else {
+            continue;
+        };
+        let commit = git_directory
+            .revparse_batch(vec![branch.to_string()])
+            .await
+            .log_err()
+            .and_then(|commits| commits.into_iter().next().flatten());
+        if commit.is_some() {
+            return commit;
+        }
+    }
+    None
+}
+
 /// `git fetch` in the worktree at `root`, quietly: it runs in the background,
 /// with nobody to answer a credentials prompt.
 async fn fetch_upstream(root: &Path) -> anyhow::Result<()> {
@@ -4220,6 +4394,10 @@ impl Render for WorktreePanel {
         v_flex()
             .key_context("WorktreePanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
+                window.focus(&this.filter.focus_handle(cx), cx);
+                this.filter.select_all(window, cx);
+            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(
@@ -4323,6 +4501,10 @@ impl EventEmitter<PanelEvent> for WorktreePanel {}
 impl Panel for WorktreePanel {
     fn persistent_name() -> &'static str {
         "WorktreePanel"
+    }
+
+    fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        self.filter.focus_handle(cx)
     }
 
     fn panel_key() -> &'static str {
@@ -4771,6 +4953,10 @@ mod tests {
             worktree("/wt/fix", "fix", false),
         )
         .await;
+        fs.with_git_state(Path::new("/outer/.git"), false, |state| {
+            state.branches.insert("fix".into());
+        })
+        .expect("the outer repository");
         fs.insert_file("/wt/fix/file.txt", b"hi".to_vec()).await;
         fs.add_linked_worktree_for_repo(
             Path::new("/inner/.git"),
@@ -4886,10 +5072,15 @@ mod tests {
         delete_fix(&panel, &mut cx);
         let (_, detail) = cx.pending_prompt().expect("the question");
         assert!(detail.contains("repos/inner"), "{detail}");
+        assert!(detail.contains("Its branch “fix” is deleted too."), "{detail}");
         cx.simulate_prompt_answer("Delete");
         cx.run_until_parked();
 
         assert!(!cx.has_pending_prompt(), "nothing refused, so nothing more to ask");
+        let branches = fs
+            .with_git_state(Path::new("/outer/.git"), false, |state| state.branches.clone())
+            .expect("the outer repository");
+        assert!(!branches.contains("fix"), "the branch goes with the worktree");
         cx.update(|_, cx| {
             let store = WorktreeMetadataStore::global(cx);
             assert_eq!(
@@ -4903,6 +5094,30 @@ mod tests {
             !fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await,
             "the clone's repository no longer holds the nested worktree"
         );
+        assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    /// The branch goes with the worktree even when git does not see it as
+    /// merged, without a second question.
+    #[gpui::test]
+    async fn an_unmerged_branch_is_deleted_with_its_worktree(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        fs.with_git_state(Path::new("/outer/.git"), false, |state| {
+            state.branches_requiring_force_delete.insert("fix".into());
+        })
+        .expect("the outer repository");
+
+        delete_fix(&panel, &mut cx);
+        cx.simulate_prompt_answer("Delete");
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt(), "nothing more to ask");
+        assert!(!fs.is_dir(Path::new("/wt/fix")).await);
+        let branches = fs
+            .with_git_state(Path::new("/outer/.git"), false, |state| state.branches.clone())
+            .expect("the outer repository");
+        assert!(!branches.contains("fix"), "the branch goes with the worktree");
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
     }
 
@@ -5053,6 +5268,125 @@ mod tests {
         )
     }
 
+    /// Focusing the panel lands in its filter with what is there selected, so
+    /// typing replaces the last filter rather than adding to it.
+    #[gpui::test]
+    async fn focusing_the_panel_selects_its_filter(cx: &mut TestAppContext) {
+        let (_fs, _multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        cx.update(|window, cx| {
+            let filter = panels[0].read(cx).filter.clone();
+            filter.set_text("old", window, cx);
+            window.blur(cx);
+        });
+        workspaces[0].update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<WorktreePanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        let filter_focused = cx.update(|window, cx| {
+            panels[0].read(cx).filter.focus_handle(cx).is_focused(window)
+        });
+        assert!(filter_focused, "the filter has focus");
+        cx.simulate_input("new");
+        let text = cx.update(|_, cx| panels[0].read(cx).filter.text(cx));
+        assert_eq!(text, "new");
+    }
+
+    /// A worktree named after a branch that already exists asks first, and
+    /// using the branch checks it out rather than failing to make a new one.
+    #[gpui::test]
+    async fn a_worktree_for_an_existing_branch_asks_first(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.with_git_state(Path::new("/outer/.git"), false, |state| {
+            state.branches.insert("rb-174".into());
+        })
+        .expect("the outer repository");
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let outer = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
+        let repository = project.read_with(&mut cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("the outer repository")
+        });
+
+        panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree(
+                outer.clone(),
+                repository,
+                key.clone(),
+                "rb-174".into(),
+                None,
+                None,
+                false,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let (title, _) = cx.pending_prompt().expect("a question about the branch");
+        assert_eq!(title, "A branch named “rb-174” already exists.");
+        cx.simulate_prompt_answer("Use Existing Branch");
+        cx.run_until_parked();
+
+        let (path, _) = new_worktree(&key, "rb-174");
+        assert!(fs.is_dir(&path).await, "the worktree was made on the branch");
+    }
+
+    /// A new worktree's branch starts from the default branch as the remote
+    /// has it, not from whatever the repository it is made in has checked out.
+    #[gpui::test]
+    async fn a_new_branch_starts_from_the_default_branch(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.with_git_state(Path::new("/outer/.git"), false, |state| {
+            state.current_branch_name = Some("rb-157".into());
+            state.refs.insert("HEAD".into(), "feature-tip".into());
+            state.refs.insert("origin/main".into(), "latest-main".into());
+        })
+        .expect("the outer repository");
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let outer = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project.clone(), window, cx)
+        });
+        cx.run_until_parked();
+        let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
+        let repository = project.read_with(&mut cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("the outer repository")
+        });
+
+        panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree(
+                outer.clone(),
+                repository,
+                key.clone(),
+                "rb-175".into(),
+                None,
+                None,
+                false,
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let start = fs
+            .with_git_state(Path::new("/outer/.git"), false, |state| {
+                state.refs.get("refs/heads/rb-175").cloned()
+            })
+            .expect("the outer repository");
+        assert_eq!(start.as_deref(), Some("latest-main"));
+    }
+
     /// A worktree made for an issue remembers the issue by Linear's own id,
     /// which outlives the branch name's copy of its identifier, and gets the
     /// colour its project's other worktrees are not using.
@@ -5168,6 +5502,56 @@ mod tests {
             git_reason(&error),
             "'/wt/fix' contains modified or untracked files, use --force to delete it"
         );
+    }
+
+    /// Asking git again about a project with nothing open keeps its rows on
+    /// screen until the answer lands; dropping them for the length of the scan
+    /// is the panel flickering once a minute.
+    #[gpui::test]
+    async fn a_closed_project_keeps_its_rows_while_it_is_asked_again(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 1).await;
+        fs.insert_tree("/closed", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/closed/.git"),
+            false,
+            worktree("/wt/closed-fix", "closed-fix", false),
+        )
+        .await;
+        let closed = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/closed")]));
+        multi_workspace.update(&mut cx, |multi_workspace, _| {
+            multi_workspace.test_add_project_group(ProjectGroup {
+                key: closed.clone(),
+                workspaces: Vec::new(),
+                expanded: true,
+            });
+        });
+        panels[0].update(&mut cx, |panel, cx| {
+            panel.discover(&[PathBuf::from("/closed")], cx);
+        });
+        cx.run_until_parked();
+
+        let closed_rows = |panel: &WorktreePanel, cx: &App| {
+            panel
+                .tree(cx)
+                .into_iter()
+                .filter(|row| row.key.matches(&closed))
+                .map(|row| row.worktrees.len())
+                .sum::<usize>()
+        };
+        let before = panels[0].read_with(&mut cx, |panel, cx| closed_rows(panel, cx));
+        assert!(before > 0, "the closed project's worktrees were found");
+
+        panels[0].update(&mut cx, |panel, cx| {
+            panel.rediscover(Some(PathBuf::from("/closed")), cx);
+            panel.discover(&[PathBuf::from("/closed")], cx);
+        });
+        let during = panels[0].read_with(&mut cx, |panel, cx| closed_rows(panel, cx));
+        assert_eq!(during, before, "the rows stay while git is asked again");
+
+        cx.run_until_parked();
+        let after = panels[0].read_with(&mut cx, |panel, cx| closed_rows(panel, cx));
+        assert_eq!(after, before);
     }
 
     /// A worktree of a project with nothing open has no workspace to switch

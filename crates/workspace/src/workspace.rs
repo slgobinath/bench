@@ -507,6 +507,16 @@ actions!(
 #[action(namespace = workspace)]
 pub struct ActivatePane(pub usize);
 
+/// Shows a panel and moves focus into it, or hides it if it is already
+/// showing, wherever focus is.
+#[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
+#[action(namespace = workspace)]
+#[serde(deny_unknown_fields)]
+pub struct TogglePanel {
+    /// The panel's persistent name, such as `Project Panel` or `LinearPanel`.
+    pub panel: String,
+}
+
 /// Moves an item to a specific pane by index.
 #[derive(Clone, Deserialize, PartialEq, JsonSchema, Action)]
 #[action(namespace = workspace)]
@@ -4790,6 +4800,45 @@ impl Workspace {
         result_panel
     }
 
+    /// Hides the panel named `name` if its dock is open with it showing, and
+    /// otherwise shows it and focuses it; see [`TogglePanel`].
+    ///
+    /// Unlike [`Self::toggle_panel_focus`], a panel that is showing hides even
+    /// when focus is elsewhere, so the same key both opens and closes it.
+    pub fn toggle_panel(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((dock, panel_index)) = self.all_docks().into_iter().find_map(|dock| {
+            let panel_index = dock.read(cx).panel_index_for_persistent_name(name, cx)?;
+            Some((dock.clone(), panel_index))
+        }) else {
+            return;
+        };
+        let showing =
+            dock.read(cx).is_open() && dock.read(cx).active_panel_index() == Some(panel_index);
+        if showing {
+            let had_focus = dock
+                .read(cx)
+                .active_panel()
+                .is_some_and(|panel| panel.panel_focus_handle(cx).contains_focused(window, cx));
+            dock.update(cx, |dock, cx| dock.set_open(false, window, cx));
+            if had_focus {
+                self.active_pane
+                    .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            }
+        } else {
+            let position = dock.read(cx).position();
+            dock.update(cx, |dock, cx| {
+                dock.activate_panel(panel_index, window, cx);
+                dock.set_open(true, window, cx);
+                if let Some(panel) = dock.active_panel() {
+                    window.focus(&panel.activation_focus_handle(cx), cx);
+                }
+            });
+            self.dismiss_zoomed_items_to_reveal(Some(position), window, cx);
+        }
+        self.serialize_workspace(window, cx);
+        cx.notify();
+    }
+
     /// Open the panel of the given type
     pub fn open_panel<T: Panel>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for dock in self.all_docks() {
@@ -8194,6 +8243,9 @@ impl Workspace {
             }))
             .on_action(cx.listener(|workspace, _: &MovePaneDown, _, cx| {
                 workspace.move_pane_to_border(SplitDirection::Down, cx)
+            }))
+            .on_action(cx.listener(|this, action: &TogglePanel, window, cx| {
+                this.toggle_panel(&action.panel, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleLeftDock, window, cx| {
                 this.toggle_dock(DockPosition::Left, window, cx);
@@ -14615,6 +14667,58 @@ mod tests {
             let (top, nested) = nested_axis(workspace);
             assert_eq!(*top.flexes.lock(), vec![1.0; top.members.len()]);
             assert_eq!(*nested.flexes.lock(), vec![1.0; nested.members.len()]);
+        });
+    }
+
+    /// `TogglePanel` hides a showing panel even when focus is in the center,
+    /// rather than moving focus into it, and shows and focuses a hidden one.
+    #[gpui::test]
+    async fn test_toggle_panel_by_name(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            let item = cx.new(TestItem::new);
+            pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel("TestPanel", window, cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.right_dock().read(cx).is_open());
+            assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        pane.update_in(cx, |pane, window, cx| window.focus(&pane.focus_handle(cx), cx));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel("TestPanel", window, cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.right_dock().read(cx).is_open());
+            assert!(pane.read(cx).focus_handle(cx).contains_focused(window, cx));
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel("TestPanel", window, cx);
+            workspace.toggle_panel("TestPanel", window, cx);
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.right_dock().read(cx).is_open());
+            assert!(
+                pane.read(cx).focus_handle(cx).contains_focused(window, cx),
+                "hiding a focused panel gives focus back to the center"
+            );
         });
     }
 

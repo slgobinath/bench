@@ -751,6 +751,20 @@
     },
   },
   {
+    "context": "LinearPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-f": "linear::FocusSearch",
+    },
+  },
+  {
+    "context": "WorktreePanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-f": "worktree_panel::FocusFilter",
+    },
+  },
+  {
     "context": "ThreadsSidebar",
     "use_key_equivalents": true,
     "bindings": {

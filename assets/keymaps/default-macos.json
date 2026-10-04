@@ -259,7 +259,7 @@
       "cmd-alt-c": "agent::OpenSettings",
       "cmd-alt-m": "agent::ToggleOptionsMenu",
       "cmd-alt-shift-n": "agent::ToggleNewThreadMenu",
-      "cmd-shift-e": "project_panel::ToggleFocus",
+      "cmd-shift-e": ["workspace::TogglePanel", { "panel": "Project Panel" }],
       "ctrl-tab": "agents_sidebar::ToggleThreadSwitcher",
       "ctrl-shift-tab": ["agents_sidebar::ToggleThreadSwitcher", { "select_last": true }],
     },
@@ -460,7 +460,6 @@
       "alt-enter": "search::SelectAllMatches",
       "cmd-f": "search::FocusSearch",
       "cmd-alt-l": "search::ToggleSelection",
-      "cmd-shift-o": "outline::Toggle",
       "alt-cmd-f": "text_finder::Toggle",
     },
   },
@@ -562,7 +561,6 @@
       "cmd-k cmd-w": "workspace::CloseAllItemsAndPanes",
       "cmd-f": "project_search::ToggleFocus",
       "cmd-g": "search::SelectNextMatch",
-      "cmd-shift-g": "search::SelectPreviousMatch",
       "cmd-shift-h": "search::ToggleReplace",
       "cmd-alt-l": "search::ToggleSelection",
       "alt-enter": "search::SelectAllMatches",
@@ -595,7 +593,6 @@
       "ctrl-shift-left": "editor::SelectSmallerSyntaxNode", // Shrink selection (VSCode version)
       "cmd-ctrl-down": "editor::SelectNextSyntaxNode", // Move selection down
       "cmd-d": ["editor::SelectNext", { "replace_newest": false }], // editor.action.addSelectionToNextFindMatch / find_under_expand
-      "cmd-shift-l": "editor::SelectAllMatches", // Select all occurrences of current selection
       "cmd-f2": "editor::SelectAllMatches", // Select all occurrences of current word
       "cmd-k cmd-d": ["editor::SelectNext", { "replace_newest": true }], // editor.action.moveSelectionToNextFindMatch / find_under_expand_skip
       // macOS binds `ctrl-cmd-d` to Show Dictionary which breaks these two binds
@@ -674,7 +671,6 @@
     "context": "Editor && mode == full",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-shift-o": "outline::Toggle",
       "ctrl-g": "go_to_line::Toggle",
       "cmd-shift-backspace": "editor::GoToPreviousChange",
       "cmd-shift-alt-backspace": "editor::GoToNextChange",
@@ -726,7 +722,7 @@
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
       "cmd-shift-n": "workspace::NewWindow",
-      "ctrl-`": "terminal_panel::Toggle",
+      "cmd-shift-t": ["workspace::TogglePanel", { "panel": "TerminalPanel" }],
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],
       "cmd-3": ["workspace::ActivatePane", 2],
@@ -752,7 +748,6 @@
       "ctrl-alt-+": ["workspace::IncreaseOpenDocksSize", { "px": 0 }],
       "cmd-shift-f": "pane::DeploySearch",
       "cmd-shift-h": ["pane::DeploySearch", { "replace_enabled": true }],
-      "cmd-shift-t": "pane::ReopenClosedItem",
       "cmd-k cmd-p": "workspace::ReopenLastPicker",
       "cmd-k cmd-s": "zed::OpenKeymap",
       "cmd-k cmd-t": "theme_selector::Toggle",
@@ -764,10 +759,13 @@
       "ctrl-tab": "tab_switcher::Toggle",
       "cmd-shift-p": "command_palette::Toggle",
       "cmd-shift-m": "diagnostics::Deploy",
-      "cmd-shift-e": "project_panel::ToggleFocus",
-      "cmd-shift-b": "outline_panel::ToggleFocus",
+      "cmd-shift-e": ["workspace::TogglePanel", { "panel": "Project Panel" }],
+      "cmd-shift-b": ["workspace::TogglePanel", { "panel": "Outline Panel" }],
+      "cmd-shift-o": ["workspace::TogglePanel", { "panel": "Outline Panel" }],
       "ctrl-shift-g": "git_panel::ToggleFocus",
-      "cmd-shift-d": "debug_panel::ToggleFocus",
+      "cmd-shift-g": ["workspace::TogglePanel", { "panel": "BenchGitPanel" }],
+      "cmd-shift-l": ["workspace::TogglePanel", { "panel": "LinearPanel" }],
+      "cmd-shift-d": ["workspace::TogglePanel", { "panel": "DatabasePanel" }],
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
       "cmd-k n": "encoding_selector::Toggle",
@@ -802,6 +800,20 @@
       // "foo-bar": ["task::Spawn", { "task_name": "MyTask", "reveal_target": "dock" }]
       // or by tag:
       // "foo-bar": ["task::Spawn", { "task_tag": "MyTag" }],
+    },
+  },
+  {
+    "context": "LinearPanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-f": "linear::FocusSearch",
+    },
+  },
+  {
+    "context": "WorktreePanel",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-f": "worktree_panel::FocusFilter",
     },
   },
   {
@@ -973,7 +985,7 @@
     "bindings": {
       "ctrl-alt-cmd-f": "workspace::FollowNextCollaborator",
       // TODO: Move this to a dock open action
-      "cmd-shift-c": "collab_panel::ToggleFocus",
+      "cmd-shift-c": ["workspace::TogglePanel", { "panel": "CollabPanel" }],
       // Only available in debug builds: opens an element inspector for development.
       "cmd-alt-i": "dev::ToggleInspector",
       // Cycles the frame-time debug overlay between hidden, frame-time-only, and detailed modes.
@@ -989,7 +1001,7 @@
       "alt-enter": "editor::OpenExcerpts",
       "shift-enter": "editor::ExpandExcerpts",
       "cmd-alt-enter": "editor::OpenExcerptsSplit",
-      "cmd-shift-e": "pane::RevealInProjectPanel",
+      "cmd-shift-e": ["workspace::TogglePanel", { "panel": "Project Panel" }],
       "cmd-f8": "editor::GoToHunk",
       "cmd-shift-f8": "editor::GoToPreviousHunk",
       "ctrl-:": "editor::ToggleInlayHints",
@@ -1489,6 +1501,7 @@
       "cmd-down": "markdown::ScrollToBottom",
       "cmd-shift-v": "markdown::CloseAndReturnToEditor",
       "cmd-f": "buffer_search::Deploy",
+      "cmd->": "claude::SendSelection",
     },
   },
   {

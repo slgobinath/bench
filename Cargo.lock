@@ -7266,6 +7266,7 @@ dependencies = [
  "language_model",
  "log",
  "markdown",
+ "markdown_preview",
  "menu",
  "multi_buffer",
  "notifications",

@@ -37,6 +37,8 @@ actions!(
         ToggleFocus,
         /// Opens or closes the Linear panel.
         Toggle,
+        /// Moves focus to the Linear panel's search box.
+        FocusSearch,
     ]
 );
 
@@ -152,11 +154,20 @@ impl LinearPanel {
                 .masked(true)
         });
 
+        let focus_handle = cx.focus_handle();
+        // On the way into the panel rather than whenever the box is focused,
+        // so a click inside the box still puts the cursor where it landed.
+        subscriptions.push(cx.on_focus_in(&focus_handle, window, |this, window, cx| {
+            if this.search.focus_handle(cx).is_focused(window) {
+                this.search.select_all(window, cx);
+            }
+        }));
+
         Self {
             workspace,
             multi_workspace,
             linear,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             search,
             api_key,
             connect_error: None,
@@ -986,6 +997,10 @@ impl Render for LinearPanel {
         v_flex()
             .key_context("LinearPanel")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                window.focus(&this.search.focus_handle(cx), cx);
+                this.search.select_all(window, cx);
+            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(body)
@@ -1012,6 +1027,13 @@ impl EventEmitter<PanelEvent> for LinearPanel {}
 impl Panel for LinearPanel {
     fn persistent_name() -> &'static str {
         "LinearPanel"
+    }
+
+    fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
+        match self.linear.read(cx).connection() {
+            Connection::Connected { .. } => self.search.focus_handle(cx),
+            Connection::Loading | Connection::Disconnected { .. } => self.focus_handle.clone(),
+        }
     }
 
     fn panel_key() -> &'static str {

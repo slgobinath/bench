@@ -35,7 +35,7 @@ use git_ui::branch_diff::BranchDiffToolbar;
 use git_ui::commit_view::CommitViewToolbar;
 use git_ui::git_panel::GitPanel;
 use git_ui::project_diff::ProjectDiffToolbar;
-use git_ui::solo_diff_view::{SoloDiffGitToolbar, SoloDiffStyleToolbar};
+use git_ui::solo_diff_view::{DiffOpenFileToolbar, SoloDiffGitToolbar, SoloDiffStyleToolbar};
 use git_ui::staged_diff::StagedDiffToolbar;
 use git_ui::unstaged_diff::UnstagedDiffToolbar;
 use git_ui_core::file_diff_view::FileDiffStyleToolbar;
@@ -1601,6 +1601,9 @@ fn initialize_pane(
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
             toolbar.add_item(image_view_toolbar, window, cx);
+            // Last, so its buttons sit at the far right of a diff's toolbar.
+            let diff_open_file_toolbar = cx.new(DiffOpenFileToolbar::new);
+            toolbar.add_item(diff_open_file_toolbar, window, cx);
         })
     });
 }

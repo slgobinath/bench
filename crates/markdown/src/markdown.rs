@@ -1082,6 +1082,12 @@ impl Markdown {
         self.selection.end > self.selection.start
     }
 
+    /// The selection as a range of the source, when something is selected.
+    pub fn selected_source_range(&self) -> Option<Range<usize>> {
+        (self.selection.end > self.selection.start)
+            .then(|| self.selection.start..self.selection.end)
+    }
+
     pub fn selected_source(&self) -> Option<&str> {
         if self.selection.end <= self.selection.start {
             return None;

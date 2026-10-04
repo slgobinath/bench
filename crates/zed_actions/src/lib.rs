@@ -741,6 +741,20 @@ pub mod claude {
         pub message: String,
     }
 
+    /// Sends a range of a file's lines to the agent terminal for the active
+    /// worktree, as an editor selection of them would be sent.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendLines {
+        /// Absolute path of the file the lines are in.
+        pub path: String,
+        /// One-based first line.
+        pub start_line: u32,
+        /// One-based last line, included.
+        pub end_line: u32,
+    }
+
     /// Puts text into the composer of the agent terminal for the active
     /// worktree, as a prompt to finish and send — a review request, say.
     #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
