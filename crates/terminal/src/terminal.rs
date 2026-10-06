@@ -2971,6 +2971,10 @@ impl Terminal {
         }
     }
 
+    pub fn is_running_claude(&self) -> bool {
+        self.foreground_process_command_name().as_deref() == Some("claude")
+    }
+
     /// Returns the working directory of the process that's connected to the PTY.
     /// That means it returns the working directory of the local shell or program
     /// that's running inside the terminal.
@@ -3053,6 +3057,10 @@ impl Terminal {
                 .title_override
                 .as_ref()
                 .map(|title_override| title_override.to_string())
+                .or_else(|| {
+                    self.is_running_claude()
+                        .then(|| claude_title(&self.breadcrumb_text, truncate.then_some(MAX_CHARS)))
+                })
                 .unwrap_or_else(|| match &self.terminal_type {
                     TerminalType::Pty { info, .. } => info
                         .current
@@ -3572,6 +3580,25 @@ fn normalize_path_command_name(command: &str) -> Option<String> {
     Some(command)
 }
 
+/// Builds a tab title from the title Claude Code sets on its terminal.
+///
+/// Claude Code prefixes its title with a spinner glyph that changes while it
+/// works, and uses its own product name until it has a task to describe, so
+/// both are stripped to leave only the summary.
+fn claude_title(terminal_title: &str, max_chars: Option<usize>) -> String {
+    let summary = terminal_title
+        .trim_start_matches(|character: char| !character.is_alphanumeric())
+        .trim();
+    if summary.is_empty() || summary == "Claude Code" {
+        return "Claude".to_string();
+    }
+    let summary = match max_chars {
+        Some(max_chars) => truncate_and_trailoff(summary, max_chars),
+        None => summary.to_string(),
+    };
+    format!("Claude: {summary}")
+}
+
 fn foreground_process_command_from_argv(argv: &[String]) -> Option<String> {
     let command = argv
         .first()
@@ -3784,6 +3811,27 @@ mod tests {
             terminal.write_output(marker.as_bytes(), cx);
         });
         assert!(startup_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_claude_title() {
+        assert_eq!(claude_title("", None), "Claude");
+        assert_eq!(claude_title("✳ Claude Code", None), "Claude");
+        assert_eq!(
+            claude_title("✳ Fix login redirect", None),
+            "Claude: Fix login redirect"
+        );
+        assert_eq!(
+            claude_title("⠐ Fix login redirect", None),
+            "Claude: Fix login redirect"
+        );
+        assert_eq!(
+            claude_title("✳ Fix login redirect loop", Some(10)),
+            format!(
+                "Claude: {}",
+                truncate_and_trailoff("Fix login redirect loop", 10)
+            )
+        );
     }
 
     #[test]

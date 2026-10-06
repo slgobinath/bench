@@ -94,6 +94,17 @@ const SWEEP: Duration = Duration::from_secs(1);
 /// that an agent has finished when it has not.
 const WORKING_FOR: Duration = Duration::from_secs(4);
 
+/// How long the heuristic must have called an agent working before its going
+/// quiet is announced as a finished turn.
+///
+/// An idle Claude Code repaints when the window loses focus or its status line
+/// refreshes, which the heuristic sees as [`WORKING_FOR`] of work followed by
+/// idleness. The "done" banner is only shown while Bench is in the background,
+/// which is exactly when those repaints happen, so without this every switch
+/// away from Bench announced the same finished turn again. A real turn keeps
+/// the spinner drawing, so it passes this easily.
+const MIN_HEURISTIC_TURN: Duration = Duration::from_secs(15);
+
 /// How long a hook's report of work, or of a question, outranks the heuristic.
 /// Past this, the turn is assumed to have ended without saying so — an
 /// interrupt, a crash, hooks removed — and the PTY goes back to being the
@@ -177,6 +188,8 @@ struct Watched {
     /// Whether this terminal has ever had an agent in it. Keeps a notification
     /// from firing for the shell prompt an agent leaves behind when it exits.
     had_agent: bool,
+    /// When the current stint of work began, while the agent is working.
+    working_since: Option<Instant>,
 }
 
 pub struct AgentTracker {
@@ -311,6 +324,7 @@ impl AgentTracker {
                 last_output: Instant::now(),
                 bell: false,
                 had_agent: false,
+                working_since: None,
             },
         );
     }
@@ -346,6 +360,7 @@ impl AgentTracker {
             let Some(command) = command else {
                 watched.command = None;
                 watched.had_agent = false;
+                watched.working_since = None;
                 changed |= was.is_some();
                 return true;
             };
@@ -369,7 +384,21 @@ impl AgentTracker {
             any_working |= state == AgentState::Working;
             changed |= was != Some(state) || watched.command.as_ref() != Some(&command);
 
-            if let Some(announcement) = announcement(was, state, &command, directory.as_deref()) {
+            // A hook's report of a finished turn is exact; only the heuristic's
+            // needs the stint of work behind it checked.
+            let worked_for = reported.is_none().then(|| {
+                watched
+                    .working_since
+                    .map_or(Duration::ZERO, |since| now.duration_since(since))
+            });
+            watched.working_since = match state {
+                AgentState::Working => watched.working_since.or(Some(now)),
+                AgentState::Idle | AgentState::NeedsInput => None,
+            };
+
+            if let Some(announcement) =
+                announcement(was, state, worked_for, &command, directory.as_deref())
+            {
                 announcements.push(announcement);
             }
 
@@ -410,6 +439,14 @@ impl AgentTracker {
             }
         }
         summary
+    }
+
+    /// What the agent in one terminal is doing, if that terminal has one.
+    pub fn state_for(&self, terminal: EntityId) -> Option<AgentState> {
+        self.watched
+            .get(&terminal)
+            .filter(|watched| watched.command.is_some())
+            .map(|watched| watched.state)
     }
 
     /// Every agent Bench can see, wherever it is running.
@@ -505,9 +542,13 @@ struct Announcement {
 /// Only two transitions are worth a banner: an agent that has stopped to ask,
 /// and an agent that has finished. Everything else — starting, carrying on,
 /// going quiet for a moment — is what the panel is for.
+///
+/// `worked_for` is how long the heuristic had called the agent working, or
+/// `None` when a hook reported the transition.
 fn announcement(
     was: Option<AgentState>,
     now: AgentState,
+    worked_for: Option<Duration>,
     command: &SharedString,
     directory: Option<&Path>,
 ) -> Option<Announcement> {
@@ -528,12 +569,16 @@ fn announcement(
             body: format!("{where_} — it has stopped to ask something.").into(),
             interrupting: true,
         }),
-        (AgentState::Working, AgentState::Idle) => Some(Announcement {
-            tag,
-            title: format!("{command} is done").into(),
-            body: format!("{where_} — the turn has finished.").into(),
-            interrupting: false,
-        }),
+        (AgentState::Working, AgentState::Idle)
+            if worked_for.is_none_or(|worked_for| worked_for >= MIN_HEURISTIC_TURN) =>
+        {
+            Some(Announcement {
+                tag,
+                title: format!("{command} is done").into(),
+                body: format!("{where_} — the turn has finished.").into(),
+                interrupting: false,
+            })
+        }
         _ => None,
     }
 }
@@ -612,6 +657,7 @@ mod tests {
             announcement(
                 None,
                 AgentState::NeedsInput,
+                None,
                 &"claude".into(),
                 Some(Path::new("/repo/fix"))
             )
@@ -625,6 +671,7 @@ mod tests {
         let asking = announcement(
             Some(AgentState::Working),
             AgentState::NeedsInput,
+            None,
             &"claude".into(),
             Some(Path::new("/repo/fix-login")),
         )
@@ -635,6 +682,7 @@ mod tests {
         let done = announcement(
             Some(AgentState::Working),
             AgentState::Idle,
+            None,
             &"claude".into(),
             Some(Path::new("/repo/fix-login")),
         )
@@ -645,11 +693,34 @@ mod tests {
             announcement(
                 Some(AgentState::Idle),
                 AgentState::Working,
+                None,
                 &"claude".into(),
                 None
             )
             .is_none(),
             "starting work is not news"
+        );
+    }
+
+    #[test]
+    fn a_repaint_is_not_announced_as_a_finished_turn() {
+        let finish = |worked_for| {
+            announcement(
+                Some(AgentState::Working),
+                AgentState::Idle,
+                worked_for,
+                &"claude".into(),
+                Some(Path::new("/repo/fix-login")),
+            )
+        };
+        assert!(
+            finish(Some(WORKING_FOR + Duration::from_secs(1))).is_none(),
+            "one burst of output, like a repaint on losing focus, is not a turn"
+        );
+        assert!(finish(Some(MIN_HEURISTIC_TURN)).is_some());
+        assert!(
+            finish(None).is_some(),
+            "a hook's report of a finished turn is announced however short"
         );
     }
 }

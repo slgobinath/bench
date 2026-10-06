@@ -4428,56 +4428,63 @@ impl Render for WorktreePanel {
                             })),
                     ),
             )
-            .when(tree.is_empty(), |this| {
-                this.child(
-                    v_flex().p_4().gap_1().child(
-                        Label::new("No projects added")
-                            .size(LabelSize::Small)
-                            .color(Color::Muted),
-                    ),
-                )
-            })
-            .children(tree.iter().enumerate().map(|(index, row)| {
-                let project_matches = filter
-                    .as_ref()
-                    .is_none_or(|filter| matches_filter(&row.name, filter));
-                // While filtering, a project is shown open whatever its
-                // collapsed state: hiding a match behind a chevron makes the
-                // filter say a thing exists and then refuse to show it.
-                let collapsed = filter.is_none() && self.is_collapsed(&row.key, cx);
-                let worktrees: Vec<_> = if collapsed {
-                    Vec::new()
-                } else {
-                    row.worktrees
-                        .iter()
-                        .filter(|worktree| match &filter {
-                            // A project whose own name matches keeps all of
-                            // its worktrees: you asked for the project.
-                            Some(filter) => {
-                                project_matches || matches_filter(&worktree.name, filter)
-                            }
-                            None => true,
-                        })
-                        .map(|worktree| {
-                            let element = self.render_worktree(worktree, worktree_index, cx);
-                            worktree_index += 1;
-                            element.into_any_element()
-                        })
-                        .collect()
-                };
-                // A project with nothing left under it is only in the way,
-                // unless it is itself what was asked for.
-                if !project_matches && worktrees.is_empty() && filter.is_some() {
-                    return div().into_any_element();
-                }
+            .child(
                 v_flex()
-                    // Worktree cards are spaced like project rows, so without
-                    // a gap the next project reads as one more worktree.
-                    .when(index > 0, |this| this.mt_3())
-                    .child(self.render_repository(row, index, cx))
-                    .children(worktrees)
-                    .into_any_element()
-            }))
+                    .id("worktree-tree")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(tree.is_empty(), |this| {
+                        this.child(
+                            v_flex().p_4().gap_1().child(
+                                Label::new("No projects added")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                        )
+                    })
+                    .children(tree.iter().enumerate().map(|(index, row)| {
+                        let project_matches = filter
+                            .as_ref()
+                            .is_none_or(|filter| matches_filter(&row.name, filter));
+                        // While filtering, a project is shown open whatever its
+                        // collapsed state: hiding a match behind a chevron makes the
+                        // filter say a thing exists and then refuse to show it.
+                        let collapsed = filter.is_none() && self.is_collapsed(&row.key, cx);
+                        let worktrees: Vec<_> = if collapsed {
+                            Vec::new()
+                        } else {
+                            row.worktrees
+                                .iter()
+                                .filter(|worktree| match &filter {
+                                    // A project whose own name matches keeps all of
+                                    // its worktrees: you asked for the project.
+                                    Some(filter) => {
+                                        project_matches || matches_filter(&worktree.name, filter)
+                                    }
+                                    None => true,
+                                })
+                                .map(|worktree| {
+                                    let element = self.render_worktree(worktree, worktree_index, cx);
+                                    worktree_index += 1;
+                                    element.into_any_element()
+                                })
+                                .collect()
+                        };
+                        // A project with nothing left under it is only in the way,
+                        // unless it is itself what was asked for.
+                        if !project_matches && worktrees.is_empty() && filter.is_some() {
+                            return div().into_any_element();
+                        }
+                        v_flex()
+                            // Worktree cards are spaced like project rows, so without
+                            // a gap the next project reads as one more worktree.
+                            .when(index > 0, |this| this.mt_3())
+                            .child(self.render_repository(row, index, cx))
+                            .children(worktrees)
+                            .into_any_element()
+                    })),
+            )
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 gpui::deferred(
                     gpui::anchored()

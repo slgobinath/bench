@@ -4,6 +4,8 @@ pub mod terminal_panel;
 mod terminal_path_like_target;
 pub mod terminal_scrollbar;
 
+use agent_tracker::{AgentTracker, AgentsChanged, agent_state_color};
+use anyhow::Context as _;
 use editor::{
     Editor, EditorSettings, actions::SelectAll, blink_manager::BlinkManager,
     ui_scrollbar_settings_from_raw,
@@ -48,7 +50,6 @@ use ui::{
     prelude::*,
     scrollbars::{self, ScrollbarVisibility},
 };
-use anyhow::Context as _;
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
@@ -312,13 +313,18 @@ impl TerminalView {
             )
         });
 
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             focus_in,
             focus_out,
             cx.observe(&blink_manager, |_, _, cx| cx.notify()),
             cx.observe_global::<SettingsStore>(Self::settings_changed),
             cx.on_release(Self::end_closed_session),
         ];
+        if let Some(tracker) = AgentTracker::try_global(cx) {
+            subscriptions.push(cx.subscribe(&tracker, |_, _, _: &AgentsChanged, cx| {
+                cx.emit(ItemEvent::UpdateTab);
+            }));
+        }
         let is_persistent = terminal.read(cx).persistent_session().is_some();
 
         Self {
@@ -1352,7 +1358,13 @@ fn subscribe_for_terminal_events(
                         cx,
                     ),
                 },
-                Event::BreadcrumbsChanged => cx.emit(ItemEvent::UpdateBreadcrumbs),
+                Event::BreadcrumbsChanged => {
+                    cx.emit(ItemEvent::UpdateBreadcrumbs);
+                    // A Claude Code tab takes its title from the terminal title.
+                    if terminal.read(cx).is_running_claude() {
+                        cx.emit(ItemEvent::UpdateTab);
+                    }
+                }
                 Event::CloseTerminal => cx.emit(ItemEvent::CloseItem),
                 Event::SelectionsChanged => {
                     window.invalidate_character_coordinates();
@@ -1635,6 +1647,15 @@ impl Item for TerminalView {
                     }
                 }
             },
+            None if terminal.is_running_claude() => {
+                let state = AgentTracker::try_global(cx)
+                    .and_then(|tracker| tracker.read(cx).state_for(self.terminal().entity_id()));
+                (
+                    IconName::AiClaude,
+                    state.map_or(Color::Muted, agent_state_color),
+                    None,
+                )
+            }
             None => (IconName::Terminal, Color::Muted, None),
         };
 
