@@ -82,6 +82,20 @@ pub struct WorktreeMetadata {
     /// set no longer has falls back to the folder instead of failing the read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// The Linear team whose issues a new worktree of this project can be made
+    /// for. Only read off a repository's own checkout. `None` is "no team",
+    /// and a project without one offers no issues, only a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linear_team: Option<LinearTeam>,
+}
+
+/// A Linear team, as much of it as is needed to filter issues by it and to
+/// name it before Linear has answered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinearTeam {
+    pub id: String,
+    pub key: String,
+    pub name: String,
 }
 
 /// The Linear issue a worktree was made for.

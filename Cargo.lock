@@ -10208,6 +10208,7 @@ dependencies = [
  "ui_input",
  "util",
  "workspace",
+ "worktree_metadata",
  "zed_actions",
  "zed_credentials_provider",
 ]

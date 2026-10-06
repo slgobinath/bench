@@ -13,6 +13,7 @@
 //! `LINEAR_API_KEY` wins over the keychain, for anyone who already exports it.
 
 mod dashboard;
+mod issue_graph;
 mod issue_view;
 mod linear_panel;
 
@@ -35,6 +36,7 @@ use serde_json::{Value, json};
 use ui::IconName;
 
 pub use dashboard::{DashboardView, OpenDashboard, open_dashboard};
+pub use issue_graph::{IssueGraphView, OpenIssueGraph, open_issue_graph};
 pub use issue_view::{IssueView, open_issue, send_to_agent};
 pub use linear_panel::LinearPanel;
 
@@ -66,6 +68,8 @@ pub const API_KEY_SETTINGS_URL: &str = "https://linear.app/settings/account/secu
 /// changed, so the ones past this are the ones you are least likely to want.
 const LIST_LIMIT: usize = 100;
 const SEARCH_LIMIT: usize = 50;
+/// How many issues the graph draws. Linear's page size at most.
+pub const GRAPH_LIMIT: usize = 200;
 /// How long typing has to pause before the panel searches. Every keystroke
 /// would otherwise be a request.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -92,6 +96,7 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalLinear(linear));
     linear_panel::init(cx);
     dashboard::init(cx);
+    issue_graph::init(cx);
 }
 
 struct GlobalLinear(Entity<Linear>);
@@ -189,6 +194,11 @@ impl StateType {
             StateType::Canceled => IconName::XCircle,
             StateType::Triage | StateType::Backlog | StateType::Other => IconName::Circle,
         }
+    }
+
+    /// Whether an issue in this group is finished with: done, or given up on.
+    pub fn is_closed(self) -> bool {
+        matches!(self, StateType::Completed | StateType::Canceled)
     }
 
     /// Whether an issue in this group is one work on has not begun, which is
@@ -446,9 +456,44 @@ pub enum Connection {
     },
 }
 
+/// An issue, and the ids of the issues it blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GraphIssue {
+    pub issue: Arc<Issue>,
+    pub blocks: Vec<SharedString>,
+}
+
+#[derive(Deserialize)]
+struct GraphResponse {
+    #[serde(deserialize_with = "nodes")]
+    issues: Vec<GraphNode>,
+}
+
+#[derive(Deserialize)]
+struct GraphNode {
+    #[serde(flatten)]
+    issue: Issue,
+    #[serde(deserialize_with = "nodes")]
+    relations: Vec<GraphRelation>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphRelation {
+    #[serde(rename = "type")]
+    kind: String,
+    related_issue: GraphRelated,
+}
+
+#[derive(Deserialize)]
+struct GraphRelated {
+    id: SharedString,
+}
+
 /// The projects and labels the panel's filters offer.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
+    pub teams: Vec<Team>,
     pub projects: Vec<Named>,
     pub labels: Vec<Named>,
 }
@@ -480,6 +525,10 @@ pub struct Linear {
     connection: Connection,
     catalog: Catalog,
     filters: IssueFilters,
+    /// The team the panel's list is limited to: that of the project the
+    /// panel's worktree belongs to. Apart from [`Self::filters`] because it
+    /// is not the user's to change here, and so is not a filter to reset.
+    team: Option<Team>,
     grouping: IssueGrouping,
     /// The groups closed in the panel, by [`IssueGrouping`] and group key.
     /// Here rather than on a panel, like the filters, so that every
@@ -525,6 +574,7 @@ impl Linear {
             connection: Connection::Loading,
             catalog: Catalog::default(),
             filters: IssueFilters::default(),
+            team: None,
             grouping: IssueGrouping::default(),
             collapsed_groups: HashSet::new(),
             query: String::new(),
@@ -717,6 +767,18 @@ impl Linear {
         &self.filters
     }
 
+    pub fn team(&self) -> Option<&Team> {
+        self.team.as_ref()
+    }
+
+    pub fn set_team(&mut self, team: Option<Team>, cx: &mut Context<Self>) {
+        if self.team == team {
+            return;
+        }
+        self.team = team;
+        self.refresh(cx);
+    }
+
     pub fn grouping(&self) -> IssueGrouping {
         self.grouping
     }
@@ -784,13 +846,58 @@ impl Linear {
         self.refresh(cx);
     }
 
+    /// `filters` as Linear's `IssueFilter`, limited to the team the panel is
+    /// scoped to; see [`Self::team`].
+    fn scoped_filter(&self, filters: &IssueFilters) -> Value {
+        let mut filter = filters.to_graphql();
+        if let (Some(team), Some(filter)) = (&self.team, filter.as_object_mut()) {
+            filter.insert("team".into(), json!({ "id": { "eq": team.id.as_ref() } }));
+        }
+        filter
+    }
+
+    /// The issues matching `filters`, with which of them each one blocks.
+    pub fn issue_graph(&self, filters: &IssueFilters, cx: &App) -> Task<Result<Vec<GraphIssue>>> {
+        let Some(key) = self.key() else {
+            return Task::ready(Err(anyhow!("Linear is not connected.")));
+        };
+        let http_client = self.http_client.clone();
+        let filter = self.scoped_filter(filters);
+        cx.background_spawn(async move {
+            let response: GraphResponse = graphql(
+                http_client.as_ref(),
+                &key,
+                &format!(
+                    "query($filter: IssueFilter, $first: Int) {{ \
+                     issues(filter: $filter, first: $first, orderBy: updatedAt) {{ \
+                     nodes {{ {ISSUE_FIELDS} relations {{ nodes {{ type relatedIssue {{ id }} }} }} }} }} }}"
+                ),
+                json!({ "filter": filter, "first": GRAPH_LIMIT }),
+            )
+            .await?;
+            Ok(response
+                .issues
+                .into_iter()
+                .map(|node| GraphIssue {
+                    blocks: node
+                        .relations
+                        .into_iter()
+                        .filter(|relation| relation.kind == "blocks")
+                        .map(|relation| relation.related_issue.id)
+                        .collect(),
+                    issue: Arc::new(node.issue),
+                })
+                .collect())
+        })
+    }
+
     /// Asks Linear again for what the panel shows.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.key() else {
             return;
         };
         let http_client = self.http_client.clone();
-        let filter = self.filters.to_graphql();
+        let filter = self.scoped_filter(&self.filters);
         let query = self.query.clone();
         self.loading = true;
         self._list = Some(cx.spawn(async move |this, cx| {
@@ -848,17 +955,27 @@ impl Linear {
     /// Searches for issues to link a new worktree to, apart from what the
     /// panel is showing. An empty search is your own unfinished issues, which
     /// is what a worktree is most likely to be made for.
-    pub fn search(&self, query: &str, cx: &App) -> Task<Result<Vec<Arc<Issue>>>> {
+    ///
+    /// With a `team`, only that team's issues.
+    pub fn search(
+        &self,
+        query: &str,
+        team: Option<&str>,
+        cx: &App,
+    ) -> Task<Result<Vec<Arc<Issue>>>> {
         let Some(key) = self.key() else {
             return Task::ready(Err(anyhow!("Linear is not connected.")));
         };
         let http_client = self.http_client.clone();
         let query = query.trim().to_owned();
-        let filter = if query.is_empty() {
+        let mut filter = if query.is_empty() {
             IssueFilters::default().to_graphql()
         } else {
             json!({})
         };
+        if let (Some(team), Some(filter)) = (team, filter.as_object_mut()) {
+            filter.insert("team".into(), json!({ "id": { "eq": team } }));
+        }
         cx.background_spawn(async move {
             let issues = if query.is_empty() {
                 list_issues(http_client.as_ref(), &key, filter).await?
@@ -1214,7 +1331,8 @@ impl Linear {
             }
             if issue.state.kind.is_not_started()
                 && let Some(state) =
-                    first_started_state(http_client.as_ref(), &key, &issue.id).await?
+                    first_state_of_type(http_client.as_ref(), &key, &issue.id, StateType::Started)
+                        .await?
             {
                 input.insert("stateId".into(), json!(state.as_ref()));
             }
@@ -1235,20 +1353,56 @@ impl Linear {
             if !updated.issue_update.success {
                 return Err(anyhow!("Linear did not update {}.", issue.identifier));
             }
-            this.update(cx, |this, cx| {
-                if let Some(updated) = updated.issue_update.issue {
-                    let updated = Arc::new(updated);
-                    for listed in &mut this.issues {
-                        if listed.id == updated.id {
-                            *listed = updated.clone();
-                        }
-                    }
-                    this.remember(updated);
-                }
-                cx.emit(LinearEvent::Changed);
-                cx.notify();
-            })
+            this.update(cx, |this, cx| this.apply_update(updated.issue_update.issue, cx))
         })
+    }
+
+    /// Moves the issue to its team's first "done" state, unless it is closed
+    /// already — done or canceled — in which case it is left as it is.
+    pub fn close_issue(&mut self, issue: Arc<Issue>, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let Some(key) = self.key() else {
+            return Task::ready(Err(anyhow!("Linear is not connected.")));
+        };
+        if issue.state.kind.is_closed() {
+            return Task::ready(Ok(()));
+        }
+        let http_client = self.http_client.clone();
+        cx.spawn(async move |this, cx| {
+            let state =
+                first_state_of_type(http_client.as_ref(), &key, &issue.id, StateType::Completed)
+                    .await?
+                    .ok_or_else(|| anyhow!("{} has no done state to move to.", issue.identifier))?;
+            let updated: IssueUpdateResponse = graphql(
+                http_client.as_ref(),
+                &key,
+                &format!(
+                    "mutation($id: String!, $input: IssueUpdateInput!) {{ \
+                     issueUpdate(id: $id, input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
+                ),
+                json!({ "id": issue.id.as_ref(), "input": { "stateId": state.as_ref() } }),
+            )
+            .await?;
+            if !updated.issue_update.success {
+                return Err(anyhow!("Linear did not update {}.", issue.identifier));
+            }
+            this.update(cx, |this, cx| this.apply_update(updated.issue_update.issue, cx))
+        })
+    }
+
+    /// Takes an issue Linear has just answered with in place of what is held
+    /// of it, wherever it is listed.
+    fn apply_update(&mut self, updated: Option<Issue>, cx: &mut Context<Self>) {
+        if let Some(updated) = updated {
+            let updated = Arc::new(updated);
+            for listed in &mut self.issues {
+                if listed.id == updated.id {
+                    *listed = updated.clone();
+                }
+            }
+            self.remember(updated);
+        }
+        cx.emit(LinearEvent::Changed);
+        cx.notify();
     }
 }
 
@@ -1533,6 +1687,8 @@ async fn fetch_catalog(http_client: &dyn HttpClient, key: &str) -> Result<Catalo
     #[serde(rename_all = "camelCase")]
     struct Response {
         #[serde(deserialize_with = "nodes")]
+        teams: Vec<Team>,
+        #[serde(deserialize_with = "nodes")]
         projects: Vec<Named>,
         #[serde(deserialize_with = "nodes")]
         issue_labels: Vec<Named>,
@@ -1542,11 +1698,13 @@ async fn fetch_catalog(http_client: &dyn HttpClient, key: &str) -> Result<Catalo
     let mut response: Response = graphql(
         http_client,
         key,
-        "query { projects(first: 100, orderBy: updatedAt) { nodes { id name } } \
+        "query { teams(first: 100) { nodes { id key name } } \
+         projects(first: 100, orderBy: updatedAt) { nodes { id name } } \
          issueLabels(first: 250, filter: { isGroup: { eq: false } }) { nodes { id name } } }",
         json!({}),
     )
     .await?;
+    response.teams.sort_by_key(|team| team.name.to_lowercase());
     response
         .projects
         .sort_by_key(|project| project.name.to_lowercase());
@@ -1559,17 +1717,20 @@ async fn fetch_catalog(http_client: &dyn HttpClient, key: &str) -> Result<Catalo
         .issue_labels
         .dedup_by(|a, b| a.name.eq_ignore_ascii_case(&b.name));
     Ok(Catalog {
+        teams: response.teams,
         projects: response.projects,
         labels: response.issue_labels,
     })
 }
 
-/// The state an issue of this team moves to when work on it begins: the first
-/// of the team's "started" states, in the order the team arranged them.
-async fn first_started_state(
+/// The state an issue of this team moves to when it enters the group `kind`:
+/// the first of the team's states of that kind, in the order the team
+/// arranged them. For `Started` that is where work on it begins.
+async fn first_state_of_type(
     http_client: &dyn HttpClient,
     key: &str,
     issue_id: &str,
+    kind: StateType,
 ) -> Result<Option<SharedString>> {
     #[derive(Deserialize)]
     struct Response {
@@ -1592,9 +1753,9 @@ async fn first_started_state(
     let response: Response = graphql(
         http_client,
         key,
-        "query($id: String!) { issue(id: $id) { team { \
-         states(filter: { type: { eq: \"started\" } }) { nodes { id position } } } } }",
-        json!({ "id": issue_id }),
+        "query($id: String!, $kind: String!) { issue(id: $id) { team { \
+         states(filter: { type: { eq: $kind } }) { nodes { id position } } } } }",
+        json!({ "id": issue_id, "kind": kind.as_str() }),
     )
     .await?;
     Ok(response
@@ -1701,6 +1862,7 @@ pub(crate) mod tests {
             },
             catalog: Catalog::default(),
             filters: IssueFilters::default(),
+            team: None,
             grouping: IssueGrouping::default(),
             collapsed_groups: HashSet::new(),
             query: String::new(),
@@ -1907,6 +2069,24 @@ pub(crate) mod tests {
                 "state": { "type": { "in": ["triage", "backlog", "unstarted", "started"] } },
             })
         );
+    }
+
+    #[test]
+    fn an_issue_with_relations_is_read_as_an_issue_and_what_it_blocks() {
+        let mut node = issue_json("RB-1");
+        node["relations"] = json!({ "nodes": [
+            { "type": "blocks", "relatedIssue": { "id": "id-RB-2" } },
+            { "type": "related", "relatedIssue": { "id": "id-RB-3" } },
+        ] });
+        node["priority"] = json!(2);
+        let response: GraphResponse =
+            serde_json::from_value(json!({ "issues": { "nodes": [node] } })).expect("a response");
+        let node = &response.issues[0];
+        assert_eq!(node.issue.identifier.as_ref(), "RB-1");
+        assert_eq!(node.issue.priority, 2.);
+        assert_eq!(node.relations.len(), 2);
+        assert_eq!(node.relations[0].kind, "blocks");
+        assert_eq!(node.relations[0].related_issue.id.as_ref(), "id-RB-2");
     }
 
     #[test]

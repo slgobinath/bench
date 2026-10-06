@@ -17,6 +17,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use ui::{ContextMenu, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*};
 use ui_input::{ErasedEditor, InputField};
+use worktree_metadata::{MetadataChanged, WorktreeMetadataStore};
 use workspace::{
     MultiWorkspace, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -25,7 +26,7 @@ use workspace::{
 use crate::{
     API_KEY_ENV_VAR, API_KEY_SETTINGS_URL, AssigneeFilter, Connection, CreateWorktree,
     CycleFilter, Issue, IssueFilters, IssueGrouping, KeySource, Linear, LinearEvent, Named,
-    StateType,
+    StateType, Team,
     issue_view::{open_issue_in, send_to_agent},
 };
 
@@ -107,7 +108,12 @@ impl LinearPanel {
         let query = linear.read(cx).query().to_owned();
         search.set_text(&query, window, cx);
 
-        let mut subscriptions = vec![search.subscribe(
+        let mut subscriptions = Vec::new();
+        // Setting or clearing a project's team changes what its panel lists.
+        if let Some(store) = WorktreeMetadataStore::try_global(cx) {
+            subscriptions.push(cx.subscribe(&store, |_, _, _: &MetadataChanged, cx| cx.notify()));
+        }
+        subscriptions.push(search.subscribe(
             Box::new({
                 let linear = linear.clone();
                 let search = Arc::downgrade(&search);
@@ -124,7 +130,7 @@ impl LinearPanel {
             }),
             window,
             cx,
-        )];
+        ));
         // Another worktree's panel searched: this one's box should say what
         // the list it draws was searched for.
         subscriptions.push(cx.subscribe_in(
@@ -175,6 +181,24 @@ impl LinearPanel {
             _connect: None,
             _subscriptions: subscriptions,
         }
+    }
+
+    /// The Linear team of the project this panel's worktree belongs to, which
+    /// is what its list is limited to. A project with no team lists every
+    /// issue.
+    fn project_team(&self, cx: &App) -> Option<Team> {
+        let workspace = self.workspace.upgrade()?;
+        let key = workspace.read(cx).project_group_key(cx);
+        let root = key.path_list().ordered_paths().next()?;
+        let team = WorktreeMetadataStore::try_global(cx)?
+            .read(cx)
+            .get(root, cx)
+            .linear_team?;
+        Some(Team {
+            id: team.id.into(),
+            key: team.key.into(),
+            name: team.name.into(),
+        })
     }
 
     fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -375,6 +399,11 @@ impl LinearPanel {
                     .min_w_0()
                     .child(self.search.render(window, cx)),
             )
+            .children(linear.team().map(|team| {
+                Label::new(team.key.clone())
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+            }))
             .child(
                 IconButton::new("open-dashboard", IconName::ChartBar)
                     .icon_size(IconSize::Small)
@@ -384,6 +413,18 @@ impl LinearPanel {
                         let workspace = this.workspace.clone();
                         window.defer(cx, move |window, cx| {
                             crate::dashboard::open_dashboard_in(&workspace, window, cx);
+                        });
+                    })),
+            )
+            .child(
+                IconButton::new("open-issue-graph", IconName::Workflow)
+                    .icon_size(IconSize::Small)
+                    .tooltip(Tooltip::text("Issue Graph"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        // Deferred, for the reason `open_issue` gives.
+                        let workspace = this.workspace.clone();
+                        window.defer(cx, move |window, cx| {
+                            crate::issue_graph::open_issue_graph_in(&workspace, window, cx);
                         });
                     })),
             )
@@ -974,6 +1015,15 @@ fn toggle_named(names: &mut Vec<Named>, name: Named) {
 
 impl Render for LinearPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Only the panel being drawn is the one whose worktree is showing, so
+        // it is the one that says which team the shared list is for. Deferred:
+        // this is a draw, and the list refreshing is not part of it.
+        let team = self.project_team(cx);
+        if self.linear.read(cx).team() != team.as_ref() {
+            let linear = self.linear.clone();
+            cx.defer(move |cx| linear.update(cx, |linear, cx| linear.set_team(team, cx)));
+        }
+
         let body = match self.linear.read(cx).connection() {
             Connection::Loading => v_flex()
                 .p_3()

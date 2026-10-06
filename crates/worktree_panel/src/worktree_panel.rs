@@ -34,13 +34,13 @@ use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
 use linear::{Issue, Linear, LinearEvent};
 use worktree_metadata::{
-    HUE_NAMES, HUES, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
+    HUE_NAMES, HUES, LinearTeam, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
 };
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClipboardItem, Context,
     DismissEvent,
     Entity,
-    EventEmitter, FocusHandle, Focusable, Global, Task, Transformation, WeakEntity, Window,
+    EventEmitter, FocusHandle, Focusable, Global, ScrollHandle, Task, Transformation, WeakEntity, Window,
     actions, percentage, prelude::*, svg,
 };
 use project::{
@@ -48,8 +48,8 @@ use project::{
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
 use ui::{
-    CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, Tooltip,
-    prelude::*,
+    Checkbox, CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, TintColor,
+    Tooltip, prelude::*,
 };
 use ui_input::{ErasedEditor, InputField};
 use settings::Settings as _;
@@ -296,6 +296,11 @@ struct PanelView {
     /// `with_animation` replays whenever its element is mounted, so without
     /// this every chevron in the panel spins on every switch.
     turning: Option<(ProjectGroupKey, Instant)>,
+    /// How far the list is scrolled. Held here rather than by each panel's
+    /// element: a panel is a fresh element tree whenever its worktree comes
+    /// forward, and a scroll position that lived in the tree would go back to
+    /// the top on every switch.
+    scroll: ScrollHandle,
 }
 
 impl Global for PanelView {}
@@ -1246,6 +1251,10 @@ impl WorktreePanel {
         let multi_workspace = self.multi_workspace.clone();
         let panel = cx.entity().downgrade();
         let directory = worktrees_directory(&key);
+        let team = project_root(&key).and_then(|root| {
+            WorktreeMetadataStore::try_global(cx)
+                .and_then(|store| store.read(cx).get(&root, cx).linear_team)
+        });
         window.defer(cx, move |window, cx| {
             multi_workspace
                 .update(cx, |multi_workspace, cx| {
@@ -1256,7 +1265,7 @@ impl WorktreePanel {
             let host = from.clone();
             host.update(cx, |host, cx| {
                 host.toggle_modal(window, cx, move |window, cx| {
-                    NameWorktree::new(directory, issue, window, cx, move |name, description, issue, window, cx| {
+                    NameWorktree::new(directory, team, issue, window, cx, move |name, description, issue, window, cx| {
                         let from = from.clone();
                         let repository = repository.clone();
                         let key = key.clone();
@@ -1281,6 +1290,96 @@ impl WorktreePanel {
         });
     }
 
+    /// [`Self::add_worktree`] for a project the window has nothing open for.
+    ///
+    /// Creating a worktree is the repository's own doing, and a closed project
+    /// has no repository entity to ask. So the project's own checkout is opened
+    /// first, as clicking its row would, and the modal follows once its
+    /// repository has been found.
+    fn add_worktree_to_closed_project(
+        &mut self,
+        key: ProjectGroupKey,
+        issue: Option<Arc<Issue>>,
+        start_agent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(root) = project_root(&key) else {
+            return;
+        };
+        let multi_workspace = self.multi_workspace.clone();
+        let panel = cx.entity().downgrade();
+        window.defer(cx, move |window, cx| {
+            let Some(multi_workspace) = multi_workspace.upgrade() else {
+                return;
+            };
+            let leaving = multi_workspace.read(cx).workspace().clone();
+            let opened = multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.find_or_create_local_workspace(
+                    PathList::new(std::slice::from_ref(&root)),
+                    Some(key.clone()),
+                    None,
+                    OpenMode::Activate,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+            window
+                .spawn(cx, async move |cx| {
+                    let workspace = match opened.await {
+                        Ok(workspace) => workspace,
+                        Err(error) => {
+                            log::error!("opening the project {}: {error:#}", root.display());
+                            leaving.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!("Could not open “{}”: {error:#}", root.display()),
+                                    cx,
+                                );
+                            });
+                            return anyhow::Ok(());
+                        }
+                    };
+                    // A project's repository is found after the project is
+                    // open, so it is waited for rather than assumed.
+                    let open = OpenWorktree {
+                        workspace: workspace.clone(),
+                        root: Some(root.clone()),
+                    };
+                    let mut repository = None;
+                    for _ in 0..REPOSITORY_ATTEMPTS {
+                        repository = cx.update(|_, cx| workspace_repository(&open, cx))?;
+                        if repository.is_some() {
+                            break;
+                        }
+                        cx.background_executor().timer(REPOSITORY_RETRY).await;
+                    }
+                    let Some(repository) = repository else {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!("“{}” is not a git repository.", root.display()),
+                                cx,
+                            );
+                        });
+                        return anyhow::Ok(());
+                    };
+                    panel.update_in(cx, |panel, window, cx| {
+                        panel.add_worktree(
+                            workspace,
+                            repository,
+                            key,
+                            issue,
+                            start_agent,
+                            window,
+                            cx,
+                        );
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+        });
+    }
+
     /// Creates a worktree for a Linear issue: asks which project it is for
     /// when the window has more than one, then asks for the name as
     /// [`Self::add_worktree`] does, with the issue already linked.
@@ -1294,23 +1393,6 @@ impl WorktreePanel {
         let Some(linear) = Linear::global(cx) else {
             return;
         };
-        // Only projects a worktree can be made in: an open one, since making
-        // one is something the repository does.
-        let targets: Vec<ProjectTarget> = self
-            .tree(cx)
-            .into_iter()
-            .filter_map(|row| {
-                Some(ProjectTarget {
-                    from: row
-                        .worktrees
-                        .iter()
-                        .find_map(|worktree| worktree.switch_from.clone())?,
-                    repository: row.repository?,
-                    name: row.name,
-                    key: row.key,
-                })
-            })
-            .collect();
         let issue = linear.read_with(cx, |linear, cx| linear.issue(&identifier, cx));
         let workspace = self.workspace.clone();
 
@@ -1328,7 +1410,7 @@ impl WorktreePanel {
                 }
             };
             this.update_in(cx, |this, window, cx| {
-                let mut targets = targets;
+                let mut targets = this.project_targets(&issue, cx);
                 match targets.len() {
                     0 => {
                         workspace
@@ -1342,21 +1424,75 @@ impl WorktreePanel {
                     }
                     1 => {
                         let target = targets.remove(0);
-                        this.add_worktree(
-                            target.from,
-                            target.repository,
-                            target.key,
-                            Some(issue),
-                            start_agent,
-                            window,
-                            cx,
-                        );
+                        this.add_worktree_to_target(target, Some(issue), start_agent, window, cx);
                     }
                     _ => this.choose_project(targets, issue, start_agent, window, cx),
                 }
             })
         })
         .detach_and_log_err(cx);
+    }
+
+    /// The projects a worktree for `issue` can go in.
+    ///
+    /// The projects whose Linear team is the issue's, open or not. Where none
+    /// has been given that team, every open project: an issue does not say
+    /// which repository its work happens in, and making a worktree is the
+    /// repository's own doing, which only an open project has one to ask.
+    fn project_targets(&self, issue: &Issue, cx: &App) -> Vec<ProjectTarget> {
+        let store = WorktreeMetadataStore::try_global(cx);
+        let targets: Vec<(ProjectTarget, bool)> = self
+            .tree(cx)
+            .into_iter()
+            .map(|row| {
+                let matches_team = project_root(&row.key)
+                    .zip(store.as_ref())
+                    .and_then(|(root, store)| store.read(cx).get(&root, cx).linear_team)
+                    .is_some_and(|team| team.id == issue.team.id.as_ref());
+                let open = row
+                    .worktrees
+                    .iter()
+                    .find_map(|worktree| worktree.switch_from.clone())
+                    .zip(row.repository);
+                (
+                    ProjectTarget {
+                        name: row.name,
+                        open,
+                        key: row.key,
+                    },
+                    matches_team,
+                )
+            })
+            .collect();
+        if targets.iter().any(|(_, matches_team)| *matches_team) {
+            targets
+                .into_iter()
+                .filter(|(_, matches_team)| *matches_team)
+                .map(|(target, _)| target)
+                .collect()
+        } else {
+            targets
+                .into_iter()
+                .map(|(target, _)| target)
+                .filter(|target| target.open.is_some())
+                .collect()
+        }
+    }
+
+    fn add_worktree_to_target(
+        &mut self,
+        target: ProjectTarget,
+        issue: Option<Arc<Issue>>,
+        start_agent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match target.open {
+            Some((from, repository)) => {
+                self.add_worktree(from, repository, target.key, issue, start_agent, window, cx)
+            }
+            None => self.add_worktree_to_closed_project(target.key, issue, start_agent, window, cx),
+        }
     }
 
     /// Asks which project a worktree for `issue` goes in. Opened on the
@@ -1385,10 +1521,8 @@ impl WorktreePanel {
                         let issue = issue.clone();
                         panel
                             .update(cx, |panel, cx| {
-                                panel.add_worktree(
-                                    target.from,
-                                    target.repository,
-                                    target.key,
+                                panel.add_worktree_to_target(
+                                    target,
                                     Some(issue),
                                     start_agent,
                                     window,
@@ -1645,12 +1779,20 @@ impl WorktreePanel {
         // Asked of the repository's git directory rather than of `repository`,
         // which can be the worktree's own checkout and so gone by then.
         let common_dir = repository.read(cx).snapshot().common_dir_abs_path.to_path_buf();
-        let branch = self
+        let deleted = self
             .tree(cx)
             .into_iter()
             .flat_map(|row| row.worktrees)
-            .find(|worktree| worktree.root.as_deref() == Some(root.as_path()))
-            .and_then(|worktree| worktree.branch);
+            .find(|worktree| worktree.root.as_deref() == Some(root.as_path()));
+        let branch = deleted.as_ref().and_then(|worktree| worktree.branch.clone());
+        // Offered to be closed only while it is open, and only when there is
+        // a connection to close it through.
+        let issue = deleted
+            .and_then(|worktree| worktree.issue)
+            .filter(|issue| !issue.state.kind.is_closed())
+            .filter(|_| {
+                Linear::global(cx).is_some_and(|linear| linear.read(cx).is_connected())
+            });
 
         cx.spawn_in(window, async move |this, cx| {
             let nested = cx
@@ -1671,18 +1813,20 @@ impl WorktreePanel {
                         .join(", ")
                 ));
             }
-            let confirmed = cx.update(|window, cx| {
-                window.prompt(
-                    gpui::PromptLevel::Warning,
-                    &format!("Delete the worktree “{name}”?"),
-                    Some(&detail),
-                    &["Delete", "Cancel"],
-                    cx,
-                )
+            let (answer, answered) = futures::channel::oneshot::channel();
+            let host = multi_workspace
+                .update(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
+            cx.update(|window, cx| {
+                host.update(cx, |host, cx| {
+                    host.toggle_modal(window, cx, |_, cx| {
+                        DeleteWorktree::new(name.clone(), detail, issue.clone(), answer, cx)
+                    });
+                });
             })?;
-            if confirmed.await? != 0 {
+            // Dismissing the dialog drops the sender, which is a no.
+            let Ok(close_issue) = answered.await else {
                 return anyhow::Ok(());
-            }
+            };
 
             // Closing can stop to ask about unsaved changes, and answering no
             // means the worktree stays. Deleting the directory anyway would
@@ -1776,6 +1920,27 @@ impl WorktreePanel {
             })?;
             this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
                 .ok();
+
+            if close_issue && let Some(issue) = issue {
+                let identifier = issue.identifier.clone();
+                let closing = cx.update(|_, cx| {
+                    Linear::global(cx)
+                        .map(|linear| linear.update(cx, |linear, cx| linear.close_issue(issue, cx)))
+                })?;
+                if let Some(closing) = closing
+                    && let Err(error) = closing.await
+                {
+                    log::error!("closing the Linear issue {identifier}: {error:#}");
+                    host.update(cx, |host, cx| {
+                        host.show_error(
+                            format!(
+                                "Deleted the worktree, but could not close {identifier} in Linear: {error:#}"
+                            ),
+                            cx,
+                        );
+                    });
+                }
+            }
             anyhow::Ok(())
         })
         .detach_and_log_err(cx);
@@ -2040,27 +2205,29 @@ impl WorktreePanel {
             .end_slot(
                 h_flex()
                     .gap_0p5()
-                    // Creating a worktree is the repository's own doing, and
-                    // there is no repository to ask while the project is
-                    // closed.
-                    .when_some(add, |this, (from, repository)| {
-                        this.child(
-                            IconButton::new(("add-worktree", index), IconName::Plus)
-                                .icon_size(IconSize::Small)
-                                .tooltip(Tooltip::text("New Worktree"))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.add_worktree(
-                                        from.clone(),
-                                        repository.clone(),
-                                        add_key.clone(),
-                                        None,
-                                        false,
-                                        window,
-                                        cx,
-                                    );
-                                })),
-                        )
-                    })
+                    .child(
+                        IconButton::new(("add-worktree", index), IconName::Plus)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("New Worktree"))
+                            .on_click(cx.listener(move |this, _, window, cx| match &add {
+                                Some((from, repository)) => this.add_worktree(
+                                    from.clone(),
+                                    repository.clone(),
+                                    add_key.clone(),
+                                    None,
+                                    false,
+                                    window,
+                                    cx,
+                                ),
+                                None => this.add_worktree_to_closed_project(
+                                    add_key.clone(),
+                                    None,
+                                    false,
+                                    window,
+                                    cx,
+                                ),
+                            })),
+                    )
                     .child(
                         IconButton::new(("remove-project", index), IconName::Close)
                             .icon_size(IconSize::Small)
@@ -2092,7 +2259,57 @@ impl WorktreePanel {
         cx: &mut Context<Self>,
     ) {
         let store = WorktreeMetadataStore::global(cx);
+        let current_team = store.read(cx).get(&root, cx).linear_team;
+        let teams: Vec<linear::Team> = Linear::global(cx)
+            .map(|linear| linear.read(cx).catalog().teams.clone())
+            .unwrap_or_default();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
+            let team_store = store.clone();
+            let team_root = root.clone();
+            let menu = menu.submenu("Linear Team", move |mut menu, _, _| {
+                let none_store = team_store.clone();
+                let none_root = team_root.clone();
+                menu = menu.toggleable_entry(
+                    "None",
+                    current_team.is_none(),
+                    IconPosition::End,
+                    None,
+                    move |_, cx| {
+                        none_store.update(cx, |store, cx| {
+                            store.update(&none_root, |metadata| metadata.linear_team = None, cx)
+                        });
+                    },
+                );
+                for team in &teams {
+                    let chosen = LinearTeam {
+                        id: team.id.to_string(),
+                        key: team.key.to_string(),
+                        name: team.name.to_string(),
+                    };
+                    let selected = current_team
+                        .as_ref()
+                        .is_some_and(|current| current.id == chosen.id);
+                    let team_store = team_store.clone();
+                    let team_root = team_root.clone();
+                    menu = menu.toggleable_entry(
+                        format!("{} ({})", team.name, team.key),
+                        selected,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            let chosen = chosen.clone();
+                            team_store.update(cx, |store, cx| {
+                                store.update(
+                                    &team_root,
+                                    |metadata| metadata.linear_team = Some(chosen),
+                                    cx,
+                                )
+                            });
+                        },
+                    );
+                }
+                menu
+            });
             menu.submenu("Icon", move |mut menu, _, _| {
                 for (icon, label) in PROJECT_ICONS {
                     let store = store.clone();
@@ -2870,8 +3087,9 @@ fn plan_rows(
 /// A description can be typed in place of a name. It becomes the worktree's
 /// title, and the name is made from it; see [`name_from_description`].
 ///
-/// With Linear connected, an issue can be linked first, and linking one names
-/// the worktree after the branch Linear suggests for it. The name stays
+/// With Linear connected and a Linear team set on the project, an issue of
+/// that team can be linked first, and linking one names the worktree after the
+/// branch Linear suggests for it. A project with no team offers only the name. The name stays
 /// editable — the issue is linked through the branch name, so a name that no
 /// longer carries the identifier is a worktree Linear will not find, but that
 /// is the user's call to make.
@@ -2880,7 +3098,8 @@ struct NameWorktree {
     /// The project's worktree directory, shown so that the layout Bench
     /// imposes is visible before the worktree is made.
     directory: PathBuf,
-    /// Absent when Linear is not connected, and the modal is just the name.
+    /// Absent when Linear is not connected or the project has no team, and the
+    /// modal is just the name.
     issue_search: Option<IssueSearch>,
     linked: Option<Arc<Issue>>,
     confirm:
@@ -2889,6 +3108,8 @@ struct NameWorktree {
 
 struct IssueSearch {
     linear: Entity<Linear>,
+    /// Linear's id of the team the search is limited to.
+    team: SharedString,
     field: Entity<InputField>,
     results: Vec<Arc<Issue>>,
     selected: usize,
@@ -2897,6 +3118,11 @@ struct IssueSearch {
     _search: Task<()>,
     _subscription: gpui::Subscription,
 }
+
+/// How often, and for how long, a project that was just opened is asked for
+/// its repository.
+const REPOSITORY_RETRY: Duration = Duration::from_millis(100);
+const REPOSITORY_ATTEMPTS: usize = 50;
 
 /// How many issues the picker lists. It is a picker, not the panel: past a
 /// handful, typing is quicker than scrolling.
@@ -2908,6 +3134,7 @@ const ISSUE_SEARCH_DEBOUNCE: Duration = Duration::from_millis(200);
 impl NameWorktree {
     fn new(
         directory: PathBuf,
+        team: Option<LinearTeam>,
         issue: Option<Arc<Issue>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2924,9 +3151,10 @@ impl NameWorktree {
 
         let issue_search = Linear::global(cx)
             .filter(|linear| linear.read(cx).is_connected())
-            .map(|linear| {
+            .zip(team)
+            .map(|(linear, team)| {
                 let field = cx.new(|cx| {
-                    InputField::new(window, cx, "Link a Linear issue…")
+                    InputField::new(window, cx, &format!("Link a {} issue…", team.key))
                         .start_icon(IconName::MagnifyingGlass)
                 });
                 let modal = cx.entity().downgrade();
@@ -2944,6 +3172,7 @@ impl NameWorktree {
                 );
                 IssueSearch {
                     linear,
+                    team: team.id.into(),
                     field,
                     results: Vec::new(),
                     selected: 0,
@@ -2983,7 +3212,12 @@ impl NameWorktree {
             let Ok(found) = this.update(cx, |this, cx| {
                 this.issue_search
                     .as_ref()
-                    .map(|search| search.linear.read(cx).search(&query, cx))
+                    .map(|search| {
+                        search
+                            .linear
+                            .read(cx)
+                            .search(&query, Some(&search.team), cx)
+                    })
             }) else {
                 return;
             };
@@ -3285,11 +3519,142 @@ impl Render for EditTitle {
     }
 }
 
+/// Asks whether to delete a worktree, and whether to close its Linear issue
+/// along with it.
+///
+/// Answered through `answer`: sending `true` or `false` is a yes, with or
+/// without closing the issue. Any other way out drops the sender, which is a
+/// no.
+struct DeleteWorktree {
+    name: SharedString,
+    detail: String,
+    /// The worktree's issue, when it is one still open and there is a Linear
+    /// to close it in.
+    issue: Option<Arc<Issue>>,
+    close_issue: bool,
+    answer: Option<futures::channel::oneshot::Sender<bool>>,
+    focus_handle: FocusHandle,
+}
+
+impl DeleteWorktree {
+    fn new(
+        name: SharedString,
+        detail: String,
+        issue: Option<Arc<Issue>>,
+        answer: futures::channel::oneshot::Sender<bool>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            name,
+            detail,
+            issue,
+            // Deleting the worktree is usually the end of the work, and an
+            // issue left open after it is one nobody will come back to.
+            close_issue: true,
+            answer: Some(answer),
+            focus_handle: cx.focus_handle(),
+        }
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(answer) = self.answer.take() {
+            answer.send(self.issue.is_some() && self.close_issue).ok();
+        }
+        cx.emit(DismissEvent);
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+}
+
+impl Focusable for DeleteWorktree {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DismissEvent> for DeleteWorktree {}
+
+impl ModalView for DeleteWorktree {}
+
+impl Render for DeleteWorktree {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let close_issue = self.close_issue;
+        v_flex()
+            .key_context("DeleteWorktree")
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .elevation_3(cx)
+            .w(rems(34.))
+            .p_3()
+            .gap_2()
+            .child(Label::new(format!("Delete the worktree “{}”?", self.name)))
+            .child(
+                Label::new(self.detail.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Muted),
+            )
+            .children(self.issue.as_ref().map(|issue| {
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Checkbox::new(
+                            "close-issue",
+                            if close_issue {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
+                            this.close_issue = state.selected();
+                            cx.notify();
+                        })),
+                    )
+                    .child(
+                        Label::new(format!("Close {} in Linear", issue.identifier))
+                            .size(LabelSize::Small),
+                    )
+                    .child(
+                        div().flex_1().min_w_0().child(
+                            Label::new(issue.title.clone())
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate(),
+                        ),
+                    )
+            }))
+            .child(
+                h_flex()
+                    .justify_end()
+                    .gap_1()
+                    .child(
+                        Button::new("cancel-delete", "Cancel")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel(&menu::Cancel, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-delete", "Delete")
+                            .style(ButtonStyle::Tinted(TintColor::Error))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm(&menu::Confirm, window, cx)
+                            })),
+                    ),
+            )
+    }
+}
+
 /// A project a worktree can be made in, for [`ChooseProject`].
 struct ProjectTarget {
     name: SharedString,
-    from: Entity<Workspace>,
-    repository: Entity<Repository>,
+    /// A workspace showing the project and its repository, which only an open
+    /// project has; see [`WorktreePanel::add_worktree_to_closed_project`] for
+    /// the rest.
+    open: Option<(Entity<Workspace>, Entity<Repository>)>,
     key: ProjectGroupKey,
 }
 
@@ -4390,6 +4755,7 @@ impl Render for WorktreePanel {
             });
         }
         let mut worktree_index = 0;
+        let scroll = cx.default_global::<PanelView>().scroll.clone();
 
         v_flex()
             .key_context("WorktreePanel")
@@ -4431,6 +4797,7 @@ impl Render for WorktreePanel {
             .child(
                 v_flex()
                     .id("worktree-tree")
+                    .track_scroll(&scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -5000,6 +5367,12 @@ mod tests {
         (fs, multi_workspace, fix, panel, cx)
     }
 
+    /// Says yes to the dialog `delete_worktree` opens.
+    fn confirm_delete(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        cx.dispatch_action(menu::Confirm);
+    }
+
     fn delete_fix(panel: &Entity<WorktreePanel>, cx: &mut VisualTestContext) {
         let row = panel.read_with(cx, |panel, cx| {
             panel
@@ -5077,10 +5450,19 @@ mod tests {
         });
 
         delete_fix(&panel, &mut cx);
-        let (_, detail) = cx.pending_prompt().expect("the question");
+        let detail = multi_workspace.update(&mut cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_modal::<DeleteWorktree>(cx)
+                .expect("the question")
+                .read(cx)
+                .detail
+                .clone()
+        });
         assert!(detail.contains("repos/inner"), "{detail}");
         assert!(detail.contains("Its branch “fix” is deleted too."), "{detail}");
-        cx.simulate_prompt_answer("Delete");
+        confirm_delete(&mut cx);
         cx.run_until_parked();
 
         assert!(!cx.has_pending_prompt(), "nothing refused, so nothing more to ask");
@@ -5116,7 +5498,7 @@ mod tests {
         .expect("the outer repository");
 
         delete_fix(&panel, &mut cx);
-        cx.simulate_prompt_answer("Delete");
+        confirm_delete(&mut cx);
         cx.run_until_parked();
 
         assert!(!cx.has_pending_prompt(), "nothing more to ask");
@@ -5142,7 +5524,7 @@ mod tests {
         .expect("the clone's repository");
 
         delete_fix(&panel, &mut cx);
-        cx.simulate_prompt_answer("Delete");
+        confirm_delete(&mut cx);
         cx.run_until_parked();
 
         let (title, detail) = cx.pending_prompt().expect("a warning");
@@ -5177,7 +5559,7 @@ mod tests {
         cx.run_until_parked();
 
         delete_fix(&panel, &mut cx);
-        cx.simulate_prompt_answer("Delete");
+        confirm_delete(&mut cx);
         cx.run_until_parked();
 
         assert!(!fs.is_dir(Path::new("/wt/fix")).await);
