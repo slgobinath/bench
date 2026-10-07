@@ -197,8 +197,27 @@ struct Watched {
     model: Option<claude_model::Probe>,
 }
 
+/// An agent in a terminal-host session that no `Terminal` in this process is
+/// attached to. After a restart that is every agent outside the workspaces
+/// Bench reopened, which keep running in the daemon the whole time.
+#[derive(Clone)]
+struct Detached {
+    session_id: String,
+    directory: PathBuf,
+    state: AgentState,
+    model: Option<claude_model::Probe>,
+}
+
+/// What the background half of a sweep found for one detached session.
+struct DetachedFound {
+    session_id: String,
+    directory: PathBuf,
+    model: Option<claude_model::Probe>,
+}
+
 pub struct AgentTracker {
     watched: HashMap<EntityId, Watched>,
+    detached: Vec<Detached>,
     reports: hooks::HookReports,
     awake: awake::AwakeGuard,
     /// The user's toggle, off the status bar button. Separate from "is the
@@ -256,6 +275,7 @@ impl AgentTracker {
 
         Self {
             watched: HashMap::new(),
+            detached: Vec::new(),
             reports: hooks::HookReports::default(),
             awake: awake::AwakeGuard::new(),
             keep_awake: AgentSettings::get_global(cx).keep_awake,
@@ -272,12 +292,19 @@ impl AgentTracker {
                 }
                 loop {
                     cx.background_executor().timer(SWEEP).await;
-                    let Ok((offset, usage_modified, model_requests)) =
-                        this.read_with(cx, |this, _| {
+                    let Ok((offset, usage_modified, model_requests, agent_commands, previous_models)) =
+                        this.read_with(cx, |this, cx| {
                             (
                                 this.reports.offset(),
                                 this.claude_usage_modified,
                                 this.model_requests(),
+                                AgentSettings::get_global(cx).commands.clone(),
+                                this.detached
+                                    .iter()
+                                    .map(|detached| {
+                                        (detached.session_id.clone(), detached.model.clone())
+                                    })
+                                    .collect::<HashMap<_, _>>(),
                             )
                         })
                     else {
@@ -286,7 +313,7 @@ impl AgentTracker {
                     // Off the main thread: this is a `stat` or two every
                     // second, and occasionally a read, on a thread that has
                     // frames to draw.
-                    let (appended, usage, models) = cx
+                    let (appended, usage, models, detached) = cx
                         .background_spawn(async move {
                             let models: Vec<_> = model_requests
                                 .into_iter()
@@ -298,6 +325,7 @@ impl AgentTracker {
                                 hooks::read_appended(offset, EVENTS_MAX_BYTES),
                                 claude_usage::read_if_changed(usage_modified),
                                 models,
+                                find_detached(&agent_commands, &previous_models),
                             )
                         })
                         .await;
@@ -306,6 +334,7 @@ impl AgentTracker {
                             this.take_models(models, cx);
                             this.take_claude_usage(usage, cx);
                             this.sweep(appended, cx);
+                            this.take_detached(detached, cx);
                         })
                         .is_err()
                     {
@@ -343,6 +372,49 @@ impl AgentTracker {
                 != probe.as_ref().and_then(|probe| probe.model.as_ref());
             watched.model = probe;
         }
+        if changed {
+            cx.emit(AgentsChanged);
+            cx.notify();
+        }
+    }
+
+    /// Runs after `sweep` so the hook reports it reads include this pass's.
+    fn take_detached(&mut self, found: Vec<DetachedFound>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let detached: Vec<Detached> = found
+            .into_iter()
+            .map(|found| {
+                // Without a terminal there is no output to judge by, so only a
+                // hook can say more than "an agent is there".
+                let state = self
+                    .reports
+                    .for_directory(&found.directory)
+                    .filter(|report| is_trusted(report, now))
+                    .map_or(AgentState::Idle, |report| report.state);
+                Detached {
+                    session_id: found.session_id,
+                    directory: found.directory,
+                    state,
+                    model: found.model,
+                }
+            })
+            .collect();
+
+        let describe = |detached: &[Detached]| {
+            detached
+                .iter()
+                .map(|detached| {
+                    (
+                        detached.session_id.clone(),
+                        detached.directory.clone(),
+                        detached.state,
+                        detached.model.as_ref().and_then(|probe| probe.model.clone()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let changed = describe(&self.detached) != describe(&detached);
+        self.detached = detached;
         if changed {
             cx.emit(AgentsChanged);
             cx.notify();
@@ -491,6 +563,11 @@ impl AgentTracker {
                 summary.count(watched.state);
             }
         }
+        for detached in &self.detached {
+            if detached.directory.starts_with(directory) {
+                summary.count(detached.state);
+            }
+        }
         summary
     }
 
@@ -507,6 +584,16 @@ impl AgentTracker {
                 continue;
             }
             if let Some(model) = watched.model.as_ref().and_then(|probe| probe.model.clone())
+                && !models.contains(&model)
+            {
+                models.push(model);
+            }
+        }
+        for detached in &self.detached {
+            if !detached.directory.starts_with(directory) {
+                continue;
+            }
+            if let Some(model) = detached.model.as_ref().and_then(|probe| probe.model.clone())
                 && !models.contains(&model)
             {
                 models.push(model);
@@ -539,6 +626,9 @@ impl AgentTracker {
             if watched.command.is_some() {
                 summary.count(watched.state);
             }
+        }
+        for detached in &self.detached {
+            summary.count(detached.state);
         }
         summary
     }
@@ -676,6 +766,41 @@ fn announcement(
 /// the prompt redraws as you type in it, and redrawing is what the heuristic
 /// calls work. A session that ended is no agent at all, which the foreground
 /// process says, whatever its last report was.
+/// The agents in daemon sessions nothing is attached to. An attached session
+/// is already covered by its `Terminal`, in this process or another Bench's.
+fn find_detached(
+    agent_commands: &[SharedString],
+    previous_models: &HashMap<String, Option<claude_model::Probe>>,
+) -> Vec<DetachedFound> {
+    let Some(host) = terminal_host::host() else {
+        return Vec::new();
+    };
+    let sessions = match host.sessions() {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            log::debug!("listing terminal host sessions: {error:#}");
+            return Vec::new();
+        }
+    };
+    sessions
+        .into_iter()
+        .filter(|session| !session.attached)
+        .filter_map(|session| {
+            let foreground = terminal::session_foreground(session.pid)?;
+            let command = foreground.command?;
+            if !agent_commands.iter().any(|agent| *agent == command) {
+                return None;
+            }
+            let previous = previous_models.get(&session.id).and_then(Option::as_ref);
+            Some(DetachedFound {
+                model: claude_model::probe(&foreground.directory, previous),
+                directory: foreground.directory,
+                session_id: session.id,
+            })
+        })
+        .collect()
+}
+
 fn is_trusted(report: &hooks::Report, now: Instant) -> bool {
     report.state == AgentState::Idle || now.duration_since(report.at) < REPORT_TRUSTED_FOR
 }

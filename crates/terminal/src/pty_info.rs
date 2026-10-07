@@ -260,6 +260,37 @@ impl PtyProcessInfo {
     }
 }
 
+/// What is in the foreground of a persistent session, found from the session's
+/// shell alone, for sessions that no `Terminal` is attached to.
+pub struct SessionForeground {
+    pub command: Option<String>,
+    pub directory: PathBuf,
+}
+
+pub fn session_foreground(leader: u32) -> Option<SessionForeground> {
+    let leader = Pid::from_u32(leader);
+    let pid = foreground_process_group(leader).unwrap_or(leader);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_cwd(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let process = system.process(pid)?;
+    let argv: Vec<String> = process
+        .cmd()
+        .iter()
+        .filter_map(|argument| argument.to_str().map(ToOwned::to_owned))
+        .collect();
+    Some(SessionForeground {
+        command: crate::foreground_process_command_from_argv(&argv),
+        directory: process.cwd()?.to_owned(),
+    })
+}
+
 /// The foreground process group of the terminal `leader` controls.
 #[cfg(target_os = "macos")]
 fn foreground_process_group(leader: Pid) -> Option<Pid> {

@@ -862,6 +862,15 @@ impl MultiWorkspace {
             .collect()
     }
 
+    /// How recently `workspace` was displayed: later activations have larger
+    /// values, and `None` is a workspace this window has never displayed.
+    pub fn activation_stamp(&self, workspace: &Entity<Workspace>) -> Option<u64> {
+        self.held
+            .iter()
+            .find(|held| held.workspace == *workspace)
+            .and_then(|held| held.activated_at)
+    }
+
     pub fn last_active_workspace_for_group(
         &self,
         key: &ProjectGroupKey,

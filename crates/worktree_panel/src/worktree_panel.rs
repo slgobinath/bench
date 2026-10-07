@@ -23,6 +23,8 @@
 //! the only owner of the workspace and project list, and a second copy of it
 //! here would be a second thing to keep honest.
 
+mod worktree_switcher;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -73,6 +75,8 @@ actions!(
         Toggle,
         /// Moves focus to the worktree panel's filter box.
         FocusFilter,
+        /// Opens a palette of the open worktrees, most recently shown first.
+        OpenSwitcher,
     ]
 );
 
@@ -128,6 +132,9 @@ pub fn init(cx: &mut App) {
             if !workspace.toggle_panel_focus::<WorktreePanel>(window, cx) {
                 workspace.close_panel::<WorktreePanel>(window, cx);
             }
+        });
+        workspace.register_action(|workspace, _: &OpenSwitcher, window, cx| {
+            worktree_switcher::open(workspace, window, cx);
         });
         // Deferred because working out which projects there are to create
         // in reads every workspace of the window, this one included, and an

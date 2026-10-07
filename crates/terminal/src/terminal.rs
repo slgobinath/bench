@@ -3,6 +3,7 @@ mod mappings;
 mod alacritty;
 mod pty_info;
 pub mod terminal_settings;
+pub use pty_info::{SessionForeground, session_foreground};
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
