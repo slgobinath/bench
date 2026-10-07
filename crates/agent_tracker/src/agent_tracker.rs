@@ -29,6 +29,7 @@
 //!   see [`awake`].
 
 pub mod awake;
+pub mod claude_model;
 pub mod claude_usage;
 pub mod hooks;
 mod keep_awake_button;
@@ -44,6 +45,7 @@ use gpui::{
 use settings::Settings as _;
 use terminal::Terminal;
 
+pub use claude_model::{ClaudeModel, ModelFamily};
 pub use claude_usage::{ClaudeUsage, ClaudeUsageButton};
 pub use keep_awake_button::{KeepAwakeButton, ToggleKeepAwake, agent_state_color};
 
@@ -190,6 +192,9 @@ struct Watched {
     had_agent: bool,
     /// When the current stint of work began, while the agent is working.
     working_since: Option<Instant>,
+    /// What the newest Claude Code transcript in this terminal's directory
+    /// says about the model; see [`claude_model`].
+    model: Option<claude_model::Probe>,
 }
 
 pub struct AgentTracker {
@@ -267,24 +272,38 @@ impl AgentTracker {
                 }
                 loop {
                     cx.background_executor().timer(SWEEP).await;
-                    let Ok((offset, usage_modified)) = this.read_with(cx, |this, _| {
-                        (this.reports.offset(), this.claude_usage_modified)
-                    }) else {
+                    let Ok((offset, usage_modified, model_requests)) =
+                        this.read_with(cx, |this, _| {
+                            (
+                                this.reports.offset(),
+                                this.claude_usage_modified,
+                                this.model_requests(),
+                            )
+                        })
+                    else {
                         return;
                     };
                     // Off the main thread: this is a `stat` or two every
                     // second, and occasionally a read, on a thread that has
                     // frames to draw.
-                    let (appended, usage) = cx
+                    let (appended, usage, models) = cx
                         .background_spawn(async move {
+                            let models: Vec<_> = model_requests
+                                .into_iter()
+                                .map(|(terminal, directory, previous)| {
+                                    (terminal, claude_model::probe(&directory, previous.as_ref()))
+                                })
+                                .collect();
                             (
                                 hooks::read_appended(offset, EVENTS_MAX_BYTES),
                                 claude_usage::read_if_changed(usage_modified),
+                                models,
                             )
                         })
                         .await;
                     if this
                         .update(cx, |this, cx| {
+                            this.take_models(models, cx);
                             this.take_claude_usage(usage, cx);
                             this.sweep(appended, cx);
                         })
@@ -295,6 +314,38 @@ impl AgentTracker {
                 }
             }),
             _subscriptions: subscriptions,
+        }
+    }
+
+    /// The terminals with an agent in them, for the sweep to look up the model
+    /// of off the main thread: where each is, and what was found last time.
+    fn model_requests(&self) -> Vec<(EntityId, PathBuf, Option<claude_model::Probe>)> {
+        self.watched
+            .iter()
+            .filter(|(_, watched)| watched.command.is_some())
+            .filter_map(|(id, watched)| {
+                Some((*id, watched.directory.clone()?, watched.model.clone()))
+            })
+            .collect()
+    }
+
+    fn take_models(
+        &mut self,
+        models: Vec<(EntityId, Option<claude_model::Probe>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        for (terminal, probe) in models {
+            let Some(watched) = self.watched.get_mut(&terminal) else {
+                continue;
+            };
+            changed |= watched.model.as_ref().and_then(|probe| probe.model.as_ref())
+                != probe.as_ref().and_then(|probe| probe.model.as_ref());
+            watched.model = probe;
+        }
+        if changed {
+            cx.emit(AgentsChanged);
+            cx.notify();
         }
     }
 
@@ -325,6 +376,7 @@ impl AgentTracker {
                 bell: false,
                 had_agent: false,
                 working_since: None,
+                model: None,
             },
         );
     }
@@ -361,6 +413,7 @@ impl AgentTracker {
                 watched.command = None;
                 watched.had_agent = false;
                 watched.working_since = None;
+                watched.model = None;
                 changed |= was.is_some();
                 return true;
             };
@@ -439,6 +492,36 @@ impl AgentTracker {
             }
         }
         summary
+    }
+
+    /// The models the agents inside `directory` are using, each once.
+    pub fn models_for(&self, directory: &Path) -> Vec<ClaudeModel> {
+        let mut models: Vec<ClaudeModel> = Vec::new();
+        for watched in self.watched.values() {
+            if watched.command.is_none()
+                || !watched
+                    .directory
+                    .as_deref()
+                    .is_some_and(|agent_directory| agent_directory.starts_with(directory))
+            {
+                continue;
+            }
+            if let Some(model) = watched.model.as_ref().and_then(|probe| probe.model.clone())
+                && !models.contains(&model)
+            {
+                models.push(model);
+            }
+        }
+        models
+    }
+
+    /// The model the agent in one terminal is using, if it has one and it is
+    /// known.
+    pub fn model_for(&self, terminal: EntityId) -> Option<ClaudeModel> {
+        self.watched
+            .get(&terminal)
+            .filter(|watched| watched.command.is_some())
+            .and_then(|watched| watched.model.as_ref()?.model.clone())
     }
 
     /// What the agent in one terminal is doing, if that terminal has one.

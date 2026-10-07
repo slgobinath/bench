@@ -29,7 +29,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use git::repository::{CreateWorktreeTarget, GitRepository, Worktree as GitWorktree};
-use agent_tracker::{AgentSummary, AgentTracker, AgentsChanged, agent_state_color};
+use agent_tracker::{
+    AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, agent_state_color,
+};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
 use linear::{Issue, Linear, LinearEvent};
@@ -192,6 +194,9 @@ struct WorktreeRow {
     /// The agents running in this worktree's terminals, counted by what they
     /// are doing.
     agents: AgentSummary,
+    /// The models those agents are using, each once; see
+    /// [`agent_tracker::claude_model`].
+    models: Vec<ClaudeModel>,
     /// The branch this worktree has checked out; see [`RowPlan::branch`].
     branch: Option<SharedString>,
     /// The issue Bench made this worktree for, as it stored it. It outlives
@@ -676,6 +681,12 @@ impl WorktreePanel {
                         .as_deref()
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).summary_for(root))
+                        .unwrap_or_default(),
+                    models: plan
+                        .root
+                        .as_deref()
+                        .zip(tracker.as_ref())
+                        .map(|(root, tracker)| tracker.read(cx).models_for(root))
                         .unwrap_or_default(),
                     linked_issue: stored.as_ref().and_then(|stored| stored.issue.clone()),
                     title: stored
@@ -2531,7 +2542,11 @@ impl WorktreePanel {
                                 .flex_none(),
                         )
                     }))
-                    .children(render_agents(index, &row.agents)),
+                    .children(render_agents(index, &row.agents))
+                    .children(row.models.iter().enumerate().map(|(position, model)| {
+                        let active = row.agents.working + row.agents.needs_input > 0;
+                        model.badge(("worktree-model", index * 8 + position), active)
+                    })),
             )
             // Always drawn, empty or not, so that every card is the same
             // height: a card with nothing more to say — the repository's own

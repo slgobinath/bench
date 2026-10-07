@@ -1659,6 +1659,19 @@ impl Item for TerminalView {
             None => (IconName::Terminal, Color::Muted, None),
         };
 
+        let terminal_id = self.terminal().entity_id();
+        let model = if terminal.task().is_none() && terminal.is_running_claude() {
+            AgentTracker::try_global(cx).and_then(|tracker| {
+                let tracker = tracker.read(cx);
+                let active = tracker
+                    .state_for(terminal_id)
+                    .is_some_and(|state| state != agent_tracker::AgentState::Idle);
+                Some((tracker.model_for(terminal_id)?, active))
+            })
+        } else {
+            None
+        };
+
         let self_handle = self.self_handle.clone();
         h_flex()
             .gap_1()
@@ -1726,6 +1739,9 @@ impl Item for TerminalView {
                         )
                     }),
             )
+            .children(model.map(|(model, active)| {
+                model.badge(("terminal-model", terminal_id.as_u64() as usize), active)
+            }))
             .into_any()
     }
 
