@@ -2834,8 +2834,9 @@ const CHEVRON_TURN: Duration = Duration::from_millis(120);
 
 /// The icons a project can be drawn with, by what each one says it is. A few
 /// that read as kinds of project rather than the whole icon set, most of which
-/// are actions and would make a project look like a button.
-const PROJECT_ICONS: [(IconName, &str); 28] = [
+/// are actions and would make a project look like a button, then the languages
+/// and frameworks a project can be written in.
+const PROJECT_ICONS: [(IconName, &str); 49] = [
     (IconName::Folder, "Folder"),
     (IconName::Code, "Code"),
     (IconName::Terminal, "Terminal"),
@@ -2864,6 +2865,27 @@ const PROJECT_ICONS: [(IconName, &str); 28] = [
     (IconName::Rocket, "Rocket"),
     (IconName::Flame, "Flame"),
     (IconName::Star, "Star"),
+    (IconName::LangC, "C"),
+    (IconName::LangCpp, "C++"),
+    (IconName::LangDart, "Dart / Flutter"),
+    (IconName::LangDocker, "Docker"),
+    (IconName::LangElixir, "Elixir"),
+    (IconName::LangGo, "Go"),
+    (IconName::LangHaskell, "Haskell"),
+    (IconName::LangJava, "Java"),
+    (IconName::LangJavascript, "JavaScript"),
+    (IconName::LangKotlin, "Kotlin"),
+    (IconName::LangLua, "Lua"),
+    (IconName::LangPhp, "PHP"),
+    (IconName::LangPython, "Python"),
+    (IconName::LangReact, "React"),
+    (IconName::LangRuby, "Ruby"),
+    (IconName::LangRust, "Rust"),
+    (IconName::LangScala, "Scala"),
+    (IconName::LangSwift, "Swift"),
+    (IconName::LangTypescript, "TypeScript"),
+    (IconName::LangVue, "Vue"),
+    (IconName::LangZig, "Zig"),
 ];
 
 /// The icon stored for a project, or the folder when none is, or when the one
