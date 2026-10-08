@@ -71,6 +71,7 @@ impl ProcessIdGetter {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProcessInfo {
+    pub(crate) pid: u32,
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) argv: Vec<String>,
@@ -205,6 +206,7 @@ impl PtyProcessInfo {
         let cwd = process.cwd().map_or(PathBuf::new(), |p| p.to_owned());
 
         let info = ProcessInfo {
+            pid: process.pid().as_u32(),
             name: process.name().to_str()?.to_owned(),
             cwd,
             argv: process
@@ -273,6 +275,7 @@ impl PtyProcessInfo {
 /// What is in the foreground of a persistent session, found from the session's
 /// shell alone, for sessions that no `Terminal` is attached to.
 pub struct SessionForeground {
+    pub pid: u32,
     pub command: Option<String>,
     /// The shell itself is in the foreground: the session is at its prompt.
     pub is_shell: bool,
@@ -305,6 +308,7 @@ pub fn session_foreground(leader: u32) -> Option<SessionForeground> {
         .filter_map(|argument| argument.to_str().map(ToOwned::to_owned))
         .collect();
     Some(SessionForeground {
+        pid: pid.as_u32(),
         command: crate::foreground_process_command_from_argv(&argv),
         is_shell: pid == leader,
         directory: process.cwd()?.to_owned(),

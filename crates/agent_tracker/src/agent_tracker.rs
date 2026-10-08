@@ -186,6 +186,9 @@ struct Watched {
     /// else — a shell, a build, nothing at all.
     command: Option<SharedString>,
     directory: Option<PathBuf>,
+    /// The agent's process, which names its own transcript; see
+    /// [`claude_model`].
+    process_id: Option<u32>,
     state: AgentState,
     /// When this terminal last produced output, which is the whole of the
     /// heuristic's evidence for "working".
@@ -205,6 +208,14 @@ struct Watched {
     /// The command in the foreground when it is neither an agent nor the
     /// shell at its prompt: a dev server, a build, a test run.
     running: Option<SharedString>,
+}
+
+/// What the sweep looks up the model of one terminal's agent from.
+struct ModelRequest {
+    terminal: EntityId,
+    directory: PathBuf,
+    process_id: Option<u32>,
+    previous: Option<claude_model::Probe>,
 }
 
 /// An agent in a terminal-host session that no `Terminal` in this process is
@@ -362,8 +373,15 @@ impl AgentTracker {
                         .background_spawn(async move {
                             let models: Vec<_> = model_requests
                                 .into_iter()
-                                .map(|(terminal, directory, previous)| {
-                                    (terminal, claude_model::probe(&directory, previous.as_ref()))
+                                .map(|request| {
+                                    (
+                                        request.terminal,
+                                        claude_model::probe(
+                                            &request.directory,
+                                            request.process_id,
+                                            request.previous.as_ref(),
+                                        ),
+                                    )
                                 })
                                 .collect();
                             let detached = find_detached(&agent_commands, &previous_models);
@@ -409,12 +427,17 @@ impl AgentTracker {
 
     /// The terminals with an agent in them, for the sweep to look up the model
     /// of off the main thread: where each is, and what was found last time.
-    fn model_requests(&self) -> Vec<(EntityId, PathBuf, Option<claude_model::Probe>)> {
+    fn model_requests(&self) -> Vec<ModelRequest> {
         self.watched
             .iter()
             .filter(|(_, watched)| watched.command.is_some())
             .filter_map(|(id, watched)| {
-                Some((*id, watched.directory.clone()?, watched.model.clone()))
+                Some(ModelRequest {
+                    terminal: *id,
+                    directory: watched.directory.clone()?,
+                    process_id: watched.process_id,
+                    previous: watched.model.clone(),
+                })
             })
             .collect()
     }
@@ -550,6 +573,7 @@ impl AgentTracker {
                 terminal: terminal.downgrade(),
                 command: None,
                 directory: None,
+                process_id: None,
                 state: AgentState::Idle,
                 last_output: Instant::now(),
                 bell: false,
@@ -598,6 +622,7 @@ impl AgentTracker {
 
             let Some(command) = command else {
                 watched.command = None;
+                watched.process_id = None;
                 watched.had_agent = false;
                 watched.working_since = None;
                 watched.model = None;
@@ -609,6 +634,7 @@ impl AgentTracker {
                 return true;
             };
             changed |= watched.running.take().is_some();
+            watched.process_id = terminal.read(cx).foreground_process_id();
 
             let reported = directory
                 .as_deref()
@@ -940,7 +966,7 @@ fn find_detached(
         if agent_commands.iter().any(|agent| *agent == command) {
             let previous = previous_models.get(&session.id).and_then(Option::as_ref);
             found.agents.push(DetachedFound {
-                model: claude_model::probe(&foreground.directory, previous),
+                model: claude_model::probe(&foreground.directory, Some(foreground.pid), previous),
                 directory: foreground.directory,
                 session_id: session.id,
             });

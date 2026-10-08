@@ -2974,6 +2974,13 @@ impl Terminal {
         }
     }
 
+    pub fn foreground_process_id(&self) -> Option<u32> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.current.read().as_ref().map(|process| process.pid),
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
     /// Whether the foreground process is the shell, so that the terminal is
     /// idle at a prompt. `None` when the foreground process is not known yet.
     pub fn foreground_process_is_shell(&self) -> Option<bool> {

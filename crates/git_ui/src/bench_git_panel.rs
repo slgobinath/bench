@@ -2417,8 +2417,12 @@ impl BenchGitPanel {
             .border_t_1()
             .border_color(cx.theme().colors().border_variant)
             .child(
+                // Takes what the buttons leave and clips inside it: without
+                // that a long branch name runs underneath them.
                 h_flex()
+                    .flex_1()
                     .min_w_0()
+                    .overflow_hidden()
                     .gap_1()
                     .child(
                         PopoverMenu::new("bench-repository-switcher")
@@ -2437,11 +2441,13 @@ impl BenchGitPanel {
                             .anchor(Anchor::BottomLeft),
                     )
                     .children(branch.map(|branch| {
-                        Label::new(branch)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line()
-                            .truncate()
+                        div().min_w_0().child(
+                            Label::new(branch)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .single_line()
+                                .truncate(),
+                        )
                     })),
             )
             .child(

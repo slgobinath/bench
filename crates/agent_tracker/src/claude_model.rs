@@ -14,8 +14,11 @@
 //! command, nothing to install. `/model` is recorded too, as a line saying what
 //! it was set to, so a switch shows before the next reply does.
 //!
-//! The newest transcript is a good guess rather than the session itself: two
-//! agents in one directory share it.
+//! Claude Code also writes `~/.claude/sessions/<pid>.json` for each running
+//! process, naming its session, so an agent's own transcript is found from its
+//! process id. Two agents in one directory then each show their own model.
+//! Without that file the newest transcript in the directory is a guess: two
+//! agents in one directory would share it.
 
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -149,8 +152,8 @@ impl ClaudeModel {
     }
 }
 
-/// What was found in a directory's newest transcript, kept so that a
-/// transcript that has not changed is not read again.
+/// What was found in an agent's transcript, kept so that a transcript that has
+/// not changed is not read again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Probe {
     path: PathBuf,
@@ -158,24 +161,27 @@ pub struct Probe {
     pub model: Option<ClaudeModel>,
 }
 
-/// The model of the newest Claude Code transcript for sessions run in
-/// `directory`. `None` where there is no transcript at all.
+/// The model of the Claude Code session in process `process_id`, or failing
+/// that of the newest transcript for sessions run in `directory`. `None`
+/// where there is no transcript at all.
 ///
 /// Blocking, for a background thread: it lists a directory and reads the end
 /// of a file.
-pub fn probe(directory: &Path, previous: Option<&Probe>) -> Option<Probe> {
-    let projects = paths::home_dir().join(".claude").join("projects");
-    probe_in(&projects, directory, previous)
+pub fn probe(directory: &Path, process_id: Option<u32>, previous: Option<&Probe>) -> Option<Probe> {
+    let claude = paths::home_dir().join(".claude");
+    probe_in(&claude, directory, process_id, previous)
 }
 
-fn probe_in(projects: &Path, directory: &Path, previous: Option<&Probe>) -> Option<Probe> {
-    let transcripts = projects.join(project_directory_name(directory));
-    let (path, modified) = std::fs::read_dir(&transcripts)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
-        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.modified().ok()?)))
-        .max_by_key(|(_, modified)| *modified)?;
+fn probe_in(
+    claude: &Path,
+    directory: &Path,
+    process_id: Option<u32>,
+    previous: Option<&Probe>,
+) -> Option<Probe> {
+    let projects = claude.join("projects");
+    let (path, modified) = process_id
+        .and_then(|process_id| session_transcript(claude, process_id))
+        .or_else(|| newest_transcript(&projects, directory))?;
 
     if let Some(previous) = previous
         && previous.path == path
@@ -195,6 +201,37 @@ fn probe_in(projects: &Path, directory: &Path, previous: Option<&Probe>) -> Opti
         modified,
         model,
     })
+}
+
+/// The transcript of the session a Claude Code process says it is running.
+/// The session's folder comes from where it was started, which is not
+/// necessarily where the process is now.
+fn session_transcript(claude: &Path, process_id: u32) -> Option<(PathBuf, SystemTime)> {
+    let record = std::fs::read_to_string(
+        claude
+            .join("sessions")
+            .join(format!("{process_id}.json")),
+    )
+    .ok()?;
+    let record: Value = serde_json::from_str(&record).ok()?;
+    let session_id = record.get("sessionId")?.as_str()?;
+    let started_in = record.get("cwd")?.as_str()?;
+    let path = claude
+        .join("projects")
+        .join(project_directory_name(Path::new(started_in)))
+        .join(format!("{session_id}.jsonl"));
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    Some((path, modified))
+}
+
+fn newest_transcript(projects: &Path, directory: &Path) -> Option<(PathBuf, SystemTime)> {
+    let transcripts = projects.join(project_directory_name(directory));
+    std::fs::read_dir(&transcripts)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| Some((entry.path(), entry.metadata().ok()?.modified().ok()?)))
+        .max_by_key(|(_, modified)| *modified)
 }
 
 /// How Claude Code names the folder of a directory's transcripts: every
@@ -324,7 +361,7 @@ mod tests {
     fn an_unchanged_transcript_is_not_read_again() {
         let root = std::env::temp_dir().join(format!("bench-claude-model-{}", std::process::id()));
         let directory = Path::new("/work/tree");
-        let transcripts = root.join(project_directory_name(directory));
+        let transcripts = root.join("projects").join(project_directory_name(directory));
         std::fs::create_dir_all(&transcripts).expect("a directory");
         let transcript = transcripts.join("session.jsonl");
         std::fs::write(
@@ -333,15 +370,45 @@ mod tests {
         )
         .expect("a transcript");
 
-        let first = probe_in(&root, directory, None).expect("a probe");
+        let first = probe_in(&root, directory, None, None).expect("a probe");
         assert_eq!(first.model, Some(model(ModelFamily::Opus, "Opus 5.5")));
 
         let mut remembered = first.clone();
         remembered.model = Some(model(ModelFamily::Haiku, "Haiku"));
-        let second = probe_in(&root, directory, Some(&remembered)).expect("a probe");
+        let second = probe_in(&root, directory, None, Some(&remembered)).expect("a probe");
         assert_eq!(second.model, remembered.model, "taken from what was known");
 
-        assert!(probe_in(&root, Path::new("/elsewhere"), None).is_none());
+        assert!(probe_in(&root, Path::new("/elsewhere"), None, None).is_none());
+        std::fs::remove_dir_all(&root).expect("cleaning up");
+    }
+
+    #[test]
+    fn two_agents_in_one_directory_each_get_their_own_model() {
+        let root = std::env::temp_dir().join(format!("bench-claude-sessions-{}", std::process::id()));
+        let directory = Path::new("/work/tree");
+        let transcripts = root.join("projects").join(project_directory_name(directory));
+        std::fs::create_dir_all(&transcripts).expect("a directory");
+        std::fs::create_dir_all(root.join("sessions")).expect("a directory");
+        for (process_id, session, model_id) in [
+            (1, "opus-session", "claude-opus-5-5"),
+            (2, "sonnet-session", "claude-sonnet-5-5"),
+        ] {
+            std::fs::write(
+                transcripts.join(format!("{session}.jsonl")),
+                format!(r#"{{"type":"assistant","message":{{"model":"{model_id}"}}}}"#),
+            )
+            .expect("a transcript");
+            std::fs::write(
+                root.join("sessions").join(format!("{process_id}.json")),
+                format!(r#"{{"sessionId":"{session}","cwd":"/work/tree"}}"#),
+            )
+            .expect("a session record");
+        }
+
+        let opus = probe_in(&root, directory, Some(1), None).expect("a probe");
+        let sonnet = probe_in(&root, directory, Some(2), None).expect("a probe");
+        assert_eq!(opus.model, Some(model(ModelFamily::Opus, "Opus 5.5")));
+        assert_eq!(sonnet.model, Some(model(ModelFamily::Sonnet, "Sonnet 5.5")));
         std::fs::remove_dir_all(&root).expect("cleaning up");
     }
 }
