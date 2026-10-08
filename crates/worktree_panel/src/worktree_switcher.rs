@@ -1,9 +1,9 @@
-//! A palette over the worktrees the window has open, most recently shown
-//! first, for switching without the worktree panel on screen.
+//! A palette over the worktrees, most recently shown first, for switching
+//! without the worktree panel on screen.
 
 use std::sync::Arc;
 
-use agent_tracker::{AgentSummary, ClaudeModel, agent_state_color};
+use agent_tracker::agent_state_color;
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Task,
@@ -14,58 +14,70 @@ use ui::{HighlightedLabel, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, MultiWorkspace, Workspace};
 
-use crate::WorktreePanel;
+use crate::{WorktreePanel, WorktreeRow};
 
 struct SwitcherEntry {
-    workspace: Entity<Workspace>,
-    name: SharedString,
-    /// The title, branch and repository, whichever the worktree has.
+    row: WorktreeRow,
+    /// What the worktree is for — its title — or its name when it has none.
+    /// The search text starts with it, which is what lets the match positions
+    /// highlight it.
+    label: SharedString,
+    /// The name, branch and repository, whichever add something to the label.
     detail: SharedString,
-    agents: AgentSummary,
-    models: Vec<ClaudeModel>,
-    is_active: bool,
+    search_text: String,
 }
 
-/// The window's open worktrees, most recently shown first. Worktrees the
-/// window has no workspace for are left out: they have no "recently" to
-/// order them by, and opening one is the panel's job.
+/// Every worktree the panel lists. Those shown in this window come first,
+/// most recently shown first. The rest, which is all but the active one right
+/// after a restart, follow by when their files were last edited, and choosing
+/// one opens it.
 fn switcher_entries(panel: &WorktreePanel, cx: &App) -> Vec<SwitcherEntry> {
     let Some(multi_workspace) = panel.multi_workspace.upgrade() else {
         return Vec::new();
     };
     let multi_workspace = multi_workspace.read(cx);
 
-    let mut entries: Vec<(Option<u64>, SwitcherEntry)> = Vec::new();
+    let mut entries: Vec<(SwitcherRecency, SwitcherEntry)> = Vec::new();
     for repository in panel.tree(cx) {
         for row in repository.worktrees {
-            let Some(workspace) = row.workspace else {
-                continue;
+            let recency = SwitcherRecency {
+                shown: row
+                    .workspace
+                    .as_ref()
+                    .and_then(|workspace| multi_workspace.activation_stamp(workspace)),
+                edited: row.status.last_edit,
             };
-            let detail = [
-                row.title.map(|title| title.to_string()),
-                row.branch.map(|branch| branch.to_string()),
-                Some(repository.name.to_string()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
+            let label = row.title.clone().unwrap_or_else(|| row.name.clone());
+            let mut detail: Vec<String> = Vec::new();
+            if label != row.name {
+                detail.push(row.name.to_string());
+            }
+            if let Some(branch) = row.branch.as_ref().filter(|branch| **branch != row.name) {
+                detail.push(branch.to_string());
+            }
+            detail.push(repository.name.to_string());
+            let detail = detail.join(" · ");
             entries.push((
-                multi_workspace.activation_stamp(&workspace),
+                recency,
                 SwitcherEntry {
-                    workspace,
-                    name: row.name,
+                    search_text: format!("{label} {detail}"),
+                    label,
                     detail: detail.into(),
-                    agents: row.agents,
-                    models: row.models,
-                    is_active: row.is_active,
+                    row,
                 },
             ));
         }
     }
-    // `None` sorts below every `Some`, which puts never-shown workspaces last.
-    entries.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    entries.sort_by_key(|(recency, _)| std::cmp::Reverse(*recency));
     entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Ordered so that `None` sorts below every `Some`: a worktree this window has
+/// shown outranks one it has not, and one with no edits found comes last.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct SwitcherRecency {
+    shown: Option<u64>,
+    edited: Option<std::time::SystemTime>,
 }
 
 /// Opens the switcher over `workspace`.
@@ -81,9 +93,10 @@ pub(crate) fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Cont
     window.defer(cx, move |window, cx| {
         let multi_workspace = panel.read(cx).multi_workspace.clone();
         let entries = switcher_entries(panel.read(cx), cx);
+        let panel = panel.downgrade();
         workspace.update(cx, |workspace, cx| {
             workspace.toggle_modal(window, cx, move |window, cx| {
-                WorktreeSwitcher::new(multi_workspace, entries, window, cx)
+                WorktreeSwitcher::new(panel, multi_workspace, entries, window, cx)
             });
         });
     });
@@ -95,12 +108,14 @@ struct WorktreeSwitcher {
 
 impl WorktreeSwitcher {
     fn new(
+        panel: WeakEntity<WorktreePanel>,
         multi_workspace: WeakEntity<MultiWorkspace>,
         entries: Vec<SwitcherEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let delegate = SwitcherDelegate::new(cx.entity().downgrade(), multi_workspace, entries);
+        let delegate =
+            SwitcherDelegate::new(cx.entity().downgrade(), panel, multi_workspace, entries);
         let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
         Self { picker }
     }
@@ -129,6 +144,7 @@ impl Render for WorktreeSwitcher {
 
 struct SwitcherDelegate {
     switcher: WeakEntity<WorktreeSwitcher>,
+    panel: WeakEntity<WorktreePanel>,
     multi_workspace: WeakEntity<MultiWorkspace>,
     entries: Vec<SwitcherEntry>,
     candidates: Vec<StringMatchCandidate>,
@@ -139,6 +155,7 @@ struct SwitcherDelegate {
 impl SwitcherDelegate {
     fn new(
         switcher: WeakEntity<WorktreeSwitcher>,
+        panel: WeakEntity<WorktreePanel>,
         multi_workspace: WeakEntity<MultiWorkspace>,
         entries: Vec<SwitcherEntry>,
     ) -> Self {
@@ -146,12 +163,13 @@ impl SwitcherDelegate {
             .iter()
             .enumerate()
             .map(|(index, entry)| {
-                StringMatchCandidate::new(index, &format!("{} {}", entry.name, entry.detail))
+                StringMatchCandidate::new(index, &entry.search_text)
             })
             .collect();
         let matches = all_matches(&candidates);
         Self {
             switcher,
+            panel,
             multi_workspace,
             selected_index: previous_worktree_index(matches.len()),
             entries,
@@ -249,24 +267,40 @@ impl PickerDelegate for SwitcherDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(workspace) = self
+        let Some(entry) = self
             .matches
             .get(self.selected_index)
             .and_then(|found| self.entries.get(found.candidate_id))
-            .map(|entry| entry.workspace.clone())
         else {
             return;
         };
+        let workspace = entry.row.workspace.clone();
+        let unopened = entry
+            .row
+            .root
+            .clone()
+            .map(|root| (entry.row.key.clone(), root, entry.row.name.clone()));
         self.dismissed(window, cx);
         // After the modal is gone and this picker's lease is dropped; see
         // `WorktreePanel::activate` for why activating cannot happen inside.
         let multi_workspace = self.multi_workspace.clone();
-        window.defer(cx, move |window, cx| {
-            multi_workspace
-                .update(cx, |multi_workspace, cx| {
-                    multi_workspace.activate(workspace, None, window, cx);
-                })
-                .log_err();
+        let panel = self.panel.clone();
+        window.defer(cx, move |window, cx| match (workspace, unopened) {
+            (Some(workspace), _) => {
+                multi_workspace
+                    .update(cx, |multi_workspace, cx| {
+                        multi_workspace.activate(workspace, None, window, cx);
+                    })
+                    .log_err();
+            }
+            (None, Some((key, root, name))) => {
+                panel
+                    .update(cx, |panel, cx| {
+                        panel.open_worktree(key, root, name, None, window, cx);
+                    })
+                    .log_err();
+            }
+            (None, None) => {}
         });
     }
 
@@ -285,15 +319,16 @@ impl PickerDelegate for SwitcherDelegate {
     ) -> Option<Self::ListItem> {
         let found = self.matches.get(ix)?;
         let entry = self.entries.get(found.candidate_id)?;
-        // The candidate leads with the name, so positions inside it are the
-        // name's; the rest are in the detail, which is drawn plain.
-        let name_positions: Vec<usize> = found
+        // The search text leads with the label, so positions inside it are the
+        // label's; the rest are in the detail, which is drawn plain.
+        let label_positions: Vec<usize> = found
             .positions
             .iter()
             .copied()
-            .filter(|position| *position < entry.name.len())
+            .filter(|position| *position < entry.label.len())
             .collect();
-        let working = entry.agents.working + entry.agents.needs_input > 0;
+        let row = &entry.row;
+        let working = row.agents.working + row.agents.needs_input > 0;
 
         Some(
             ListItem::new(ix)
@@ -305,10 +340,7 @@ impl PickerDelegate for SwitcherDelegate {
                         .w_full()
                         .min_w_0()
                         .gap_2()
-                        .child(
-                            HighlightedLabel::new(entry.name.clone(), name_positions)
-                                .flex_none(),
-                        )
+                        .child(HighlightedLabel::new(entry.label.clone(), label_positions).flex_none())
                         .child(
                             div().min_w_0().flex_1().child(
                                 Label::new(entry.detail.clone())
@@ -317,8 +349,8 @@ impl PickerDelegate for SwitcherDelegate {
                                     .truncate(),
                             ),
                         )
-                        .when(entry.is_active, |row| {
-                            row.child(
+                        .when(row.is_active, |this| {
+                            this.child(
                                 Label::new("current")
                                     .size(LabelSize::XSmall)
                                     .color(Color::Muted)
@@ -329,12 +361,12 @@ impl PickerDelegate for SwitcherDelegate {
                 .end_slot(
                     h_flex()
                         .gap_1p5()
-                        .children(entry.agents.state().map(|state| {
+                        .children(row.agents.state().map(|state| {
                             Icon::new(IconName::AiClaude)
                                 .size(IconSize::Small)
                                 .color(agent_state_color(state))
                         }))
-                        .children(entry.models.iter().enumerate().map(|(position, model)| {
+                        .children(row.models.iter().enumerate().map(|(position, model)| {
                             model.badge(("switcher-model", ix * 8 + position), working)
                         })),
                 ),

@@ -44,7 +44,7 @@ use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClipboardItem, Context,
     DismissEvent,
     Entity,
-    EventEmitter, FocusHandle, Focusable, Global, ScrollHandle, Task, Transformation, WeakEntity, Window,
+    EventEmitter, FocusHandle, Focusable, Global, ScrollHandle, Stateful, Task, Transformation, WeakEntity, Window,
     actions, percentage, prelude::*, svg,
 };
 use project::{
@@ -204,6 +204,10 @@ struct WorktreeRow {
     /// The models those agents are using, each once; see
     /// [`agent_tracker::claude_model`].
     models: Vec<ClaudeModel>,
+    /// The commands running in this worktree's terminals that are not agents:
+    /// dev servers, builds and the like; see
+    /// [`agent_tracker::AgentTracker::processes_for`].
+    processes: Vec<SharedString>,
     /// The branch this worktree has checked out; see [`RowPlan::branch`].
     branch: Option<SharedString>,
     /// The issue Bench made this worktree for, as it stored it. It outlives
@@ -694,6 +698,12 @@ impl WorktreePanel {
                         .as_deref()
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).models_for(root))
+                        .unwrap_or_default(),
+                    processes: plan
+                        .root
+                        .as_deref()
+                        .zip(tracker.as_ref())
+                        .map(|(root, tracker)| tracker.read(cx).processes_for(root))
                         .unwrap_or_default(),
                     linked_issue: stored.as_ref().and_then(|stored| stored.issue.clone()),
                     title: stored
@@ -1816,7 +1826,11 @@ impl WorktreePanel {
             let nested = cx
                 .background_spawn(nested_worktrees(fs.clone(), root.clone()))
                 .await;
-            let mut detail = format!("{} will be removed from disk.", root.display());
+            let mut detail = format!(
+                "{} will be removed from disk. Terminals open in it are closed and the \
+                 processes running in them are stopped.",
+                root.display()
+            );
             if let Some(branch) = &branch {
                 detail.push_str(&format!(" Its branch “{branch}” is deleted too."));
             }
@@ -1856,6 +1870,28 @@ impl WorktreePanel {
                 .await?;
             if !closed {
                 return anyhow::Ok(());
+            }
+
+            // Closing a workspace leaves its terminals' sessions running, and
+            // a dev server or build still writing into the directory is what
+            // makes git fail to empty it. Ended whether or not the worktree
+            // was open: after a restart most of them are not.
+            let ended = cx
+                .background_spawn({
+                    let root = root.clone();
+                    async move { terminal::end_sessions_inside(&root) }
+                })
+                .await;
+            match ended {
+                Ok(0) => {}
+                Ok(count) => log::info!(
+                    "ended {count} terminal session(s) running in {}",
+                    root.display()
+                ),
+                Err(error) => log::warn!(
+                    "could not end the terminal sessions in {}: {error:#}",
+                    root.display()
+                ),
             }
 
             let git = which::which("git").ok();
@@ -2423,167 +2459,35 @@ impl WorktreePanel {
                 .is_some_and(|scans| scans.syncing.contains(root))
         });
 
-        let name = match &row.issue {
-            Some(issue) => name_without_identifier(&row.name, &issue.identifier),
-            None => row.name.clone(),
-        };
-        let (heading, subheading) = match row.title.clone() {
-            Some(title) => (title, Some(name)),
-            // Without a title the name leads, and the line under it names the
-            // branch — which says something only when it is not the name
-            // again: the repository's own checkout switched to a feature
-            // branch, or a worktree whose branch was renamed. When the branch
-            // doesn't diverge there is nothing else to say there, so it shows
-            // the worktree's filesystem path instead of sitting empty.
-            None => {
-                let branch = row.branch.clone().filter(|branch| *branch != name);
-                let subheading = branch.or_else(|| {
-                    row.root
-                        .as_deref()
-                        .map(|root| SharedString::from(root.display().to_string()))
-                });
-                (name, subheading)
+        let sync_button = sync.map(|(root, ahead, behind)| {
+            if is_syncing {
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2)
+                    .into_any_element()
+            } else {
+                IconButton::new(("sync", index), IconName::ArrowCircle)
+                    .icon_size(IconSize::XSmall)
+                    .icon_color(Color::Accent)
+                    .tooltip(Tooltip::text(sync_description(ahead, behind)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.sync_worktree(
+                            root.clone(),
+                            ahead > 0,
+                            behind > 0,
+                            window,
+                            cx,
+                        );
+                    }))
+                    .into_any_element()
             }
-        };
-        let text_color = if is_open {
-            Color::Default
-        } else {
-            Color::Muted
-        };
-        let colors = cx.theme().colors();
+        });
 
-        v_flex()
-            .id(("worktree", index))
+        worktree_card(row, index, sync_button, cx)
             .ml_3()
             .mr_1p5()
-            .my_0p5()
-            .px_2()
-            .py_1p5()
-            .gap_0p5()
-            .rounded_md()
-            .border_1()
-            .cursor_pointer()
-            .map(|card| {
-                if row.is_active {
-                    card.border_color(colors.border_selected)
-                        .bg(colors.ghost_element_selected)
-                } else {
-                    card.border_color(colors.border_variant)
-                        .bg(colors.ghost_element_background)
-                        .hover(|card| card.bg(colors.ghost_element_hover))
-                }
-            })
-            .when_some(row_tooltip(row), |this, tooltip| {
-                this.tooltip(Tooltip::text(tooltip))
-            })
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::GitBranch)
-                            .size(IconSize::Small)
-                            .color(if row.is_active {
-                                // The worktree the window is showing. One
-                                // accented icon says which of them you are in
-                                // from across the tree.
-                                Color::Accent
-                            } else if is_open {
-                                Color::Muted
-                            } else {
-                                // A worktree that exists but is not open in
-                                // this window: the card is there to be
-                                // clicked, and should not read as one of the
-                                // window's own.
-                                Color::Ignored
-                            }),
-                    )
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_1()
-                            .child(
-                                // Truncated: a long title would otherwise
-                                // widen the card past the panel.
-                                div().min_w_0().child(
-                                    Label::new(heading)
-                                        .single_line()
-                                        .truncate()
-                                        .color(text_color),
-                                ),
-                            )
-                            .children(sync.map(|(root, ahead, behind)| {
-                                if is_syncing {
-                                    Icon::new(IconName::ArrowCircle)
-                                        .size(IconSize::XSmall)
-                                        .color(Color::Muted)
-                                        .with_rotate_animation(2)
-                                        .into_any_element()
-                                } else {
-                                    IconButton::new(("sync", index), IconName::ArrowCircle)
-                                        .icon_size(IconSize::XSmall)
-                                        .icon_color(Color::Accent)
-                                        .tooltip(Tooltip::text(sync_description(ahead, behind)))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.sync_worktree(
-                                                root.clone(),
-                                                ahead > 0,
-                                                behind > 0,
-                                                window,
-                                                cx,
-                                            );
-                                        }))
-                                        .into_any_element()
-                                }
-                            })),
-                    )
-                    .children(row.status.last_edit.and_then(|at| {
-                        let ago = SystemTime::now().duration_since(at).ok()?;
-                        Some(
-                            Label::new(edited_ago(ago))
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted)
-                                .flex_none(),
-                        )
-                    }))
-                    .children(render_agents(index, &row.agents))
-                    .children(row.models.iter().enumerate().map(|(position, model)| {
-                        let active = row.agents.working + row.agents.needs_input > 0;
-                        model.badge(("worktree-model", index * 8 + position), active)
-                    })),
-            )
-            // Always drawn, empty or not, so that every card is the same
-            // height: a card with nothing more to say — the repository's own
-            // checkout, usually — would otherwise sit shorter than the rest.
-            .child(
-                h_flex()
-                    .w_full()
-                    .min_w_0()
-                    .h_5()
-                    .gap_1p5()
-                    // Holds the icon's room, so the name sits under the
-                    // title rather than under the icon.
-                    .child(div().flex_none().size(IconSize::Small.rems()))
-                    .child(div().flex_1().min_w_0().children(subheading.map(|name| {
-                        Label::new(name)
-                            .size(LabelSize::Small)
-                            .color(Color::Muted)
-                            .single_line()
-                            .truncate()
-                    })))
-                    .children(render_changes(index, row.status.changes))
-                    .children(row.status.ahead_behind.and_then(|(ahead, behind)| {
-                        render_ahead_behind(index, ahead, behind)
-                    }))
-                    .children(
-                        row.pull_request
-                            .map(|state| render_pull_request(state, index)),
-                    )
-                    .children(row.issue.as_deref().map(render_issue_pill)),
-            )
             .when_some(row.root.clone(), |this, root| {
                 let issue = row.issue.as_ref().map(|issue| issue.identifier.clone());
                 this.on_mouse_down(
@@ -2714,6 +2618,155 @@ impl WorktreePanel {
     }
 }
 
+/// A worktree as a card: what it is for above, which worktree it is below.
+///
+/// Shared by the panel and the worktree switcher so that both draw a worktree
+/// the same way. What a click does, and the right-click menu, are the caller's.
+fn worktree_card(
+    row: &WorktreeRow,
+    index: usize,
+    sync_button: Option<AnyElement>,
+    cx: &App,
+) -> Stateful<Div> {
+    let is_open = row.workspace.is_some();
+    let name = match &row.issue {
+        Some(issue) => name_without_identifier(&row.name, &issue.identifier),
+        None => row.name.clone(),
+    };
+    let (heading, subheading) = match row.title.clone() {
+        Some(title) => (title, Some(name)),
+        // Without a title the name leads, and the line under it names the
+        // branch — which says something only when it is not the name
+        // again: the repository's own checkout switched to a feature
+        // branch, or a worktree whose branch was renamed. When the branch
+        // doesn't diverge there is nothing else to say there, so it shows
+        // the worktree's filesystem path instead of sitting empty.
+        None => {
+            let branch = row.branch.clone().filter(|branch| *branch != name);
+            let subheading = branch.or_else(|| {
+                row.root
+                    .as_deref()
+                    .map(|root| SharedString::from(root.display().to_string()))
+            });
+            (name, subheading)
+        }
+    };
+    let text_color = if is_open {
+        Color::Default
+    } else {
+        Color::Muted
+    };
+    let colors = cx.theme().colors();
+
+    v_flex()
+        .id(("worktree", index))
+        .my_0p5()
+        .px_2()
+        .py_1p5()
+        .gap_0p5()
+        .rounded_md()
+        .border_1()
+        .cursor_pointer()
+        .map(|card| {
+            if row.is_active {
+                card.border_color(colors.border_selected)
+                    .bg(colors.ghost_element_selected)
+            } else {
+                card.border_color(colors.border_variant)
+                    .bg(colors.ghost_element_background)
+                    .hover(|card| card.bg(colors.ghost_element_hover))
+            }
+        })
+        .when_some(row_tooltip(row), |this, tooltip| {
+            this.tooltip(Tooltip::text(tooltip))
+        })
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .gap_1p5()
+                .child(
+                    Icon::new(IconName::GitBranch)
+                        .size(IconSize::Small)
+                        .color(if row.is_active {
+                            // The worktree the window is showing. One
+                            // accented icon says which of them you are in
+                            // from across the tree.
+                            Color::Accent
+                        } else if is_open {
+                            Color::Muted
+                        } else {
+                            // A worktree that exists but is not open in
+                            // this window: the card is there to be
+                            // clicked, and should not read as one of the
+                            // window's own.
+                            Color::Ignored
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(
+                            // Truncated: a long title would otherwise
+                            // widen the card past the panel.
+                            div().min_w_0().child(
+                                Label::new(heading)
+                                    .single_line()
+                                    .truncate()
+                                    .color(text_color),
+                            ),
+                        )
+                        .children(sync_button),
+                )
+                .children(row.status.last_edit.and_then(|at| {
+                    let ago = SystemTime::now().duration_since(at).ok()?;
+                    Some(
+                        Label::new(edited_ago(ago))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                            .flex_none(),
+                    )
+                }))
+                .children(render_processes(index, &row.processes))
+                .children(render_agents(index, &row.agents))
+                .children(row.models.iter().enumerate().map(|(position, model)| {
+                    let active = row.agents.working + row.agents.needs_input > 0;
+                    model.badge(("worktree-model", index * 8 + position), active)
+                })),
+        )
+        // Always drawn, empty or not, so that every card is the same
+        // height: a card with nothing more to say — the repository's own
+        // checkout, usually — would otherwise sit shorter than the rest.
+        .child(
+            h_flex()
+                .w_full()
+                .min_w_0()
+                .h_5()
+                .gap_1p5()
+                // Holds the icon's room, so the name sits under the
+                // title rather than under the icon.
+                .child(div().flex_none().size(IconSize::Small.rems()))
+                .child(div().flex_1().min_w_0().children(subheading.map(|name| {
+                    Label::new(name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted)
+                        .single_line()
+                        .truncate()
+                })))
+                .children(render_changes(index, row.status.changes))
+                .children(row.status.ahead_behind.and_then(|(ahead, behind)| {
+                    render_ahead_behind(index, ahead, behind)
+                }))
+                .children(
+                    row.pull_request
+                        .map(|state| render_pull_request(state, index)),
+                )
+                .children(row.issue.as_deref().map(render_issue_pill)),
+        )
+}
+
 /// A Linear issue's state, as Linear draws it: its group's icon in the colour
 /// the team gave the state.
 fn render_issue_state(issue: &Issue) -> Icon {
@@ -2819,6 +2872,31 @@ fn project_icon(stored: Option<&str>) -> IconName {
     stored
         .and_then(|name| name.parse::<IconName>().ok())
         .unwrap_or(IconName::Folder)
+}
+
+/// That something other than an agent is running in one of the worktree's
+/// terminals, with what it is on hover.
+fn render_processes(index: usize, processes: &[SharedString]) -> Option<AnyElement> {
+    if processes.is_empty() {
+        return None;
+    }
+    let commands = processes
+        .iter()
+        .map(|command| command.as_ref())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(
+        div()
+            .id(("processes", index))
+            .flex_none()
+            .child(
+                Icon::new(IconName::PlayFilled)
+                    .size(IconSize::Small)
+                    .color(Color::Success),
+            )
+            .tooltip(Tooltip::text(format!("Running: {commands}")))
+            .into_any_element(),
+    )
 }
 
 /// Whether an agent is at work in the worktree, and what it is doing: Claude's

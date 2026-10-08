@@ -755,7 +755,7 @@
       "ctrl-alt-cmd-p": "settings_profile_selector::Toggle",
       "cmd-t": "project_symbols::Toggle",
       "cmd-p": "file_finder::Toggle",
-      "cmd-e": "worktree_panel::OpenSwitcher",
+      "cmd-shift-space": "worktree_panel::OpenSwitcher",
       "ctrl-shift-tab": ["tab_switcher::Toggle", { "select_last": true }],
       "ctrl-tab": "tab_switcher::Toggle",
       "cmd-shift-p": "command_palette::Toggle",
@@ -1699,7 +1699,7 @@
     "context": "WorktreeSwitcher",
     "use_key_equivalents": true,
     "bindings": {
-      "cmd-e": "menu::Cancel",
+      "cmd-shift-space": "menu::Cancel",
     },
   },
   {

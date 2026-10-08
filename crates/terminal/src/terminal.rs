@@ -2,8 +2,10 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+mod ports;
 pub mod terminal_settings;
-pub use pty_info::{SessionForeground, session_foreground};
+pub use ports::{ListeningPort, listening_ports};
+pub use pty_info::{SessionForeground, end_sessions_inside, session_foreground};
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -2972,6 +2974,17 @@ impl Terminal {
         }
     }
 
+    /// Whether the foreground process is the shell, so that the terminal is
+    /// idle at a prompt. `None` when the foreground process is not known yet.
+    pub fn foreground_process_is_shell(&self) -> Option<bool> {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => {
+                info.current.read().as_ref().map(|process| process.is_shell)
+            }
+            TerminalType::DisplayOnly => None,
+        }
+    }
+
     pub fn is_running_claude(&self) -> bool {
         self.foreground_process_command_name().as_deref() == Some("claude")
     }
@@ -3173,6 +3186,15 @@ impl Terminal {
 
     /// The `terminal_host` session this terminal shows, if its shell is
     /// hosted there rather than owned by this process.
+    /// The shell this terminal runs, whether it lives in a terminal-host
+    /// session or is this terminal's own child.
+    pub fn shell_pid(&self) -> Option<u32> {
+        match self.persistent_session() {
+            Some(session) => Some(session.leader_pid),
+            None => self.pid_getter().map(|pid_getter| pid_getter.fallback_pid().as_u32()),
+        }
+    }
+
     pub fn persistent_session(&self) -> Option<&PersistentSession> {
         self.persistent_session.as_ref()
     }

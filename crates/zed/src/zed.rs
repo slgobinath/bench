@@ -627,6 +627,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
         // Bench: whether the Mac is being held awake for a working agent.
         let keep_awake = cx.new(agent_tracker::KeepAwakeButton::new);
+        // Bench: the ports the programs in this worktree's terminals listen on.
+        let listening_ports = cx.new(|cx| agent_tracker::PortsButton::new(workspace, cx));
         // Bench: how much of the Claude plan is used, as Claude Code reports it.
         let claude_usage = cx.new(agent_tracker::ClaudeUsageButton::new);
         let merge_conflict_indicator =
@@ -639,8 +641,10 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             status_bar.add_left_item(git_blame_status, window, cx);
             status_bar.add_left_item(merge_conflict_indicator, window, cx);
             status_bar.add_left_item(activity_indicator, window, cx);
-            status_bar.add_right_item(claude_usage, window, cx);
+            // Right-hand items are laid out last-added first, so the first one
+            // added sits at the far right edge.
             status_bar.add_right_item(keep_awake, window, cx);
+            status_bar.add_right_item(claude_usage, window, cx);
             status_bar.add_right_item(active_buffer_encoding, window, cx);
             status_bar.add_right_item(active_buffer_language, window, cx);
             status_bar.add_right_item(active_toolchain_language, window, cx);
@@ -650,6 +654,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
             // Keep these last so they stay leftmost and can change without moving the other items.
             status_bar.add_right_item(vim_mode_indicator, window, cx);
             status_bar.add_right_item(pending_keystrokes_indicator, window, cx);
+            // Added after those so that it is the leftmost of the right-hand
+            // items, where its width changing moves none of the others.
+            status_bar.add_right_item(listening_ports, window, cx);
         });
 
         let panels_task = initialize_panels(window, cx);

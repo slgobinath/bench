@@ -111,9 +111,9 @@ impl Render for KeepAwakeButton {
         };
 
         let (icon, color) = match (keep_awake, holding) {
-            (false, _) => (IconName::Power, Color::Disabled),
-            (true, false) => (IconName::Power, Color::Muted),
-            (true, true) => (IconName::Power, Color::Accent),
+            (false, _) => (IconName::Coffee, Color::Disabled),
+            (true, false) => (IconName::Coffee, Color::Muted),
+            (true, true) => (IconName::Coffee, Color::Accent),
         };
 
         let tooltip = match (keep_awake, holding, summary.working) {

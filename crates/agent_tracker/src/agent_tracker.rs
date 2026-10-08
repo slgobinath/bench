@@ -33,6 +33,7 @@ pub mod claude_model;
 pub mod claude_usage;
 pub mod hooks;
 mod keep_awake_button;
+mod ports_button;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,6 +47,8 @@ use settings::Settings as _;
 use terminal::Terminal;
 
 pub use claude_model::{ClaudeModel, ModelFamily};
+pub use ports_button::PortsButton;
+pub use terminal::ListeningPort;
 pub use claude_usage::{ClaudeUsage, ClaudeUsageButton};
 pub use keep_awake_button::{KeepAwakeButton, ToggleKeepAwake, agent_state_color};
 
@@ -82,6 +85,10 @@ impl settings::Settings for AgentSettings {
         }
     }
 }
+
+/// Ports are looked for on every this-many sweeps, since it walks the process
+/// table and, when something is running, asks `lsof`.
+const PORT_SCAN_EVERY: u32 = 3;
 
 /// How often the terminals are swept. Fast enough that a state change is seen
 /// before you look, slow enough to be nothing: the work is reading a cached
@@ -195,6 +202,9 @@ struct Watched {
     /// What the newest Claude Code transcript in this terminal's directory
     /// says about the model; see [`claude_model`].
     model: Option<claude_model::Probe>,
+    /// The command in the foreground when it is neither an agent nor the
+    /// shell at its prompt: a dev server, a build, a test run.
+    running: Option<SharedString>,
 }
 
 /// An agent in a terminal-host session that no `Terminal` in this process is
@@ -208,6 +218,25 @@ struct Detached {
     model: Option<claude_model::Probe>,
 }
 
+/// A non-agent process running in a daemon session nothing is attached to.
+#[derive(Clone, PartialEq)]
+struct DetachedProcess {
+    session_id: String,
+    directory: PathBuf,
+    command: SharedString,
+}
+
+/// What the background half of a sweep found in the daemon's unattached
+/// sessions.
+#[derive(Default)]
+struct DetachedSessions {
+    agents: Vec<DetachedFound>,
+    processes: Vec<DetachedProcess>,
+    /// Every unattached session's shell and where it is, for the port scan:
+    /// a server can be left running behind an idle prompt.
+    shells: Vec<(u32, PathBuf)>,
+}
+
 /// What the background half of a sweep found for one detached session.
 struct DetachedFound {
     session_id: String,
@@ -218,6 +247,9 @@ struct DetachedFound {
 pub struct AgentTracker {
     watched: HashMap<EntityId, Watched>,
     detached: Vec<Detached>,
+    detached_processes: Vec<DetachedProcess>,
+    /// What the terminals' programs are listening on, as of the last scan.
+    ports: Vec<ListeningPort>,
     reports: hooks::HookReports,
     awake: awake::AwakeGuard,
     /// The user's toggle, off the status bar button. Separate from "is the
@@ -276,6 +308,8 @@ impl AgentTracker {
         Self {
             watched: HashMap::new(),
             detached: Vec::new(),
+            detached_processes: Vec::new(),
+            ports: Vec::new(),
             reports: hooks::HookReports::default(),
             awake: awake::AwakeGuard::new(),
             keep_awake: AgentSettings::get_global(cx).keep_awake,
@@ -290,9 +324,19 @@ impl AgentTracker {
                 {
                     return;
                 }
+                let mut sweeps: u32 = 0;
                 loop {
                     cx.background_executor().timer(SWEEP).await;
-                    let Ok((offset, usage_modified, model_requests, agent_commands, previous_models)) =
+                    sweeps = sweeps.wrapping_add(1);
+                    let scan_ports = sweeps.is_multiple_of(PORT_SCAN_EVERY);
+                    let Ok((
+                        offset,
+                        usage_modified,
+                        model_requests,
+                        agent_commands,
+                        previous_models,
+                        live_shells,
+                    )) =
                         this.read_with(cx, |this, cx| {
                             (
                                 this.reports.offset(),
@@ -305,6 +349,7 @@ impl AgentTracker {
                                         (detached.session_id.clone(), detached.model.clone())
                                     })
                                     .collect::<HashMap<_, _>>(),
+                                scan_ports.then(|| this.terminal_shells(cx)),
                             )
                         })
                     else {
@@ -313,7 +358,7 @@ impl AgentTracker {
                     // Off the main thread: this is a `stat` or two every
                     // second, and occasionally a read, on a thread that has
                     // frames to draw.
-                    let (appended, usage, models, detached) = cx
+                    let (appended, usage, models, detached, ports) = cx
                         .background_spawn(async move {
                             let models: Vec<_> = model_requests
                                 .into_iter()
@@ -321,11 +366,26 @@ impl AgentTracker {
                                     (terminal, claude_model::probe(&directory, previous.as_ref()))
                                 })
                                 .collect();
+                            let detached = find_detached(&agent_commands, &previous_models);
+                            let ports = match live_shells {
+                                Some(mut shells) => {
+                                    shells.extend(detached.shells.iter().cloned());
+                                    match terminal::listening_ports(shells).await {
+                                        Ok(ports) => Some(ports),
+                                        Err(error) => {
+                                            log::debug!("scanning for listening ports: {error:#}");
+                                            None
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
                             (
                                 hooks::read_appended(offset, EVENTS_MAX_BYTES),
                                 claude_usage::read_if_changed(usage_modified),
                                 models,
-                                find_detached(&agent_commands, &previous_models),
+                                detached,
+                                ports,
                             )
                         })
                         .await;
@@ -335,6 +395,7 @@ impl AgentTracker {
                             this.take_claude_usage(usage, cx);
                             this.sweep(appended, cx);
                             this.take_detached(detached, cx);
+                            this.take_ports(ports, cx);
                         })
                         .is_err()
                     {
@@ -378,10 +439,54 @@ impl AgentTracker {
         }
     }
 
+    /// Each terminal's shell and where the terminal is, for the port scan.
+    fn terminal_shells(&self, cx: &App) -> Vec<(u32, PathBuf)> {
+        self.watched
+            .values()
+            .filter_map(|watched| {
+                let terminal = watched.terminal.upgrade()?;
+                let terminal = terminal.read(cx);
+                Some((terminal.shell_pid()?, terminal.working_directory()?))
+            })
+            .collect()
+    }
+
+    fn take_ports(&mut self, ports: Option<Vec<ListeningPort>>, cx: &mut Context<Self>) {
+        let Some(ports) = ports else {
+            return;
+        };
+        if ports != self.ports {
+            self.ports = ports;
+            cx.emit(AgentsChanged);
+            cx.notify();
+        }
+    }
+
+    /// The ports the programs in terminals inside any of `directories` are
+    /// listening on, lowest first, one entry per port.
+    pub fn ports_for(&self, directories: &[PathBuf]) -> Vec<ListeningPort> {
+        let mut ports: Vec<ListeningPort> = self
+            .ports
+            .iter()
+            .filter(|port| {
+                directories
+                    .iter()
+                    .any(|directory| port.directory.starts_with(directory))
+            })
+            .cloned()
+            .collect();
+        ports.sort_by_key(|port| port.port);
+        ports.dedup_by_key(|port| port.port);
+        ports
+    }
+
     /// Runs after `sweep` so the hook reports it reads include this pass's.
-    fn take_detached(&mut self, found: Vec<DetachedFound>, cx: &mut Context<Self>) {
+    fn take_detached(&mut self, found: DetachedSessions, cx: &mut Context<Self>) {
         let now = Instant::now();
-        let detached: Vec<Detached> = found
+        let DetachedSessions {
+            agents, processes, ..
+        } = found;
+        let detached: Vec<Detached> = agents
             .into_iter()
             .map(|found| {
                 // Without a terminal there is no output to judge by, so only a
@@ -413,8 +518,10 @@ impl AgentTracker {
                 })
                 .collect::<Vec<_>>()
         };
-        let changed = describe(&self.detached) != describe(&detached);
+        let changed = describe(&self.detached) != describe(&detached)
+            || self.detached_processes != processes;
         self.detached = detached;
+        self.detached_processes = processes;
         if changed {
             cx.emit(AgentsChanged);
             cx.notify();
@@ -449,6 +556,7 @@ impl AgentTracker {
                 had_agent: false,
                 working_since: None,
                 model: None,
+                running: None,
             },
         );
     }
@@ -471,11 +579,18 @@ impl AgentTracker {
                 return false;
             };
 
-            let command = terminal
+            let foreground = terminal
                 .read(cx)
                 .foreground_process_command_name()
-                .map(SharedString::from)
+                .map(SharedString::from);
+            let command = foreground
+                .clone()
                 .filter(|command| settings.is_agent(command));
+            // Unknown counts as the shell: an icon for a process that may not
+            // be there is worse than none for one that is.
+            let running = foreground.filter(|_| {
+                command.is_none() && terminal.read(cx).foreground_process_is_shell() == Some(false)
+            });
             let directory = terminal.read(cx).working_directory();
 
             let was = watched.had_agent.then_some(watched.state);
@@ -486,9 +601,14 @@ impl AgentTracker {
                 watched.had_agent = false;
                 watched.working_since = None;
                 watched.model = None;
-                changed |= was.is_some();
+                changed |= was.is_some() || watched.running != running;
+                watched.running = running;
+                if watched.running.is_some() {
+                    watched.directory = directory;
+                }
                 return true;
             };
+            changed |= watched.running.take().is_some();
 
             let reported = directory
                 .as_deref()
@@ -600,6 +720,25 @@ impl AgentTracker {
             }
         }
         models
+    }
+
+    /// The commands running inside `directory` that are not agents, each once.
+    pub fn processes_for(&self, directory: &Path) -> Vec<SharedString> {
+        let mut commands: Vec<SharedString> = Vec::new();
+        let watched = self
+            .watched
+            .values()
+            .filter_map(|watched| Some((watched.directory.as_deref()?, watched.running.as_ref()?)));
+        let detached = self
+            .detached_processes
+            .iter()
+            .map(|process| (process.directory.as_path(), &process.command));
+        for (process_directory, command) in watched.chain(detached) {
+            if process_directory.starts_with(directory) && !commands.contains(command) {
+                commands.push(command.clone());
+            }
+        }
+        commands
     }
 
     /// The model the agent in one terminal is using, if it has one and it is
@@ -766,39 +905,54 @@ fn announcement(
 /// the prompt redraws as you type in it, and redrawing is what the heuristic
 /// calls work. A session that ended is no agent at all, which the foreground
 /// process says, whatever its last report was.
-/// The agents in daemon sessions nothing is attached to. An attached session
-/// is already covered by its `Terminal`, in this process or another Bench's.
+/// What is running in daemon sessions nothing is attached to. An attached
+/// session is already covered by its `Terminal`, in this process or another
+/// Bench's.
 fn find_detached(
     agent_commands: &[SharedString],
     previous_models: &HashMap<String, Option<claude_model::Probe>>,
-) -> Vec<DetachedFound> {
+) -> DetachedSessions {
     let Some(host) = terminal_host::host() else {
-        return Vec::new();
+        return DetachedSessions::default();
     };
     let sessions = match host.sessions() {
         Ok(sessions) => sessions,
         Err(error) => {
             log::debug!("listing terminal host sessions: {error:#}");
-            return Vec::new();
+            return DetachedSessions::default();
         }
     };
-    sessions
-        .into_iter()
-        .filter(|session| !session.attached)
-        .filter_map(|session| {
-            let foreground = terminal::session_foreground(session.pid)?;
-            let command = foreground.command?;
-            if !agent_commands.iter().any(|agent| *agent == command) {
-                return None;
-            }
+    let mut found = DetachedSessions::default();
+    for session in sessions.into_iter().filter(|session| !session.attached) {
+        let Some(foreground) = terminal::session_foreground(session.pid) else {
+            continue;
+        };
+        found.shells.push((
+            session.pid,
+            foreground
+                .shell_directory
+                .clone()
+                .unwrap_or_else(|| foreground.directory.clone()),
+        ));
+        let Some(command) = foreground.command else {
+            continue;
+        };
+        if agent_commands.iter().any(|agent| *agent == command) {
             let previous = previous_models.get(&session.id).and_then(Option::as_ref);
-            Some(DetachedFound {
+            found.agents.push(DetachedFound {
                 model: claude_model::probe(&foreground.directory, previous),
                 directory: foreground.directory,
                 session_id: session.id,
-            })
-        })
-        .collect()
+            });
+        } else if !foreground.is_shell {
+            found.processes.push(DetachedProcess {
+                session_id: session.id,
+                directory: foreground.directory,
+                command: command.into(),
+            });
+        }
+    }
+    found
 }
 
 fn is_trusted(report: &hooks::Report, now: Instant) -> bool {

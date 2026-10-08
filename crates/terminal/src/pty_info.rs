@@ -1,6 +1,10 @@
 use gpui::{Context, Task};
 use parking_lot::{MappedRwLockReadGuard, Mutex, RwLock, RwLockReadGuard};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
@@ -70,6 +74,9 @@ pub(crate) struct ProcessInfo {
     pub(crate) name: String,
     pub(crate) cwd: PathBuf,
     pub(crate) argv: Vec<String>,
+    /// Whether the foreground process is the shell itself, which is a terminal
+    /// sitting at its prompt rather than one running something.
+    pub(crate) is_shell: bool,
 }
 
 /// Fetches Zed-relevant Pseudo-Terminal (PTY) process information
@@ -193,6 +200,8 @@ impl PtyProcessInfo {
 
     fn load(&self) -> Option<ProcessInfo> {
         let process = self.refresh()?;
+        let shell_pid = self.session_leader.unwrap_or(self.pid_getter.fallback_pid());
+        let is_shell = process.pid() == shell_pid;
         let cwd = process.cwd().map_or(PathBuf::new(), |p| p.to_owned());
 
         let info = ProcessInfo {
@@ -203,6 +212,7 @@ impl PtyProcessInfo {
                 .iter()
                 .filter_map(|s| s.to_str().map(ToOwned::to_owned))
                 .collect(),
+            is_shell,
         };
         *self.current.write() = Some(info.clone());
         Some(info)
@@ -264,7 +274,12 @@ impl PtyProcessInfo {
 /// shell alone, for sessions that no `Terminal` is attached to.
 pub struct SessionForeground {
     pub command: Option<String>,
+    /// The shell itself is in the foreground: the session is at its prompt.
+    pub is_shell: bool,
     pub directory: PathBuf,
+    /// Where the shell itself is, which can differ from the foreground
+    /// process's directory.
+    pub shell_directory: Option<PathBuf>,
 }
 
 pub fn session_foreground(leader: u32) -> Option<SessionForeground> {
@@ -272,13 +287,17 @@ pub fn session_foreground(leader: u32) -> Option<SessionForeground> {
     let pid = foreground_process_group(leader).unwrap_or(leader);
     let mut system = System::new();
     system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
+        ProcessesToUpdate::Some(&[pid, leader]),
         true,
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::Always)
             .with_cwd(UpdateKind::Always)
             .without_tasks(),
     );
+    let shell_directory = system
+        .process(leader)
+        .and_then(|process| process.cwd())
+        .map(ToOwned::to_owned);
     let process = system.process(pid)?;
     let argv: Vec<String> = process
         .cmd()
@@ -287,9 +306,53 @@ pub fn session_foreground(leader: u32) -> Option<SessionForeground> {
         .collect();
     Some(SessionForeground {
         command: crate::foreground_process_command_from_argv(&argv),
+        is_shell: pid == leader,
         directory: process.cwd()?.to_owned(),
+        shell_directory,
     })
 }
+
+/// Ends every persistent terminal session working inside `root` — its shell
+/// or the program in front of it is in that directory — and waits for them to
+/// exit, so that nothing is still writing there when the directory is removed.
+///
+/// Closing a workspace deliberately leaves its sessions running, so that
+/// terminals survive a restart, which is why this has to ask the host. Returns
+/// how many sessions it ended. Blocks; call it off the main thread.
+pub fn end_sessions_inside(root: &Path) -> anyhow::Result<usize> {
+    let Some(host) = terminal_host::host() else {
+        return Ok(0);
+    };
+    let doomed: Vec<String> = host
+        .sessions()?
+        .into_iter()
+        .filter(|session| {
+            session_foreground(session.pid).is_some_and(|foreground| {
+                foreground.directory.starts_with(root)
+                    || foreground
+                        .shell_directory
+                        .is_some_and(|directory| directory.starts_with(root))
+            })
+        })
+        .map(|session| session.id)
+        .collect();
+    for id in &doomed {
+        host.kill(id, None)?;
+    }
+
+    let deadline = Instant::now() + SESSIONS_END_WITHIN;
+    while Instant::now() < deadline {
+        let remaining = host.sessions()?;
+        if !remaining.iter().any(|session| doomed.contains(&session.id)) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(doomed.len())
+}
+
+/// The host hangs a session up and, after a grace period, kills it outright.
+const SESSIONS_END_WITHIN: Duration = Duration::from_secs(5);
 
 /// The foreground process group of the terminal `leader` controls.
 #[cfg(target_os = "macos")]
