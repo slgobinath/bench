@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use anyhow::{Context as _, Result, anyhow};
 use git::repository::{CreateWorktreeTarget, GitRepository, Worktree as GitWorktree};
 use agent_tracker::{
     AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, agent_state_color,
@@ -168,6 +169,42 @@ struct RepositoryRow {
     /// just a row has no repository entity behind it.
     repository: Option<Entity<Repository>>,
     worktrees: Vec<WorktreeRow>,
+}
+
+/// A project as [`WorktreePanel::projects`] reports it.
+pub struct ProjectListing {
+    pub name: SharedString,
+    /// The project's main checkout, which is what
+    /// [`WorktreePanel::create_worktree_in_project`] takes to name it.
+    pub root: Option<PathBuf>,
+    /// Whether the window has a workspace open for any of its worktrees.
+    pub is_open: bool,
+    /// The Linear team whose issues are worked on in this project.
+    pub linear_team: Option<LinearTeam>,
+    pub worktrees: Vec<WorktreeListing>,
+}
+
+/// A worktree as [`WorktreePanel::projects`] reports it.
+pub struct WorktreeListing {
+    pub name: SharedString,
+    pub root: Option<PathBuf>,
+    pub branch: Option<SharedString>,
+    pub title: Option<SharedString>,
+    pub is_open: bool,
+    pub is_main: bool,
+    /// Whether it is the worktree the window is showing.
+    pub is_active: bool,
+    pub agents: AgentSummary,
+    pub processes: Vec<SharedString>,
+}
+
+/// What creating a worktree does when a branch of its name already exists.
+#[derive(Clone, Copy)]
+enum ExistingBranch {
+    /// Ask the user whether to use it or replace it.
+    Ask,
+    Use,
+    Refuse,
 }
 
 /// One worktree of a repository.
@@ -1594,8 +1631,173 @@ impl WorktreePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let created = self.make_worktree(
+            from.clone(),
+            repository,
+            key,
+            name,
+            description,
+            issue,
+            start_agent,
+            ExistingBranch::Ask,
+            window,
+            cx,
+        );
+        cx.spawn(async move |_, cx| {
+            if let Err(error) = created.await {
+                log::error!("{error:#}");
+                from.update(cx, |workspace, cx| workspace.show_error(format!("{error:#}"), cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Creates a worktree in a project for a caller outside the panel, such as
+    /// Bench's MCP server, and opens it. Resolves to the new worktree's root.
+    ///
+    /// `root` is the project's root, as [`ProjectListing::root`] gives
+    /// it. Only a project the window has open can be created in: making a
+    /// worktree is the repository's own doing, and a closed project has no
+    /// repository entity to ask.
+    ///
+    /// The name is settled as the name dialog settles it: `name` when it is a
+    /// branch name, else the Linear branch name of `issue`. A `name` that is
+    /// not a branch name is taken as a description, and the name made from it;
+    /// see [`name_from_description`]. A worktree made for an issue is linked
+    /// to it, as one made from the dialog with the issue linked is.
+    ///
+    /// Nothing is asked of the user. A branch that already exists is used only
+    /// when `use_existing_branch` is set, and is never replaced, since
+    /// replacing it would discard its commits.
+    pub fn create_worktree_in_project(
+        &mut self,
+        root: &Path,
+        name: Option<SharedString>,
+        description: Option<SharedString>,
+        issue: Option<Arc<Issue>>,
+        start_agent: bool,
+        use_existing_branch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<PathBuf>> {
+        let typed = name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty());
+        let (name, description) = match typed {
+            Some(typed) if is_branch_name(&typed) => (typed, description),
+            Some(typed) => (
+                name_from_description(&typed),
+                description.or_else(|| Some(typed.into())),
+            ),
+            None => match &issue {
+                Some(issue) => (issue.branch_name.to_string(), description),
+                None => {
+                    return Task::ready(Err(anyhow!(
+                        "Give the worktree a name, or a Linear issue to name it after"
+                    )));
+                }
+            },
+        };
+        if !is_branch_name(&name) {
+            return Task::ready(Err(anyhow!("“{name}” is not a valid branch name")));
+        }
+        let name = SharedString::from(name);
+        let Some(row) = self
+            .tree(cx)
+            .into_iter()
+            .find(|row| project_root(&row.key).as_deref() == Some(root))
+        else {
+            return Task::ready(Err(anyhow!(
+                "No project at {} is open in this window",
+                root.display()
+            )));
+        };
+        let Some(repository) = row.repository.clone() else {
+            return Task::ready(Err(anyhow!(
+                "Open the project “{}” in Bench before creating a worktree in it",
+                row.name
+            )));
+        };
+        let Some(from) = row
+            .worktrees
+            .iter()
+            .find_map(|worktree| worktree.workspace.clone().or(worktree.switch_from.clone()))
+        else {
+            return Task::ready(Err(anyhow!("The project “{}” has no open workspace", row.name)));
+        };
+        let existing_branch = if use_existing_branch {
+            ExistingBranch::Use
+        } else {
+            ExistingBranch::Refuse
+        };
+        let created = self.make_worktree(
+            from,
+            repository,
+            row.key,
+            name.clone(),
+            description,
+            issue,
+            start_agent,
+            existing_branch,
+            window,
+            cx,
+        );
+        cx.background_spawn(async move {
+            created
+                .await?
+                .with_context(|| format!("Creating the worktree “{name}” was cancelled"))
+        })
+    }
+
+    /// The projects the panel lists and their worktrees, for callers outside
+    /// the panel.
+    pub fn projects(&self, cx: &App) -> Vec<ProjectListing> {
+        let store = WorktreeMetadataStore::try_global(cx);
+        self.tree(cx)
+            .into_iter()
+            .map(|row| ProjectListing {
+                linear_team: project_root(&row.key)
+                    .zip(store.as_ref())
+                    .and_then(|(root, store)| store.read(cx).get(&root, cx).linear_team),
+                root: project_root(&row.key),
+                name: row.name,
+                is_open: row.is_open,
+                worktrees: row
+                    .worktrees
+                    .into_iter()
+                    .map(|worktree| WorktreeListing {
+                        name: worktree.name,
+                        root: worktree.root,
+                        branch: worktree.branch,
+                        title: worktree.title,
+                        is_open: worktree.workspace.is_some(),
+                        is_main: worktree.is_main,
+                        is_active: worktree.is_active,
+                        agents: worktree.agents,
+                        processes: worktree.processes,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// [`Self::create_worktree`] without the reporting: resolves to the new
+    /// worktree's root, or to `None` when the user cancelled.
+    fn make_worktree(
+        &mut self,
+        from: Entity<Workspace>,
+        repository: Entity<Repository>,
+        key: ProjectGroupKey,
+        name: SharedString,
+        description: Option<SharedString>,
+        issue: Option<Arc<Issue>>,
+        start_agent: bool,
+        existing_branch: ExistingBranch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
         let Some(fs) = self.fs(cx) else {
-            return;
+            return Task::ready(Err(anyhow!("Bench has no file system to create worktrees with")));
         };
         let (path, mut target) = new_worktree(&key, &name);
         let snapshot = repository.read(cx).snapshot();
@@ -1625,7 +1827,8 @@ impl WorktreePanel {
         cx.spawn_in(window, async move |this, cx| {
             let branches = repository
                 .update(cx, |repository, _| repository.branches())
-                .await??;
+                .await?
+                .with_context(|| format!("Could not create the worktree “{name}”"))?;
             let existing = branches
                 .branches
                 .into_iter()
@@ -1633,65 +1836,71 @@ impl WorktreePanel {
             if let Some(existing) = existing {
                 let worktrees = repository
                     .update(cx, |repository, _| repository.worktrees())
-                    .await??;
+                    .await?
+                    .with_context(|| format!("Could not create the worktree “{name}”"))?;
                 let checked_out = worktrees
                     .into_iter()
                     .find(|worktree| worktree.branch_name() == Some(name.as_ref()));
                 if let Some(checked_out) = checked_out {
-                    from.update(cx, |workspace, cx| {
-                        workspace.show_error(
-                            format!(
-                                "Could not create the worktree “{name}”: the branch is already checked out at {}",
-                                checked_out.path.display()
-                            ),
-                            cx,
-                        );
-                    });
-                    return anyhow::Ok(());
+                    anyhow::bail!(
+                        "Could not create the worktree “{name}”: the branch is already checked out at {}",
+                        checked_out.path.display()
+                    );
                 }
 
-                let last_commit = existing
-                    .most_recent_commit
-                    .map(|commit| format!(" Its last commit is “{}”.", commit.subject))
-                    .unwrap_or_default();
-                let answer = cx.update(|window, cx| {
-                    window.prompt(
-                        gpui::PromptLevel::Warning,
-                        &format!("A branch named “{name}” already exists."),
-                        Some(&format!(
-                            "No worktree has it checked out.{last_commit}\n\nUse it to carry on \
-                             from where it is, or replace it with a new branch from the latest \
-                             default branch, which discards its commits that are not on another \
-                             branch."
-                        )),
-                        &["Use Existing Branch", "Replace Branch", "Cancel"],
-                        cx,
-                    )
-                })?;
-                match answer.await? {
-                    0 => {
+                match existing_branch {
+                    ExistingBranch::Use => {
                         target = CreateWorktreeTarget::ExistingBranch {
                             branch_name: name.to_string(),
                         };
                     }
-                    1 => {
-                        let deleted = repository
-                            .update(cx, |repository, _| {
-                                repository.delete_branch(false, name.to_string(), true)
-                            })
-                            .await?;
-                        if let Err(refused) = deleted {
-                            log::error!("deleting the branch {name}: {refused:#}");
-                            from.update(cx, |workspace, cx| {
-                                workspace.show_error(
-                                    format!("Could not replace the branch “{name}”: {}", git_reason(&refused)),
-                                    cx,
-                                );
-                            });
-                            return anyhow::Ok(());
+                    ExistingBranch::Refuse => {
+                        anyhow::bail!(
+                            "Could not create the worktree “{name}”: a branch with that name \
+                             already exists. Use the existing branch, or pick another name."
+                        );
+                    }
+                    ExistingBranch::Ask => {
+                        let last_commit = existing
+                            .most_recent_commit
+                            .map(|commit| format!(" Its last commit is “{}”.", commit.subject))
+                            .unwrap_or_default();
+                        let answer = cx.update(|window, cx| {
+                            window.prompt(
+                                gpui::PromptLevel::Warning,
+                                &format!("A branch named “{name}” already exists."),
+                                Some(&format!(
+                                    "No worktree has it checked out.{last_commit}\n\nUse it to carry on \
+                                     from where it is, or replace it with a new branch from the latest \
+                                     default branch, which discards its commits that are not on another \
+                                     branch."
+                                )),
+                                &["Use Existing Branch", "Replace Branch", "Cancel"],
+                                cx,
+                            )
+                        })?;
+                        match answer.await? {
+                            0 => {
+                                target = CreateWorktreeTarget::ExistingBranch {
+                                    branch_name: name.to_string(),
+                                };
+                            }
+                            1 => {
+                                let deleted = repository
+                                    .update(cx, |repository, _| {
+                                        repository.delete_branch(false, name.to_string(), true)
+                                    })
+                                    .await?;
+                                if let Err(refused) = deleted {
+                                    anyhow::bail!(
+                                        "Could not replace the branch “{name}”: {}",
+                                        git_reason(&refused)
+                                    );
+                                }
+                            }
+                            _ => return Ok(None),
                         }
                     }
-                    _ => return anyhow::Ok(()),
                 }
             }
 
@@ -1707,63 +1916,53 @@ impl WorktreePanel {
                     repository.create_worktree(target, path.clone())
                 })
                 .await?;
-
-            match created {
-                Ok(()) => {
-                    // Stored before the worktree opens, so its title bar is
-                    // in its own colour from the first frame.
-                    cx.update(|_, cx| {
-                        WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
-                            let hue = store.least_used_hue(&siblings, cx);
-                            store.update(
-                                &path,
-                                |metadata| {
-                                    metadata.hue = Some(hue);
-                                    metadata.issue = linked;
-                                    metadata.title = title;
-                                },
-                                cx,
-                            );
-                        });
-                    })?;
-                    this.update_in(cx, |this, window, cx| {
-                        this.rediscover(project_root(&key), cx);
-                        this.open_worktree(key, path, name, then, window, cx);
-                    })?;
-                    let started = issue.and_then(|issue| {
-                        let linear = cx.update(|_, cx| Linear::global(cx)).ok()??;
-                        let identifier = issue.identifier.clone();
-                        let started =
-                            linear.update(cx, |linear, cx| linear.start_issue(issue, cx));
-                        Some((identifier, started))
-                    });
-                    if let Some((identifier, started)) = started
-                        && let Err(error) = started.await
-                    {
-                        log::error!("starting the Linear issue {identifier}: {error:#}");
-                        from.update(cx, |workspace, cx| {
-                            workspace.show_error(
-                                format!(
-                                    "Created the worktree, but could not update {identifier} in Linear: {error:#}"
-                                ),
-                                cx,
-                            );
-                        });
-                    }
-                }
-                Err(refused) => {
-                    log::error!("creating the worktree {}: {refused:#}", path.display());
-                    from.update(cx, |workspace, cx| {
-                        workspace.show_error(
-                            format!("Could not create the worktree “{name}”: {refused}"),
-                            cx,
-                        );
-                    });
-                }
+            if let Err(refused) = created {
+                anyhow::bail!("Could not create the worktree “{name}”: {refused}");
             }
-            anyhow::Ok(())
+
+            // Stored before the worktree opens, so its title bar is in its own
+            // colour from the first frame.
+            cx.update(|_, cx| {
+                WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+                    let hue = store.least_used_hue(&siblings, cx);
+                    store.update(
+                        &path,
+                        |metadata| {
+                            metadata.hue = Some(hue);
+                            metadata.issue = linked;
+                            metadata.title = title;
+                        },
+                        cx,
+                    );
+                });
+            })?;
+            this.update_in(cx, |this, window, cx| {
+                this.rediscover(project_root(&key), cx);
+                this.open_worktree(key, path.clone(), name, then, window, cx);
+            })?;
+            let started = issue.and_then(|issue| {
+                let linear = cx.update(|_, cx| Linear::global(cx)).ok()??;
+                let identifier = issue.identifier.clone();
+                let started = linear.update(cx, |linear, cx| linear.start_issue(issue, cx));
+                Some((identifier, started))
+            });
+            // The worktree exists by now, so this is reported on its own rather
+            // than as the creation failing.
+            if let Some((identifier, started)) = started
+                && let Err(error) = started.await
+            {
+                log::error!("starting the Linear issue {identifier}: {error:#}");
+                from.update(cx, |workspace, cx| {
+                    workspace.show_error(
+                        format!(
+                            "Created the worktree, but could not update {identifier} in Linear: {error:#}"
+                        ),
+                        cx,
+                    );
+                });
+            }
+            Ok(Some(path))
         })
-        .detach_and_log_err(cx);
     }
 
     /// Deletes a worktree: closes the workspaces showing anything inside it,
@@ -1947,13 +2146,33 @@ impl WorktreePanel {
                         .ok();
                     return anyhow::Ok(());
                 }
-                for nested in &refused_nested {
-                    remove_nested(&fs, git.as_deref(), nested, true).await?;
+                let forced = async {
+                    for nested in &refused_nested {
+                        remove_nested(&fs, git.as_deref(), nested, true).await?;
+                    }
+                    if !outer_removed {
+                        repository
+                            .update(cx, |repository, _| {
+                                repository.remove_worktree(root.clone(), true)
+                            })
+                            .await??;
+                    }
+                    anyhow::Ok(())
                 }
-                if !outer_removed {
-                    repository
-                        .update(cx, |repository, _| repository.remove_worktree(root.clone(), true))
-                        .await??;
+                .await;
+                // Shown, not only logged: after "Delete Anyway" a failure that
+                // only reached the log looks like the button doing nothing.
+                if let Err(error) = forced {
+                    log::error!("force-deleting the worktree {}: {error:#}", root.display());
+                    host.update(cx, |host, cx| {
+                        host.show_error(
+                            format!("Could not delete “{name}”: {}", git_reason(&error)),
+                            cx,
+                        );
+                    });
+                    this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
+                        .ok();
+                    return anyhow::Ok(());
                 }
             }
 
@@ -2836,7 +3055,7 @@ const CHEVRON_TURN: Duration = Duration::from_millis(120);
 /// that read as kinds of project rather than the whole icon set, most of which
 /// are actions and would make a project look like a button, then the languages
 /// and frameworks a project can be written in.
-const PROJECT_ICONS: [(IconName, &str); 49] = [
+const PROJECT_ICONS: [(IconName, &str); 50] = [
     (IconName::Folder, "Folder"),
     (IconName::Code, "Code"),
     (IconName::Terminal, "Terminal"),
@@ -2854,6 +3073,7 @@ const PROJECT_ICONS: [(IconName, &str); 49] = [
     (IconName::ChartBar, "Data"),
     (IconName::Sparkle, "AI"),
     (IconName::House, "Home"),
+    (IconName::Person, "User"),
     (IconName::Building, "Business"),
     (IconName::Banknote, "Money"),
     (IconName::Wallet, "Wallet"),
@@ -4205,6 +4425,13 @@ async fn linked_worktree_common_dir(fs: &dyn Fs, directory: &Path) -> Option<Pat
     } else {
         gitdir
     };
+    // A checkout whose git directory is gone — pruned, or removed by hand —
+    // is no longer a worktree of anything: git answers "is not a working
+    // tree" to removing it, forced or not. It is only files in the outer
+    // worktree now, and goes with it.
+    if !fs.is_dir(&gitdir).await {
+        return None;
+    }
     match fs.load(&gitdir.join("commondir")).await {
         Ok(common_dir) => {
             let common_dir = PathBuf::from(common_dir.trim());
@@ -5546,6 +5773,13 @@ mod tests {
         .await;
         fs.insert_tree("/wt/fix/node_modules/pkg", json!({ ".git": "gitdir: /x" }))
             .await;
+        // A checkout whose repository no longer has it: git refuses to remove
+        // it, so it has to go with the outer worktree as plain files.
+        fs.insert_tree(
+            "/wt/fix/repos/orphan",
+            json!({ ".git": "gitdir: /inner/.git/worktrees/gone", "file.txt": "hi" }),
+        )
+        .await;
 
         let nested = nested_worktrees(fs.clone(), PathBuf::from("/wt/fix")).await;
         let found: Vec<(PathBuf, PathBuf)> = nested
@@ -5756,6 +5990,83 @@ mod tests {
                 "the dialog is gone once the worktree is showing"
             );
         });
+    }
+
+    /// A worktree asked for with only an issue is named, titled and linked the
+    /// way the name dialog does it with that issue linked; text that is not a
+    /// branch name becomes the title and a name is made from it.
+    #[gpui::test]
+    async fn a_worktree_created_from_outside_the_panel_is_named_like_the_dialog_names_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
+        fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
+            .await;
+        let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
+        let outer = multi_workspace.update_in(&mut cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(project, window, cx)
+        });
+        cx.run_until_parked();
+        let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
+
+        let created = panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree_in_project(
+                Path::new("/outer"),
+                None,
+                None,
+                Some(an_issue("RB-116")),
+                false,
+                false,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let path = created.await.expect("the worktree is created");
+        let (expected, _) = new_worktree(&key, "dev/rb-116-legal-entities");
+        assert_eq!(path, expected, "named after the issue's Linear branch");
+        let metadata = cx.update(|_, cx| WorktreeMetadataStore::global(cx).read(cx).get(&path, cx));
+        assert_eq!(
+            metadata.issue.map(|issue| issue.identifier).as_deref(),
+            Some("RB-116")
+        );
+        assert_eq!(
+            metadata.title.as_deref(),
+            Some("Legal entities carry their own logo")
+        );
+
+        let created = panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree_in_project(
+                Path::new("/outer"),
+                Some("Fix the login redirect".into()),
+                None,
+                None,
+                false,
+                false,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let path = created.await.expect("the worktree is created");
+        let (expected, _) = new_worktree(&key, "fix-the-login-redirect");
+        assert_eq!(path, expected, "a description is made into a name");
+        let metadata = cx.update(|_, cx| WorktreeMetadataStore::global(cx).read(cx).get(&path, cx));
+        assert_eq!(metadata.title.as_deref(), Some("Fix the login redirect"));
+
+        let created = panels[0].update_in(&mut cx, |panel, window, cx| {
+            panel.create_worktree_in_project(
+                Path::new("/outer"),
+                None,
+                None,
+                None,
+                false,
+                false,
+                window,
+                cx,
+            )
+        });
+        assert!(created.await.is_err(), "nothing to name it after");
     }
 
     fn an_issue(identifier: &str) -> Arc<Issue> {

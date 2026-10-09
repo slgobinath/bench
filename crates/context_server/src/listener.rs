@@ -46,6 +46,7 @@ struct RegisteredTool {
 type ToolHandler = Box<
     dyn Fn(
         Option<serde_json::Value>,
+        ToolContext,
         &mut AsyncApp,
     ) -> Task<Result<ToolResponse<serde_json::Value>>>,
 >;
@@ -63,25 +64,76 @@ impl McpServer {
 
         cx.spawn(async move |cx| {
             let (temp_dir, socket_path, listener) = task.await?;
-            let tools = Rc::new(RefCell::new(HashMap::default()));
-            let handlers = Rc::new(RefCell::new(HashMap::default()));
-            let server_task = cx.spawn({
-                let tools = tools.clone();
-                let handlers = handlers.clone();
-                async move |cx| {
-                    while let Ok((stream, _)) = listener.accept().await {
-                        Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
-                    }
-                    drop(temp_dir)
-                }
-            });
-            Ok(Self {
-                socket_path,
-                _server_task: server_task,
-                tools,
-                handlers,
-            })
+            Ok(Self::serve(socket_path, listener, Some(temp_dir), cx))
         })
+    }
+
+    /// Serves at a fixed `socket_path`, so that clients outside the
+    /// application can find it.
+    ///
+    /// A socket file left behind by an instance that has exited is replaced,
+    /// but one that another running instance is still serving is not: the
+    /// first instance keeps it. The socket is readable and writable by its
+    /// owner only, since anything that can connect can call every tool.
+    pub fn bind(socket_path: PathBuf, cx: &AsyncApp) -> Task<Result<Self>> {
+        let task = cx.background_spawn({
+            let socket_path = socket_path.clone();
+            async move {
+                if socket_path.exists() {
+                    if net::UnixStream::connect(&socket_path).is_ok() {
+                        anyhow::bail!(
+                            "another instance is already serving MCP at {}",
+                            socket_path.display()
+                        );
+                    }
+                    std::fs::remove_file(&socket_path).with_context(|| {
+                        format!("removing the stale socket {}", socket_path.display())
+                    })?;
+                }
+                if let Some(parent) = socket_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let listener = UnixListener::bind(&socket_path).context("creating mcp socket")?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+                        .context("restricting the mcp socket to its owner")?;
+                }
+                anyhow::Ok(listener)
+            }
+        });
+
+        cx.spawn(async move |cx| {
+            let listener = task.await?;
+            Ok(Self::serve(socket_path, listener, None, cx))
+        })
+    }
+
+    fn serve(
+        socket_path: PathBuf,
+        listener: UnixListener,
+        temp_dir: Option<tempfile::TempDir>,
+        cx: &mut AsyncApp,
+    ) -> Self {
+        let tools = Rc::new(RefCell::new(HashMap::default()));
+        let handlers = Rc::new(RefCell::new(HashMap::default()));
+        let server_task = cx.spawn({
+            let tools = tools.clone();
+            let handlers = handlers.clone();
+            async move |cx| {
+                while let Ok((stream, _)) = listener.accept().await {
+                    Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
+                }
+                drop(temp_dir)
+            }
+        });
+        Self {
+            socket_path,
+            _server_task: server_task,
+            tools,
+            handlers,
+        }
     }
 
     pub fn add_tool<T: McpServerTool + Clone + 'static>(&mut self, tool: T) {
@@ -114,7 +166,7 @@ impl McpServer {
                 annotations: Some(tool.annotations()),
             },
             handler: Box::new({
-                move |input_value, cx| {
+                move |input_value, context, cx| {
                     let input = match input_value {
                         Some(input) => serde_json::from_value(input),
                         None => serde_json::from_value(serde_json::Value::Null),
@@ -123,7 +175,7 @@ impl McpServer {
                     let tool = tool.clone();
                     match input {
                         Ok(input) => cx.spawn(async move |cx| {
-                            let output = tool.run(input, cx).await?;
+                            let output = tool.run(input, context, cx).await?;
 
                             Ok(ToolResponse {
                                 content: output.content,
@@ -211,14 +263,30 @@ impl McpServer {
             .detach();
 
         cx.spawn(async move |cx| {
+            let mut context = ToolContext::default();
             while let Some(request) = incoming_rx.next().await {
                 let Some(request_id) = request.id.clone() else {
+                    if request.method == CLIENT_DIRECTORY_METHOD
+                        && let Some(params) = request.params
+                    {
+                        match serde_json::from_str::<ClientDirectoryParams>(params.get()) {
+                            Ok(params) => context.client_directory = Some(params.path),
+                            Err(error) => log::error!("invalid {CLIENT_DIRECTORY_METHOD}: {error}"),
+                        }
+                    }
                     continue;
                 };
 
                 if request.method == CallTool::METHOD {
-                    Self::handle_call_tool(request_id, request.params, &tools, &outgoing_tx, cx)
-                        .await;
+                    Self::handle_call_tool(
+                        request_id,
+                        request.params,
+                        context.clone(),
+                        &tools,
+                        &outgoing_tx,
+                        cx,
+                    )
+                    .await;
                 } else if request.method == ListTools::METHOD {
                     Self::handle_list_tools(request.id.unwrap(), &tools, &outgoing_tx);
                 } else if let Some(handler) = handlers.borrow().get(&request.method.as_ref()) {
@@ -268,6 +336,7 @@ impl McpServer {
     async fn handle_call_tool(
         request_id: RequestId,
         params: Option<Box<RawValue>>,
+        context: ToolContext,
         tools: &Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         outgoing_tx: &UnboundedSender<String>,
         cx: &mut AsyncApp,
@@ -282,7 +351,7 @@ impl McpServer {
                 if let Some(tool) = tools.borrow().get(&params.name.as_ref()) {
                     let outgoing_tx = outgoing_tx.clone();
 
-                    let task = (tool.handler)(params.arguments, cx);
+                    let task = (tool.handler)(params.arguments, context, cx);
                     cx.spawn(async move |_| {
                         let response = match task.await {
                             Ok(result) => CallToolResponse {
@@ -418,8 +487,27 @@ pub trait McpServerTool {
     fn run(
         &self,
         input: Self::Input,
+        context: ToolContext,
         cx: &mut AsyncApp,
     ) -> impl Future<Output = Result<ToolResponse<Self::Output>>>;
+}
+
+/// A notification a client sends to say which directory it is working in,
+/// before or after `initialize`. It is not part of MCP: a stdio bridge sends
+/// it on behalf of the process that spawned it, which MCP has no way to name.
+pub const CLIENT_DIRECTORY_METHOD: &str = "zed/clientDirectory";
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ClientDirectoryParams {
+    pub path: PathBuf,
+}
+
+/// What a tool knows about the connection it was called on.
+#[derive(Clone, Debug, Default)]
+pub struct ToolContext {
+    /// The directory the client said it is working in; see
+    /// [`CLIENT_DIRECTORY_METHOD`].
+    pub client_directory: Option<PathBuf>,
 }
 
 #[derive(Debug)]

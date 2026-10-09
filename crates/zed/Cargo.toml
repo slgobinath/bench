@@ -80,6 +80,7 @@ assets.workspace = true
 audio.workspace = true
 auto_update.workspace = true
 auto_update_ui.workspace = true
+bench_mcp.workspace = true
 breadcrumbs.workspace = true
 call.workspace = true
 call_hierarchy.workspace = true

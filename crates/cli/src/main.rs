@@ -153,6 +153,11 @@ struct Args {
     /// by having Zed act like netcat communicating over a Unix socket.
     #[arg(long, hide = true)]
     askpass: Option<String>,
+
+    /// Connect to the running app's MCP server over stdio, for use as an MCP
+    /// server command (e.g. `claude mcp add bench -- <this cli> --mcp`).
+    #[arg(long)]
+    mcp: bool,
 }
 
 /// Parses a path containing a position (e.g. `path:line:column`)
@@ -524,6 +529,10 @@ fn run() -> Result<()> {
         paths::set_custom_data_dir(dir);
     }
 
+    if args.mcp {
+        return mcp_bridge();
+    }
+
     #[cfg(target_os = "linux")]
     let args = flatpak::set_bin_if_no_escape(args);
 
@@ -796,6 +805,61 @@ fn run() -> Result<()> {
         std::process::exit(exit_status);
     }
     Ok(())
+}
+
+/// Relays MCP messages between stdio and the running app's MCP socket.
+///
+/// The app does all the work. This only tells it, before relaying anything,
+/// which directory the MCP client was started in, which is what lets its
+/// tools default to the worktree the client is working in.
+#[cfg(unix)]
+fn mcp_bridge() -> Result<()> {
+    use std::io::Write as _;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let socket_path = paths::mcp_socket_path();
+    let stream = UnixStream::connect(socket_path).with_context(|| {
+        format!(
+            "could not connect to {} (is the app running?)",
+            socket_path.display()
+        )
+    })?;
+
+    let directory = env::current_dir().context("reading the current directory")?;
+    let announcement = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "zed/clientDirectory",
+        "params": { "path": directory },
+    });
+    let mut socket_writer = stream.try_clone()?;
+    writeln!(socket_writer, "{announcement}")?;
+
+    let input = thread::spawn(move || -> io::Result<()> {
+        io::copy(&mut io::stdin().lock(), &mut socket_writer)?;
+        // The client is done; closing our half lets the app close the
+        // connection, which ends the relay below.
+        socket_writer.shutdown(Shutdown::Write)
+    });
+
+    let mut socket_reader = stream;
+    io::copy(&mut socket_reader, &mut io::stdout().lock()).context("relaying to stdout")?;
+
+    // The app closed the connection, possibly because it quit. The input
+    // thread may still be blocked reading stdin, so it is not waited for
+    // unless it has already finished.
+    if input.is_finished() {
+        input
+            .join()
+            .map_err(|_| anyhow::anyhow!("the stdin relay panicked"))?
+            .context("relaying from stdin")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn mcp_bridge() -> Result<()> {
+    anyhow::bail!("--mcp is only supported on macOS and Linux")
 }
 
 fn anonymous_fd(path: &str) -> Option<fs::File> {

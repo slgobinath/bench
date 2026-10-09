@@ -2136,6 +2136,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 
 [[package]]
+name = "bench_mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "context_server",
+ "editor",
+ "gpui",
+ "language",
+ "linear",
+ "log",
+ "paths",
+ "project",
+ "release_channel",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "util",
+ "workspace",
+ "worktree_panel",
+]
+
+[[package]]
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
@@ -23053,6 +23075,7 @@ dependencies = [
  "audio",
  "auto_update",
  "auto_update_ui",
+ "bench_mcp",
  "breadcrumbs",
  "call",
  "call_hierarchy",

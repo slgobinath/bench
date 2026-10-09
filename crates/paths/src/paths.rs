@@ -224,6 +224,13 @@ pub fn hang_traces_dir() -> &'static PathBuf {
     LOGS_DIR.get_or_init(|| data_dir().join("hang_traces"))
 }
 
+/// Returns the path to the socket Bench serves MCP on, which `cli --mcp`
+/// bridges to.
+pub fn mcp_socket_path() -> &'static PathBuf {
+    static MCP_SOCKET_PATH: OnceLock<PathBuf> = OnceLock::new();
+    MCP_SOCKET_PATH.get_or_init(|| data_dir().join("mcp.sock"))
+}
+
 /// Returns the path to the logs directory.
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();

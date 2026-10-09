@@ -773,6 +773,7 @@ fn main() {
         linear::init(cx);
         database_explorer::init(cx);
         agent_tracker::init(cx);
+        bench_mcp::init(cx);
         tasks_ui::init(cx);
         snippets_ui::init(cx);
         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);
