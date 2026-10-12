@@ -2935,6 +2935,9 @@ impl Pane {
                             focus_handle.dispatch_action(&*action, window, cx);
                             return;
                         }
+                        pane.activate_item(ix, true, true, window, cx);
+                        window.dispatch_action(crate::ToggleAllDocks.boxed_clone(), cx);
+                        return;
                     }
                     pane.activate_item(ix, true, true, window, cx)
                 }
