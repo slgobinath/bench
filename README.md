@@ -37,6 +37,7 @@ Bench runs your agents where they already live, in the terminal. It does not rep
 Paste a personal API key once. Bench keeps it in your system keychain, and `LINEAR_API_KEY` works too.
 
 - **Issues panel.** Search your issues and filter them by assignee, status, cycle, project and label, all behind one filter button. Issues are grouped by status unless you choose otherwise.
+- **Enter widens a search that found nothing.** Pressing Enter on a search with no results searches again across every assignee, unassigned issues and closed ones, without touching the filters. Changing the search or a filter goes back to them.
 - **Issues open as tabs.** An issue opens in a tab with its status, assignee, labels, description and comments. **Open in Linear** is one click away.
 - **Create a worktree for an issue.** Link an issue in the New Worktree dialog, or use **Create Worktree** on any issue. Bench names the worktree after the branch Linear suggests, moves the issue to *In Progress* and assigns it to you if nobody has it.
 - **Send an issue to the agent.** Right-click an issue's tab, or use the sparkle button on its row in the Issues panel, to put the issue's link into the Claude Code composer of the current worktree.
@@ -58,6 +59,19 @@ Paste a personal API key once. Bench keeps it in your system keychain, and `LINE
 ## Less in the way
 
 Bench is single-player, and its collaborators are agents. The collaboration panel button, the sign-in button, the inline assistant, the edit predictions button and the branch name in the title bar (a worktree is already named after its branch) are hidden by default. Menus have a little more room to breathe.
+
+## Shortcuts that differ from Zed
+
+On macOS, Bench moves navigation history to the keys browsers and Xcode use, so you can follow a reference with Cmd+Click and go back without lifting your hand off Cmd.
+
+| Action | Bench | Zed |
+|---|---|---|
+| Go back | `cmd-[` | `ctrl--` |
+| Go forward | `cmd-]` | `ctrl-_` |
+| Outdent | `ctrl-[` | `cmd-[` |
+| Indent | `ctrl-]` | `cmd-]` |
+| Search in project | `cmd-alt-f` | `cmd-shift-f` |
+| Text finder | `cmd-shift-f` | `cmd-alt-f` |
 
 ## Getting started
 

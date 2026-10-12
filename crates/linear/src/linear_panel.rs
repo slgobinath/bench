@@ -1051,6 +1051,12 @@ impl Render for LinearPanel {
                 window.focus(&this.search.focus_handle(cx), cx);
                 this.search.select_all(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &menu::Confirm, window, cx| {
+                if this.search.focus_handle(cx).is_focused(window) {
+                    this.linear
+                        .update(cx, |linear, cx| linear.widen_search_if_empty(cx));
+                }
+            }))
             .size_full()
             .bg(cx.theme().colors().panel_background)
             .child(body)

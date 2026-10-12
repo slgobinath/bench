@@ -360,6 +360,17 @@ impl Default for IssueFilters {
 }
 
 impl IssueFilters {
+    /// Every issue, whoever it is assigned to and whatever its state.
+    fn unfiltered() -> Self {
+        Self {
+            assignee: AssigneeFilter::Anyone,
+            states: Vec::new(),
+            project: None,
+            cycle: CycleFilter::Any,
+            labels: Vec::new(),
+        }
+    }
+
     /// The filters as Linear's `IssueFilter` input.
     fn to_graphql(&self) -> Value {
         let mut filter = serde_json::Map::new();
@@ -535,6 +546,13 @@ pub struct Linear {
     /// worktree's panel shows the same list.
     collapsed_groups: HashSet<(IssueGrouping, SharedString)>,
     query: String,
+    /// Whether the search ignores the panel's filters, because Enter was pressed
+    /// on a search they left empty. Not a filter, so the filter menu neither
+    /// shows nor resets it; changing the search or a filter ends it.
+    search_widened: bool,
+    /// Enter was pressed while the search was still in flight: if it comes
+    /// back empty, it is widened as soon as it does.
+    widen_when_empty: bool,
     issues: Vec<Arc<Issue>>,
     /// Whether a list request is in flight. The previous list stays on screen
     /// until it lands, rather than the panel emptying on every keystroke.
@@ -578,6 +596,8 @@ impl Linear {
             grouping: IssueGrouping::default(),
             collapsed_groups: HashSet::new(),
             query: String::new(),
+            search_widened: false,
+            widen_when_empty: false,
             issues: Vec::new(),
             loading: false,
             list_error: None,
@@ -833,6 +853,8 @@ impl Linear {
         let before = self.filters.clone();
         update(&mut self.filters);
         if self.filters != before {
+            self.search_widened = false;
+            self.widen_when_empty = false;
             self.refresh(cx);
         }
     }
@@ -843,7 +865,25 @@ impl Linear {
             return;
         }
         self.query = query.to_owned();
+        self.search_widened = false;
+        self.widen_when_empty = false;
         self.refresh(cx);
+    }
+
+    /// Searches again without the panel's filters, for an issue the filters
+    /// hide: someone else's, an unassigned one, or one that is closed. Only
+    /// does so for a search that found nothing, and leaves the filters as the
+    /// user set them, so changing the search goes back to them.
+    pub fn widen_search_if_empty(&mut self, cx: &mut Context<Self>) {
+        if self.query.is_empty() || self.search_widened {
+            return;
+        }
+        if self.loading {
+            self.widen_when_empty = true;
+        } else if self.issues.is_empty() && self.list_error.is_none() {
+            self.search_widened = true;
+            self.refresh(cx);
+        }
     }
 
     /// `filters` as Linear's `IssueFilter`, limited to the team the panel is
@@ -897,7 +937,11 @@ impl Linear {
             return;
         };
         let http_client = self.http_client.clone();
-        let filter = self.scoped_filter(&self.filters);
+        let filter = if self.search_widened {
+            self.scoped_filter(&IssueFilters::unfiltered())
+        } else {
+            self.scoped_filter(&self.filters)
+        };
         let query = self.query.clone();
         self.loading = true;
         self._list = Some(cx.spawn(async move |this, cx| {
@@ -917,6 +961,9 @@ impl Linear {
                         this.issues = issues.into_iter().map(Arc::new).collect();
                         for issue in this.issues.clone() {
                             this.remember(issue);
+                        }
+                        if std::mem::take(&mut this.widen_when_empty) {
+                            this.widen_search_if_empty(cx);
                         }
                     }
                     Err(error) => {
@@ -1866,6 +1913,8 @@ pub(crate) mod tests {
             grouping: IssueGrouping::default(),
             collapsed_groups: HashSet::new(),
             query: String::new(),
+            search_widened: false,
+            widen_when_empty: false,
             issues: Vec::new(),
             loading: false,
             list_error: None,
@@ -2058,6 +2107,11 @@ pub(crate) mod tests {
         assert_eq!(identifier_in_branch("eng-"), None);
         assert_eq!(identifier_in_branch("toolongkey-12"), None);
         assert_eq!(identifier_in_branch(""), None);
+    }
+
+    #[test]
+    fn unfiltered_asks_for_every_issue() {
+        assert_eq!(IssueFilters::unfiltered().to_graphql(), json!({}));
     }
 
     #[test]
