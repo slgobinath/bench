@@ -1476,6 +1476,20 @@ pub fn identifier_in_branch(branch: &str) -> Option<SharedString> {
     Some(format!("{}-{number}", team.to_ascii_uppercase()).into())
 }
 
+/// The identifier of the issue a Linear link points to, as
+/// `https://linear.app/<workspace>/issue/RB-137/title-slug` does.
+pub fn issue_identifier_in_url(url: &str) -> Option<SharedString> {
+    let rest = url
+        .strip_prefix("https://linear.app/")
+        .or_else(|| url.strip_prefix("http://linear.app/"))?;
+    let mut segments = rest.split(['?', '#']).next()?.split('/');
+    let _workspace = segments.next()?;
+    if segments.next()? != "issue" {
+        return None;
+    }
+    identifier_in_branch(segments.next()?)
+}
+
 /// The dashboard's request filter: `filters` without their status, limited to
 /// issues still open or finished since `since`. See
 /// [`Linear::dashboard_issues`].
@@ -2107,6 +2121,24 @@ pub(crate) mod tests {
         assert_eq!(identifier_in_branch("eng-"), None);
         assert_eq!(identifier_in_branch("toolongkey-12"), None);
         assert_eq!(identifier_in_branch(""), None);
+    }
+
+    #[test]
+    fn links_to_issues_are_told_from_other_linear_links() {
+        for (url, expected) in [
+            ("https://linear.app/rentbee/issue/RB-216/renters-sign-in", Some("RB-216")),
+            ("https://linear.app/rentbee/issue/rb-135#comment-1", Some("RB-135")),
+            ("https://linear.app/rentbee/issue/RB-136", Some("RB-136")),
+            ("https://linear.app/rentbee/project/storefront-launch", None),
+            ("https://linear.app/rentbee/issue/", None),
+            ("https://example.com/rentbee/issue/RB-216", None),
+        ] {
+            assert_eq!(
+                issue_identifier_in_url(url).as_deref(),
+                expected,
+                "{url}"
+            );
+        }
     }
 
     #[test]

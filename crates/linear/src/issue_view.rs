@@ -15,7 +15,7 @@ use ui::{Divider, Tooltip, prelude::*};
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};
 
-use crate::{CreateWorktree, Issue, IssueDetail, Linear, LinearEvent};
+use crate::{CreateWorktree, Issue, IssueDetail, Linear, LinearEvent, issue_identifier_in_url};
 
 /// The link, with a trailing space so it doesn't fuse with what is typed next.
 pub fn send_to_agent(url: &str) -> zed_actions::claude::SendText {
@@ -39,7 +39,8 @@ pub fn open_issue(
         return;
     }
     let project = workspace.project().clone();
-    let view = cx.new(|cx| IssueView::new(identifier, project, window, cx));
+    let workspace_handle = cx.weak_entity();
+    let view = cx.new(|cx| IssueView::new(identifier, workspace_handle, project, window, cx));
     workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
 }
 
@@ -60,6 +61,7 @@ pub struct IssueView {
     /// Known once the issue has loaded; the tab can only be sent to the agent
     /// from then on.
     url: Option<SharedString>,
+    workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     loaded: Loaded,
     focus_handle: FocusHandle,
@@ -71,6 +73,7 @@ pub struct IssueView {
 impl IssueView {
     fn new(
         identifier: SharedString,
+        workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -94,6 +97,7 @@ impl IssueView {
             identifier,
             title: None,
             url: None,
+            workspace,
             project,
             loaded: Loaded::Loading,
             focus_handle: cx.focus_handle(),
@@ -277,12 +281,26 @@ fn property(icon: IconName, text: SharedString) -> impl IntoElement {
         .child(Label::new(text).size(LabelSize::Small))
 }
 
-fn markdown_element(markdown: &Entity<Markdown>, window: &Window, cx: &App) -> MarkdownElement {
+/// Links to other Linear issues open their tab here when Linear is connected,
+/// and in the browser otherwise.
+fn markdown_element(
+    markdown: &Entity<Markdown>,
+    workspace: &WeakEntity<Workspace>,
+    window: &Window,
+    cx: &App,
+) -> MarkdownElement {
+    let workspace = workspace.clone();
     MarkdownElement::new(
         markdown.clone(),
         MarkdownStyle::themed(MarkdownFont::Preview, window, cx),
     )
-    .on_url_click(|url, _, cx| cx.open_url(&url))
+    .on_url_click(move |url, window, cx| {
+        let connected = Linear::global(cx).is_some_and(|linear| linear.read(cx).is_connected());
+        match connected.then(|| issue_identifier_in_url(&url)).flatten() {
+            Some(identifier) => open_issue_in(&workspace, identifier, window, cx),
+            None => cx.open_url(&url),
+        }
+    })
 }
 
 impl Render for IssueView {
@@ -313,7 +331,7 @@ impl Render for IssueView {
                 .child(self.render_header(&detail.issue, cx))
                 .child(Divider::horizontal())
                 .child(match description {
-                    Some(description) => markdown_element(description, window, cx).into_any_element(),
+                    Some(description) => markdown_element(description, &self.workspace, window, cx).into_any_element(),
                     None => Label::new("No description")
                         .color(Color::Muted)
                         .into_any_element(),
@@ -344,7 +362,7 @@ impl Render for IssueView {
                                                     .color(Color::Muted),
                                             ),
                                     )
-                                    .child(markdown_element(body, window, cx))
+                                    .child(markdown_element(body, &self.workspace, window, cx))
                             })),
                     )
                 })
@@ -439,9 +457,10 @@ impl Item for IssueView {
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>> {
         let identifier = self.identifier.clone();
+        let workspace = self.workspace.clone();
         let project = self.project.clone();
         Task::ready(Some(
-            cx.new(|cx| IssueView::new(identifier, project, window, cx)),
+            cx.new(|cx| IssueView::new(identifier, workspace, project, window, cx)),
         ))
     }
 }
