@@ -49,7 +49,7 @@ use workspace::searchable::{
 use workspace::{ItemId, Pane, SaveIntent, Workspace, WorkspaceId, delete_unloaded_items};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
-    claude::{SendLines, SendSelection},
+    claude::{AddComment, AddCommentOn, CommentTarget, SendLines, SendSelection},
 };
 
 use crate::markdown_preview_settings::MarkdownPreviewSettings;
@@ -1044,6 +1044,31 @@ impl MarkdownPreviewView {
         }
     }
 
+    /// A comment on the lines of the source the selection was rendered from.
+    fn comment_on_selection(&self, cx: &App) -> Option<AddCommentOn> {
+        let lines = self.selected_lines(cx)?;
+        let markdown = self.markdown.read(cx);
+        let excerpt = markdown
+            .selected_source_range()
+            .and_then(|range| markdown.source().get(range))
+            .map(str::to_string);
+        Some(AddCommentOn {
+            target: CommentTarget {
+                path: lines.path,
+                start_line: Some(lines.start_line),
+                end_line: Some(lines.end_line),
+                excerpt,
+            },
+        })
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        match self.comment_on_selection(cx) {
+            Some(comment) => window.dispatch_action(Box::new(comment), cx),
+            None => cx.propagate(),
+        }
+    }
+
     fn close_and_return_to_editor(
         &mut self,
         _: &CloseAndReturnToEditor,
@@ -1085,7 +1110,9 @@ impl MarkdownPreviewView {
     /// Returns the theme chosen in `markdown_preview.theme`, or `None` if the
     /// user hasn't set one or it can't be resolved.
     fn resolve_preview_theme(&self, cx: &App) -> Option<Arc<Theme>> {
-        let theme_selection = ThemeSettings::get_global(cx).markdown_preview_theme.as_ref();
+        let theme_selection = ThemeSettings::get_global(cx)
+            .markdown_preview_theme
+            .as_ref();
         let configured = theme_selection.and_then(|theme_selection| {
             let theme_name = theme_selection.name(SystemAppearance::global(cx).0);
             ThemeRegistry::global(cx).get(&theme_name.0).ok()
@@ -1863,6 +1890,7 @@ impl MarkdownPreviewView {
             .on_action(cx.listener(MarkdownPreviewView::scroll_to_bottom))
             .on_action(cx.listener(MarkdownPreviewView::close_and_return_to_editor))
             .on_action(cx.listener(MarkdownPreviewView::send_selection))
+            .on_action(cx.listener(MarkdownPreviewView::add_comment))
             .on_action(cx.listener(MarkdownPreviewView::increase_font_size))
             .on_action(cx.listener(MarkdownPreviewView::decrease_font_size))
             .on_action(cx.listener(MarkdownPreviewView::reset_font_size))
@@ -1899,6 +1927,9 @@ impl MarkdownPreviewView {
                                     let send_lines = view
                                         .upgrade()
                                         .and_then(|view| view.read(cx).selected_lines(cx));
+                                    let comment = view
+                                        .upgrade()
+                                        .and_then(|view| view.read(cx).comment_on_selection(cx));
                                     if context_menu_link.is_none()
                                         && selected_text.is_none()
                                         && selected_markdown.is_none()
@@ -1919,6 +1950,18 @@ impl MarkdownPreviewView {
                                                         );
                                                     },
                                                 )
+                                                .when_some(comment, |menu, comment| {
+                                                    menu.entry(
+                                                        "Add Comment…",
+                                                        Some(Box::new(AddComment)),
+                                                        move |window, cx| {
+                                                            window.dispatch_action(
+                                                                Box::new(comment.clone()),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )
+                                                })
                                                 .separator()
                                             })
                                             .when_some(selected_text, |menu, text| {
@@ -1983,16 +2026,14 @@ impl MarkdownPreviewView {
                         .child(LinkPreview::new(hovered_url.as_ref(), cx)),
                 )
             })
-            .child(
-                div().absolute().top_2().right_4().child(appearance_toggle(
-                    "toggle-appearance",
-                    cx.theme().appearance(),
-                    cx.listener(|this, appearance: &Appearance, _, cx| {
-                        this.appearance = Some(*appearance);
-                        cx.notify();
-                    }),
-                )),
-            )
+            .child(div().absolute().top_2().right_4().child(appearance_toggle(
+                "toggle-appearance",
+                cx.theme().appearance(),
+                cx.listener(|this, appearance: &Appearance, _, cx| {
+                    this.appearance = Some(*appearance);
+                    cx.notify();
+                }),
+            )))
             .into_any_element()
     }
 }

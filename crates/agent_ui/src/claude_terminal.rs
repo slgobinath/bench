@@ -16,7 +16,8 @@ use terminal_view::terminal_panel::TerminalPanel;
 use util::ResultExt as _;
 use workspace::Workspace;
 use zed_actions::claude::{
-    NewTerminal, SendCommit, SendDiagnostic, SendFile, SendLines, SendSelection, SendText,
+    NewTerminal, ReviewComment, SendComments, SendCommit, SendDiagnostic, SendFile, SendLines,
+    SendSelection, SendText,
 };
 
 use crate::agent_panel::format_selection_for_terminal;
@@ -84,6 +85,16 @@ pub fn init(cx: &mut App) {
             .register_action(|workspace, action: &SendText, window, cx| {
                 send(workspace, Payload::Text(action.text.clone()), window, cx);
             })
+            .register_action(|workspace, action: &SendComments, window, cx| {
+                if !action.comments.is_empty() {
+                    send(
+                        workspace,
+                        Payload::Comments(action.comments.clone()),
+                        window,
+                        cx,
+                    );
+                }
+            })
             .register_action(|workspace, action: &SendDiagnostic, window, cx| {
                 let payload = Payload::Diagnostic {
                     path: PathBuf::from(action.path.clone()),
@@ -112,6 +123,7 @@ enum Payload {
         message: String,
     },
     Text(String),
+    Comments(Vec<ReviewComment>),
 }
 
 fn send(
@@ -209,6 +221,9 @@ fn paste(
         ),
         Payload::Commit(sha) => format!("{sha} "),
         Payload::Text(text) => text.clone(),
+        Payload::Comments(comments) => format_comments(comments, |path| {
+            mention_path(path, &working_directory, workspace, cx)
+        }),
         Payload::Diagnostic {
             path,
             line,
@@ -225,6 +240,40 @@ fn paste(
     // No trailing carriage return: the text lands in Claude's composer so the
     // prompt can be typed around it, rather than being submitted on its own.
     terminal.update(cx, |terminal, _| terminal.paste(&text));
+}
+
+/// Review comments as one prompt: each comment under a mention of the lines it
+/// is about, numbered so the agent can answer them one by one. A comment on a
+/// page that couldn't be traced to its lines quotes the text instead.
+fn format_comments(comments: &[ReviewComment], mention: impl Fn(&Path) -> String) -> String {
+    let mut text = String::from("Please address these review comments:\n");
+    for (index, comment) in comments.iter().enumerate() {
+        let target = &comment.target;
+        let lines = match (target.start_line, target.end_line) {
+            (Some(start), end) => {
+                let start = start.saturating_sub(1);
+                let end = end.map_or(start, |end| end.saturating_sub(1)).max(start);
+                line_range_suffix(&(start..=end))
+            }
+            (None, _) => String::new(),
+        };
+        text.push_str(&format!(
+            "\n{}. {}{lines}\n",
+            index + 1,
+            mention(Path::new(&target.path))
+        ));
+        if target.start_line.is_none()
+            && let Some(excerpt) = &target.excerpt
+        {
+            for line in excerpt.trim().lines() {
+                text.push_str(&format!("   > {line}\n"));
+            }
+        }
+        for line in comment.comment.trim().lines() {
+            text.push_str(&format!("   {line}\n"));
+        }
+    }
+    text
 }
 
 /// A path relative to the terminal's cwd when it sits under it, so the agent
@@ -452,6 +501,42 @@ mod tests {
     use project::Project;
     use settings::SettingsStore;
     use workspace::MultiWorkspace;
+    use zed_actions::claude::CommentTarget;
+
+    #[test]
+    fn comments_are_numbered_under_mentions_of_their_lines() {
+        let comment = |path: &str, lines: Option<(u32, u32)>, excerpt: Option<&str>, body: &str| {
+            ReviewComment {
+                target: CommentTarget {
+                    path: path.to_string(),
+                    start_line: lines.map(|(start, _)| start),
+                    end_line: lines.map(|(_, end)| end),
+                    excerpt: excerpt.map(str::to_string),
+                },
+                comment: body.to_string(),
+            }
+        };
+        let comments = [
+            comment(
+                "/work/src/main.rs",
+                Some((10, 12)),
+                Some("fn main"),
+                "Rename this.\nAnd test it.",
+            ),
+            comment("/work/index.html", None, Some("Pricing"), "Make it bigger."),
+            comment("/work/README.md", Some((4, 4)), None, "Typo"),
+        ];
+        let text = format_comments(&comments, |path| {
+            format!("@{}", path.strip_prefix("/work").unwrap_or(path).display())
+        });
+        assert_eq!(
+            text,
+            "Please address these review comments:\n\
+             \n1. @src/main.rs:10-12\n   Rename this.\n   And test it.\n\
+             \n2. @index.html\n   > Pricing\n   Make it bigger.\n\
+             \n3. @README.md:4\n   Typo\n"
+        );
+    }
 
     #[gpui::test]
     async fn test_launch_opens_a_claude_terminal_in_the_worktree_root(cx: &mut TestAppContext) {

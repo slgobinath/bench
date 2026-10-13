@@ -166,8 +166,8 @@ mod platform {
         NSAppearance, NSAppearanceCustomization as _, NSAppearanceNameAqua,
         NSAppearanceNameDarkAqua, NSView,
     };
-    use theme::Appearance;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use theme::Appearance;
     use util::ResultExt as _;
     use wry::WebViewExtMacOS as _;
 

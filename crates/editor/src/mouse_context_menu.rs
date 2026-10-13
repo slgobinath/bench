@@ -12,7 +12,7 @@ use project::DisableAiSettings;
 use std::ops::Range;
 use text::PointUtf16;
 use workspace::OpenInTerminal;
-use zed_actions::claude::SendSelection;
+use zed_actions::claude::{AddComment, SendSelection};
 use zed_actions::preview::{
     markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
 };
@@ -293,6 +293,9 @@ pub fn deploy_context_menu(
                 )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Send to Agent", Box::new(SendSelection))
+                })
+                .when(!disable_ai, |this| {
+                    this.action("Add Comment…", Box::new(AddComment))
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))

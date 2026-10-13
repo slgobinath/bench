@@ -15736,6 +15736,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "review_comments"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "menu",
+ "project",
+ "serde_json",
+ "text",
+ "ui",
+ "util",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23429,6 +23446,7 @@ dependencies = [
  "remote_server",
  "repl",
  "reqwest_client",
+ "review_comments",
  "rope",
  "sandbox",
  "search",

@@ -798,6 +798,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
         let linear_panel = LinearPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
+        let comments_panel =
+            review_comments::CommentsPanel::load(workspace_handle.clone(), cx.clone());
 
         async fn add_panel_when_ready(
             panel_task: impl Future<Output = anyhow::Result<Entity<impl workspace::Panel>>> + 'static,
@@ -825,6 +827,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(linear_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(comments_panel, workspace_handle.clone(), cx.clone()),
             initialize_agent_panel(workspace_handle.clone(), cx.clone()).map(|r| r.log_err()),
         );
 

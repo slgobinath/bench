@@ -23,7 +23,9 @@ use util::ResultExt as _;
 use workspace::item::Item;
 use workspace::notifications::NotifyResultExt as _;
 use workspace::{Pane, Workspace};
-use zed_actions::claude::{SendLines, SendSelection, SendText};
+use zed_actions::claude::{
+    AddComment, AddCommentOn, CommentTarget, SendLines, SendSelection, SendText,
+};
 
 use crate::web_view::{PageEvent, WebView, page_url};
 
@@ -299,6 +301,7 @@ impl HtmlPreviewView {
         cx: &mut Context<Self>,
     ) {
         let send_to_agent = self.send_to_agent_action(cx);
+        let comment_target = self.selection_target(cx);
         let has_selection = !self.selection.is_empty();
         let focus_handle = self.focus_handle.clone();
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
@@ -309,6 +312,20 @@ impl HtmlPreviewView {
                         Some(Box::new(SendSelection)),
                         move |window, cx| window.dispatch_action(action.boxed_clone(), cx),
                     )
+                    .when_some(comment_target, |menu, target| {
+                        menu.entry(
+                            "Add Comment…",
+                            Some(Box::new(AddComment)),
+                            move |window, cx| {
+                                window.dispatch_action(
+                                    Box::new(AddCommentOn {
+                                        target: target.clone(),
+                                    }),
+                                    cx,
+                                )
+                            },
+                        )
+                    })
                     .separator()
                 })
                 .when(has_selection, |menu| {
@@ -332,6 +349,28 @@ impl HtmlPreviewView {
     /// What sends the page's selection to the agent: the lines of the file it
     /// was rendered from when they can be found, and otherwise the text.
     fn send_to_agent_action(&self, cx: &App) -> Option<Box<dyn Action>> {
+        let target = self.selection_target(cx)?;
+        match (target.start_line, target.end_line) {
+            (Some(start_line), Some(end_line)) => Some(Box::new(SendLines {
+                path: target.path,
+                start_line,
+                end_line,
+            })),
+            _ => Some(Box::new(SendText {
+                text: format!(
+                    "From {}:\n{}\n",
+                    self.project_path
+                        .path
+                        .display(util::paths::PathStyle::local()),
+                    self.selection.trim()
+                ),
+            })),
+        }
+    }
+
+    /// The page's selection, as the lines of the file it was rendered from
+    /// when they can be found, and as its text otherwise.
+    fn selection_target(&self, cx: &App) -> Option<CommentTarget> {
         let selection = self.selection.trim();
         if selection.is_empty()
             || DisableAiSettings::is_ai_disabled_for_buffer(self.buffer.as_ref(), cx)
@@ -342,20 +381,18 @@ impl HtmlPreviewView {
             .buffer
             .as_ref()
             .and_then(|buffer| source_lines_for_selection(&buffer.read(cx).text(), selection));
-        match source_lines {
-            Some(lines) => Some(Box::new(SendLines {
-                path: self.abs_path.to_string_lossy().into_owned(),
-                start_line: *lines.start(),
-                end_line: *lines.end(),
-            })),
-            None => Some(Box::new(SendText {
-                text: format!(
-                    "From {}:\n{selection}\n",
-                    self.project_path
-                        .path
-                        .display(util::paths::PathStyle::local())
-                ),
-            })),
+        Some(CommentTarget {
+            path: self.abs_path.to_string_lossy().into_owned(),
+            start_line: source_lines.as_ref().map(|lines| *lines.start()),
+            end_line: source_lines.as_ref().map(|lines| *lines.end()),
+            excerpt: Some(selection.to_string()),
+        })
+    }
+
+    fn add_comment(&mut self, _: &AddComment, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selection_target(cx) {
+            Some(target) => window.dispatch_action(Box::new(AddCommentOn { target }), cx),
+            None => cx.propagate(),
         }
     }
 
@@ -458,17 +495,15 @@ fn source_lines_for_selection(source: &str, selection: &str) -> Option<RangeIncl
 
 impl Render for HtmlPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let appearance = self
-            .appearance
-            .unwrap_or_else(|| cx.theme().appearance());
+        let appearance = self.appearance.unwrap_or_else(|| cx.theme().appearance());
         if self.applied_appearance != Some(appearance)
             && let Some(web_view) = &self.web_view
         {
             web_view.set_appearance(appearance);
             self.applied_appearance = Some(appearance);
         }
-        let show_toggle = self.web_view.is_some()
-            && !self.is_covered_by_zoomed_item(cx.entity_id(), cx);
+        let show_toggle =
+            self.web_view.is_some() && !self.is_covered_by_zoomed_item(cx.entity_id(), cx);
 
         v_flex()
             .id("HtmlPreview")
@@ -478,6 +513,7 @@ impl Render for HtmlPreviewView {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::send_selection))
+            .on_action(cx.listener(Self::add_comment))
             .on_action(cx.listener(Self::reload))
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::select_all))

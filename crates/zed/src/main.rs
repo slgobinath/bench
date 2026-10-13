@@ -808,6 +808,7 @@ fn main() {
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         html_preview::init(cx);
+        review_comments::init(cx);
         onboarding::init(cx);
         settings_ui::init(cx);
         keymap_editor::init(cx);

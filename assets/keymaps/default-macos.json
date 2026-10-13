@@ -164,6 +164,7 @@
       "cmd-alt-l": ["buffer_search::Deploy", { "selection_search_enabled": true }],
       "cmd-e": "buffer_search::UseSelectionForFind",
       "cmd->": "claude::SendSelection",
+      "cmd-<": "claude::AddComment",
       "cmd-alt-e": "editor::SelectEnclosingSymbol",
       "alt-enter": "editor::OpenSelectionsInMultibuffer",
       "cmd-shift-f": "text_finder::Toggle",
@@ -1511,6 +1512,15 @@
       "cmd-shift-v": "markdown::CloseAndReturnToEditor",
       "cmd-f": "buffer_search::Deploy",
       "cmd->": "claude::SendSelection",
+      "cmd-<": "claude::AddComment",
+    },
+  },
+  {
+    "context": "CommentDialog > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
     },
   },
   {
@@ -1523,6 +1533,7 @@
       "cmd-r": "html_preview::Reload",
       "cmd-alt-i": "html_preview::OpenDevTools",
       "cmd->": "claude::SendSelection",
+      "cmd-<": "claude::AddComment",
     },
   },
   {

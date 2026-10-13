@@ -696,7 +696,7 @@ pub mod assistant {
 pub mod claude {
     use gpui::{Action, actions};
     use schemars::JsonSchema;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
 
     actions!(
         claude,
@@ -706,8 +706,52 @@ pub mod claude {
             /// Sends the current selection to the Claude Code terminal for the
             /// active worktree, starting one if none is running there.
             SendSelection,
+            /// Comments on the selected lines. Comments collect in the comments
+            /// panel until they are sent to the agent together.
+            AddComment,
         ]
     );
+
+    /// Opens the comment dialog for a range of a file's lines, or for a piece
+    /// of a page that couldn't be traced to its lines.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct AddCommentOn {
+        pub target: CommentTarget,
+    }
+
+    /// What a review comment is about.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+    pub struct CommentTarget {
+        /// Absolute path of the file.
+        pub path: String,
+        /// One-based first line, when the lines are known.
+        #[serde(default)]
+        pub start_line: Option<u32>,
+        /// One-based last line, included.
+        #[serde(default)]
+        pub end_line: Option<u32>,
+        /// The text commented on.
+        #[serde(default)]
+        pub excerpt: Option<String>,
+    }
+
+    /// A comment on a file, as sent to the agent.
+    #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
+    pub struct ReviewComment {
+        pub target: CommentTarget,
+        pub comment: String,
+    }
+
+    /// Puts review comments into the composer of the agent terminal for the
+    /// active worktree, all in one message.
+    #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
+    #[action(namespace = claude)]
+    #[serde(deny_unknown_fields)]
+    pub struct SendComments {
+        pub comments: Vec<ReviewComment>,
+    }
 
     /// Sends a file to the agent terminal for the active worktree.
     #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
