@@ -992,6 +992,20 @@ pub mod preview {
             ]
         );
     }
+
+    pub mod html {
+        use gpui::actions;
+
+        actions!(
+            html_preview,
+            [
+                /// Opens the current HTML file in a browser tab.
+                OpenPreview,
+                /// Opens the current HTML file in a browser tab in a split pane.
+                OpenPreviewToTheSide,
+            ]
+        );
+    }
 }
 
 pub mod agents_sidebar {

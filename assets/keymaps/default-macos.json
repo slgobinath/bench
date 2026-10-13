@@ -660,6 +660,14 @@
     },
   },
   {
+    "context": "Editor && (extension == html || extension == htm)",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-k v": "html_preview::OpenPreviewToTheSide",
+      "cmd-shift-v": "html_preview::OpenPreview",
+    },
+  },
+  {
     "context": "Editor && (extension == csv || extension == tsv || extension == ssv || extension == psv || extension == jsonl || extension == ndjson)",
     "use_key_equivalents": true,
     "bindings": {
@@ -1502,6 +1510,18 @@
       "cmd-down": "markdown::ScrollToBottom",
       "cmd-shift-v": "markdown::CloseAndReturnToEditor",
       "cmd-f": "buffer_search::Deploy",
+      "cmd->": "claude::SendSelection",
+    },
+  },
+  {
+    "context": "HtmlPreview",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "html_preview::CopySelection",
+      "cmd-a": "html_preview::SelectAll",
+      "cmd-v": "html_preview::Paste",
+      "cmd-r": "html_preview::Reload",
+      "cmd-alt-i": "html_preview::OpenDevTools",
       "cmd->": "claude::SendSelection",
     },
   },

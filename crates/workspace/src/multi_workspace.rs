@@ -336,9 +336,7 @@ impl MultiWorkspace {
             // Bench registers no sidebar, but a restored session or an action
             // can still mark it open. Reporting that would make the title bar
             // leave the traffic lights to a sidebar that is never drawn.
-            open: self.sidebar.is_some()
-                && self.sidebar_open()
-                && self.multi_workspace_enabled(cx),
+            open: self.sidebar.is_some() && self.sidebar_open() && self.multi_workspace_enabled(cx),
             side: self.sidebar_side(cx),
         }
     }
@@ -2193,7 +2191,9 @@ impl Render for MultiWorkspace {
                         .child(self.workspace().clone()),
                 )
                 .children(right_sidebar)
-                .child(self.workspace().read(cx).modal_layer.clone())
+                // Deferred so that modals draw above native views such as an
+                // HTML preview's web view, which sit above non-deferred content.
+                .child(deferred(self.workspace().read(cx).modal_layer.clone()).with_priority(0))
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(
                         v_flex().h(px(0.0)).top_20().items_center().child(

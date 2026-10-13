@@ -1,9 +1,12 @@
 use editor::{Editor, MultiBuffer};
 use gpui::{AnyElement, Entity, Modifiers};
+use html_preview::HtmlPreviewView;
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
+use project::ProjectPath;
 use svg_preview::svg_preview_view::SvgPreviewView;
 use tabular_data_preview::TabularDataPreviewPane;
 use ui::{Tooltip, prelude::*, text_for_keystroke};
+use workspace::notifications::NotifyResultExt as _;
 
 use super::QuickActionBar;
 
@@ -11,6 +14,7 @@ enum PreviewTarget {
     Markdown(Entity<Editor>),
     Svg(Entity<MultiBuffer>),
     TabularData(Entity<Editor>),
+    Html(ProjectPath),
 }
 
 impl QuickActionBar {
@@ -33,6 +37,11 @@ impl QuickActionBar {
             && TabularDataPreviewPane::is_tabular_data_file(&editor, cx)
         {
             PreviewTarget::TabularData(editor)
+        } else if let Some(project_path) = active_item.project_path(cx)
+            && html_preview::is_html_file(project_path.path.as_std_path())
+            && active_item.act_as::<HtmlPreviewView>(cx).is_none()
+        {
+            PreviewTarget::Html(project_path)
         } else {
             return None;
         };
@@ -52,6 +61,11 @@ impl QuickActionBar {
                 "toggle-tabular-preview",
                 "Preview Tabular Data",
                 &tabular_data_preview::OpenPreview as &dyn gpui::Action,
+            ),
+            PreviewTarget::Html(_) => (
+                "toggle-html-preview",
+                "Open in Browser Tab",
+                &html_preview::OpenPreview as &dyn gpui::Action,
             ),
         };
 
@@ -123,6 +137,22 @@ impl QuickActionBar {
                                         editor, pane, window, cx,
                                     );
                                 }
+                            }
+                            PreviewTarget::Html(project_path) => {
+                                let pane = if open_to_the_side {
+                                    workspace.adjacent_pane_of(&pane, window, cx)
+                                } else {
+                                    pane
+                                };
+                                HtmlPreviewView::open(
+                                    workspace,
+                                    project_path.clone(),
+                                    pane,
+                                    !open_to_the_side,
+                                    window,
+                                    cx,
+                                )
+                                .notify_err(workspace, cx);
                             }
                         }
                     });

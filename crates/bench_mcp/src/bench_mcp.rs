@@ -1,5 +1,5 @@
-//! Bench's MCP server: tools that let an agent see what Bench is showing and
-//! create worktrees in it.
+//! Bench's MCP server: tools that let an agent see what Bench is showing,
+//! create worktrees in it and open pages in it.
 //!
 //! It is served on a Unix socket at [`paths::mcp_socket_path`], which only its
 //! owner can open, and agents reach it through `cli --mcp`, a stdio bridge to
@@ -17,6 +17,7 @@ use context_server::types::{
 };
 use editor::Editor;
 use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt as _, WindowHandle};
+use html_preview::HtmlPreviewView;
 use language::{DiagnosticSeverity, OffsetRangeExt as _};
 use project::Project;
 use schemars::JsonSchema;
@@ -49,6 +50,7 @@ pub fn init(cx: &mut App) {
         server.add_tool(GetActiveEditor);
         server.add_tool(GetOpenFiles);
         server.add_tool(GetDiagnostics);
+        server.add_tool(OpenHtmlFile);
         cx.update(|cx| cx.set_global(BenchMcpServer(server)));
         anyhow::Ok(())
     })
@@ -854,6 +856,117 @@ impl McpServerTool for GetDiagnostics {
             files_truncated,
         })
     }
+}
+
+#[derive(Clone)]
+struct OpenHtmlFile;
+
+/// Opens an HTML file from a worktree in a browser tab in Bench, so the person
+/// can look at the page and select parts of it to send back to you. The tab
+/// reloads when the file changes on disk. Pages are served from the worktree,
+/// so relative links to scripts, styles and images work.
+#[derive(Deserialize, JsonSchema)]
+struct OpenHtmlFileInput {
+    /// The HTML file: an absolute path, or one relative to the worktree's root.
+    path: String,
+    /// The worktree's directory. Defaults to the worktree the caller is
+    /// working in.
+    #[serde(default)]
+    worktree: Option<String>,
+    /// Open the tab in a split beside the active pane rather than in it.
+    #[serde(default)]
+    to_the_side: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct OpenHtmlFileOutput {
+    path: PathBuf,
+}
+
+impl McpServerTool for OpenHtmlFile {
+    type Input = OpenHtmlFileInput;
+    type Output = OpenHtmlFileOutput;
+
+    const NAME: &'static str = "open_html_file";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let path = PathBuf::from(&input.path);
+        let directory = match &input.worktree {
+            None if path.is_absolute() => path.clone(),
+            _ => target_directory(input.worktree.clone(), &context)?,
+        };
+        let (window, workspace, path) = cx.update(|cx| -> Result<_> {
+            let workspace = workspace_for_directory(&directory, cx)?;
+            let path = if path.is_relative() {
+                let roots = workspace_roots(&workspace, cx);
+                let root = containing_root(roots.iter().map(PathBuf::as_path), &directory)
+                    .context("The worktree is not open in Bench")?;
+                root.join(&path)
+            } else {
+                path
+            };
+            let window = window_for_workspace(&workspace, cx)?;
+            Ok((window, workspace, path))
+        })?;
+        anyhow::ensure!(
+            html_preview::is_html_file(&path),
+            "{} is not an HTML file",
+            path.display()
+        );
+        let fs = cx.update(|cx| workspace.read(cx).project().read(cx).fs().clone());
+        anyhow::ensure!(fs.is_file(&path).await, "{} does not exist", path.display());
+
+        window.update(cx, |_, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                let project_path = workspace
+                    .project()
+                    .read(cx)
+                    .find_project_path(&path, cx)
+                    .with_context(|| format!("{} is not in an open worktree", path.display()))?;
+                let pane = workspace.active_pane().clone();
+                let pane = if input.to_the_side {
+                    workspace.adjacent_pane_of(&pane, window, cx)
+                } else {
+                    pane
+                };
+                HtmlPreviewView::open(workspace, project_path, pane, false, window, cx)?;
+                anyhow::Ok(())
+            })
+        })??;
+        respond(OpenHtmlFileOutput { path })
+    }
+}
+
+/// The window a workspace is open in.
+fn window_for_workspace(
+    workspace: &Entity<Workspace>,
+    cx: &App,
+) -> Result<WindowHandle<MultiWorkspace>> {
+    windows(cx)
+        .into_iter()
+        .find(|window| {
+            window.read(cx).is_ok_and(|multi_workspace| {
+                multi_workspace
+                    .workspaces()
+                    .any(|candidate| candidate == workspace)
+            })
+        })
+        .context("The worktree's window is no longer open")
 }
 
 fn workspace_root_paths(project: &Entity<Project>, cx: &App) -> Vec<PathBuf> {

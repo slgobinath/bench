@@ -143,6 +143,7 @@ tempfile = { workspace = true, optional = true }
 
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true
+html_preview.workspace = true
 http_client.workspace = true
 image_viewer.workspace = true
 input_latency_ui.workspace = true

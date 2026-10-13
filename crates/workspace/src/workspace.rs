@@ -66,8 +66,8 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
     ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
     Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
-    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
-    transparent_black,
+    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, deferred, point,
+    relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -10103,12 +10103,17 @@ impl Render for Workspace {
                                     }
                                 })
                             }))
-                            .children(self.render_notifications(window, cx)),
+                            // Deferred so that they draw above native views
+                            // such as an HTML preview's web view.
+                            .children(
+                                self.render_notifications(window, cx)
+                                    .map(|notifications| deferred(notifications).with_priority(0)),
+                            ),
                     )
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
                     })
-                    .child(self.toast_layer.clone()),
+                    .child(deferred(self.toast_layer.clone()).with_priority(0)),
             )
     }
 }
@@ -14700,7 +14705,9 @@ mod tests {
             assert!(panel.read(cx).focus_handle(cx).contains_focused(window, cx));
         });
 
-        pane.update_in(cx, |pane, window, cx| window.focus(&pane.focus_handle(cx), cx));
+        pane.update_in(cx, |pane, window, cx| {
+            window.focus(&pane.focus_handle(cx), cx)
+        });
         workspace.update_in(cx, |workspace, window, cx| {
             workspace.toggle_panel("TestPanel", window, cx);
         });
