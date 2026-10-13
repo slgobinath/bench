@@ -17,7 +17,8 @@ use gpui::{
 use language::{Buffer, BufferEvent};
 use project::{DisableAiSettings, Project, ProjectPath};
 use regex::Regex;
-use ui::{ContextMenu, prelude::*};
+use theme::{Appearance, ThemeScope};
+use ui::{ContextMenu, appearance_toggle, prelude::*};
 use util::ResultExt as _;
 use workspace::item::Item;
 use workspace::notifications::NotifyResultExt as _;
@@ -100,6 +101,10 @@ pub struct HtmlPreviewView {
     /// Where the page is in the window, as last laid out.
     page_bounds: Cell<Bounds<Pixels>>,
     context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
+    /// Light or dark, when switched away from Bench's theme's appearance.
+    appearance: Option<Appearance>,
+    /// The appearance last given to the web view.
+    applied_appearance: Option<Appearance>,
     _subscriptions: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -237,6 +242,8 @@ impl HtmlPreviewView {
             selection: String::new(),
             page_bounds: Cell::new(Bounds::default()),
             context_menu: None,
+            appearance: None,
+            applied_appearance: None,
             _subscriptions: subscriptions,
             _tasks: vec![handle_events, watch_buffer],
         }
@@ -451,10 +458,23 @@ fn source_lines_for_selection(source: &str, selection: &str) -> Option<RangeIncl
 
 impl Render for HtmlPreviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let appearance = self
+            .appearance
+            .unwrap_or_else(|| cx.theme().appearance());
+        if self.applied_appearance != Some(appearance)
+            && let Some(web_view) = &self.web_view
+        {
+            web_view.set_appearance(appearance);
+            self.applied_appearance = Some(appearance);
+        }
+        let show_toggle = self.web_view.is_some()
+            && !self.is_covered_by_zoomed_item(cx.entity_id(), cx);
+
         v_flex()
             .id("HtmlPreview")
             .key_context("HtmlPreview")
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .on_action(cx.listener(Self::send_selection))
@@ -483,6 +503,41 @@ impl Render for HtmlPreviewView {
                 )
                 .with_priority(1)
             }))
+            .when(show_toggle, |this| {
+                this.child(self.render_appearance_toggle(appearance, cx))
+            })
+    }
+}
+
+impl HtmlPreviewView {
+    /// Deferred, as the page is drawn above everything that isn't.
+    fn render_appearance_toggle(
+        &self,
+        appearance: Appearance,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = (appearance != cx.theme().appearance())
+            .then(|| theme_settings::theme_for_appearance(appearance, None, cx));
+        let colors = theme.as_ref().unwrap_or_else(|| cx.theme()).colors();
+        let toggle = div()
+            .absolute()
+            .top_2()
+            .right_4()
+            .p_0p5()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .shadow_sm()
+            .child(appearance_toggle(
+                "toggle-appearance",
+                appearance,
+                cx.listener(|this, appearance: &Appearance, _, cx| {
+                    this.appearance = Some(*appearance);
+                    cx.notify();
+                }),
+            ));
+        deferred(ThemeScope::new(theme, toggle)).with_priority(0)
     }
 }
 

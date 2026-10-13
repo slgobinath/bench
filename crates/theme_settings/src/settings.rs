@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 pub use settings::{FontFamilyName, IconThemeName, ThemeAppearanceMode, ThemeName};
 use settings::{IntoGpui, RegisterSetting, Settings, SettingsContent};
 use std::sync::Arc;
-use theme::{Appearance, DEFAULT_ICON_THEME_NAME, SyntaxTheme, Theme, UiDensity};
+use theme::{
+    ActiveTheme as _, Appearance, DEFAULT_ICON_THEME_NAME, SyntaxTheme, Theme, ThemeRegistry,
+    UiDensity,
+};
 
 const MIN_FONT_SIZE: Pixels = px(6.0);
 const MAX_FONT_SIZE: Pixels = px(100.0);
@@ -96,6 +99,32 @@ pub struct ThemeSettings {
     pub ui_density: UiDensity,
     /// The amount of fading applied to unnecessary code.
     pub unnecessary_code_fade: f32,
+}
+
+/// The theme to show content in when a view switches it to `appearance`: the
+/// one `selection` picks for that appearance, or the theme setting's when there
+/// is no selection, and the default theme for the appearance when that picks a
+/// theme of the other one.
+pub fn theme_for_appearance(
+    appearance: Appearance,
+    selection: Option<&ThemeSelection>,
+    cx: &App,
+) -> Arc<Theme> {
+    let selection = selection.unwrap_or(&ThemeSettings::get_global(cx).theme);
+    let name = match selection {
+        ThemeSelection::Static(name) => name,
+        ThemeSelection::Dynamic { light, dark, .. } => match appearance {
+            Appearance::Light => light,
+            Appearance::Dark => dark,
+        },
+    };
+    let registry = ThemeRegistry::global(cx);
+    registry
+        .get(&name.0)
+        .ok()
+        .filter(|theme| theme.appearance() == appearance)
+        .or_else(|| registry.get(default_theme(appearance)).ok())
+        .unwrap_or_else(|| cx.theme().clone())
 }
 
 /// Returns the name of the default theme for the given [`Appearance`].

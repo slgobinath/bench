@@ -162,7 +162,11 @@ mod platform {
     };
     use http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use http::{HeaderValue, StatusCode};
-    use objc2_app_kit::NSView;
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceCustomization as _, NSAppearanceNameAqua,
+        NSAppearanceNameDarkAqua, NSView,
+    };
+    use theme::Appearance;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use util::ResultExt as _;
     use wry::WebViewExtMacOS as _;
@@ -304,6 +308,20 @@ mod platform {
             self.webview.open_devtools();
         }
 
+        /// Shows the page light or dark: pages that style themselves with
+        /// `prefers-color-scheme` follow the web view's appearance.
+        pub(crate) fn set_appearance(&self, appearance: Appearance) {
+            // SAFETY: the appearance names are constant strings AppKit exports.
+            let name = unsafe {
+                match appearance {
+                    Appearance::Light => NSAppearanceNameAqua,
+                    Appearance::Dark => NSAppearanceNameDarkAqua,
+                }
+            };
+            let appearance = NSAppearance::appearanceNamed(name);
+            self.webview.webview().setAppearance(appearance.as_deref());
+        }
+
         /// Gives the page the keyboard, so that keys typed into it reach it.
         pub(crate) fn focus(&self) {
             if self.webview.webview().window().is_some() {
@@ -409,6 +427,8 @@ mod platform {
         }
 
         pub(crate) fn open_devtools(&self) {}
+
+        pub(crate) fn set_appearance(&self, _appearance: theme::Appearance) {}
 
         pub(crate) fn focus(&self) {}
 

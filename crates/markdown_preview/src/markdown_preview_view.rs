@@ -27,11 +27,12 @@ use markdown::{
 use project::search::SearchQuery;
 use project::{DisableAiSettings, Project, ProjectPath, image_store};
 use settings::{SeedQuerySetting, Settings, update_settings_file};
-use theme::{SystemAppearance, Theme, ThemeRegistry};
+use theme::{Appearance, GlobalTheme, SystemAppearance, Theme, ThemeRegistry, ThemeScope};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
 use ui::{
-    ContextMenu, LinkPreview, ScrollAxes, Scrollbars, WithScrollbar, prelude::*, right_click_menu,
+    ContextMenu, LinkPreview, ScrollAxes, Scrollbars, WithScrollbar, appearance_toggle, prelude::*,
+    right_click_menu,
 };
 use util::{
     ResultExt,
@@ -78,6 +79,9 @@ pub struct MarkdownPreviewView {
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
     hovered_url: Option<SharedString>,
+    /// Light or dark, when switched away from the appearance the preview's
+    /// theme has.
+    appearance: Option<Appearance>,
     mode: MarkdownPreviewMode,
     /// Search results depend on the parsed markdown, which lags behind the source while a
     /// background parse is in flight. Tracked so matches can be invalidated once it lands.
@@ -418,6 +422,7 @@ impl MarkdownPreviewView {
                 base_directory: None,
                 pending_update_task: None,
                 hovered_url: None,
+                appearance: None,
                 mode,
                 markdown_parse_pending: false,
             };
@@ -1080,10 +1085,20 @@ impl MarkdownPreviewView {
     /// Returns the theme chosen in `markdown_preview.theme`, or `None` if the
     /// user hasn't set one or it can't be resolved.
     fn resolve_preview_theme(&self, cx: &App) -> Option<Arc<Theme>> {
-        let theme_settings = ThemeSettings::get_global(cx);
-        let theme_selection = theme_settings.markdown_preview_theme.as_ref()?;
-        let theme_name = theme_selection.name(SystemAppearance::global(cx).0);
-        ThemeRegistry::global(cx).get(&theme_name.0).ok()
+        let theme_selection = ThemeSettings::get_global(cx).markdown_preview_theme.as_ref();
+        let configured = theme_selection.and_then(|theme_selection| {
+            let theme_name = theme_selection.name(SystemAppearance::global(cx).0);
+            ThemeRegistry::global(cx).get(&theme_name.0).ok()
+        });
+        let configured_appearance = configured
+            .as_ref()
+            .map_or_else(|| cx.theme().appearance(), |theme| theme.appearance());
+        match self.appearance {
+            Some(appearance) if appearance != configured_appearance => Some(
+                theme_settings::theme_for_appearance(appearance, theme_selection, cx),
+            ),
+            _ => configured,
+        }
     }
 
     fn render_markdown_element(
@@ -1805,6 +1820,23 @@ fn lines_for_source_range(snapshot: &language::BufferSnapshot, range: Range<usiz
 impl Render for MarkdownPreviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let preview_theme = self.resolve_preview_theme(cx);
+        let content = match &preview_theme {
+            Some(theme) => GlobalTheme::with_scoped_theme(cx, theme.clone(), |cx| {
+                self.render_preview(&preview_theme, window, cx)
+            }),
+            None => self.render_preview(&preview_theme, window, cx),
+        };
+        ThemeScope::new(preview_theme, content)
+    }
+}
+
+impl MarkdownPreviewView {
+    fn render_preview(
+        &mut self,
+        preview_theme: &Option<Arc<Theme>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let bg_color = preview_theme
             .as_ref()
             .map(|theme| theme.colors().editor_background)
@@ -1951,6 +1983,17 @@ impl Render for MarkdownPreviewView {
                         .child(LinkPreview::new(hovered_url.as_ref(), cx)),
                 )
             })
+            .child(
+                div().absolute().top_2().right_4().child(appearance_toggle(
+                    "toggle-appearance",
+                    cx.theme().appearance(),
+                    cx.listener(|this, appearance: &Appearance, _, cx| {
+                        this.appearance = Some(*appearance);
+                        cx.notify();
+                    }),
+                )),
+            )
+            .into_any_element()
     }
 }
 

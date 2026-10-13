@@ -1,3 +1,4 @@
+mod appearance_toggle;
 mod button;
 mod button_like;
 mod button_link;
@@ -6,6 +7,7 @@ mod icon_button;
 mod split_button;
 mod toggle_button;
 
+pub use appearance_toggle::*;
 pub use button::*;
 pub use button_like::*;
 pub use button_link::*;

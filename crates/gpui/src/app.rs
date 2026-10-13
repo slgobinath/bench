@@ -2184,6 +2184,19 @@ impl App {
             .map(|any_state| any_state.downcast_ref::<G>().unwrap())
     }
 
+    /// Access the global of the given type mutably without notifying its
+    /// observers. Only for a change that is undone before anything else runs,
+    /// such as a value scoped to drawing part of a window, which observers
+    /// reacting to would redraw forever. Panics if a global for that type has
+    /// not been assigned.
+    #[track_caller]
+    pub fn global_mut_without_notifying<G: Global>(&mut self) -> &mut G {
+        self.globals_by_type
+            .get_mut(&TypeId::of::<G>())
+            .and_then(|any_state| any_state.downcast_mut::<G>())
+            .unwrap_or_else(|| panic!("no state of type {} exists", type_name::<G>()))
+    }
+
     /// Access the global of the given type mutably. Panics if a global for that type has not been assigned.
     #[track_caller]
     pub fn global_mut<G: Global>(&mut self) -> &mut G {

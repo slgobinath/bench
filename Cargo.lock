@@ -8402,6 +8402,8 @@ dependencies = [
  "serde",
  "serde_json",
  "text",
+ "theme",
+ "theme_settings",
  "ui",
  "util",
  "workspace",

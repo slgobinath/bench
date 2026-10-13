@@ -10,8 +10,11 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use project::Project;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+use std::sync::Arc;
+
+use theme::{Appearance, GlobalTheme, Theme, ThemeScope};
 use time_format::TimestampFormat;
-use ui::{Divider, Tooltip, prelude::*};
+use ui::{Divider, Tooltip, appearance_toggle, prelude::*};
 use workspace::Workspace;
 use workspace::item::{Item, ItemEvent};
 
@@ -64,6 +67,8 @@ pub struct IssueView {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
     loaded: Loaded,
+    /// Light or dark, when switched away from Bench's theme's appearance.
+    appearance: Option<Appearance>,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     _load: Task<()>,
@@ -100,6 +105,7 @@ impl IssueView {
             workspace,
             project,
             loaded: Loaded::Loading,
+            appearance: None,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             _load: Task::ready(()),
@@ -303,8 +309,16 @@ fn markdown_element(
     })
 }
 
-impl Render for IssueView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl IssueView {
+    /// The theme the issue is shown in, when switched to the other appearance
+    /// than Bench's theme has.
+    fn content_theme(&self, cx: &App) -> Option<Arc<Theme>> {
+        self.appearance
+            .filter(|appearance| *appearance != cx.theme().appearance())
+            .map(|appearance| theme_settings::theme_for_appearance(appearance, None, cx))
+    }
+
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let content = match &self.loaded {
             Loaded::Loading => v_flex()
                 .child(Label::new("Loading…").color(Color::Muted))
@@ -370,25 +384,59 @@ impl Render for IssueView {
         };
 
         div()
-            .id("linear-issue")
             .key_context("LinearIssue")
             .track_focus(&self.focus_handle)
+            .relative()
             .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
             .bg(cx.theme().colors().editor_background)
+            .text_color(cx.theme().colors().text)
             .child(
-                // A readable measure rather than the pane's full width: an
-                // issue is prose, and prose across a wide monitor is hard to
-                // follow from one line to the next.
                 div()
-                    .w_full()
-                    .max_w(rems(48.))
-                    .mx_auto()
-                    .px_6()
-                    .py_6()
-                    .child(content),
+                    .id("linear-issue")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .child(
+                        // A readable measure rather than the pane's full width: an
+                        // issue is prose, and prose across a wide monitor is hard to
+                        // follow from one line to the next.
+                        div()
+                            .w_full()
+                            .max_w(rems(48.))
+                            .mx_auto()
+                            .px_6()
+                            .py_6()
+                            .child(content),
+                    ),
             )
+            .child(
+                div()
+                    .absolute()
+                    .top_2()
+                    .right_2()
+                    .child(appearance_toggle(
+                        "toggle-appearance",
+                        cx.theme().appearance(),
+                        cx.listener(|this: &mut Self, appearance: &Appearance, _, cx| {
+                            this.appearance = Some(*appearance);
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for IssueView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.content_theme(cx);
+        let content = match &theme {
+            Some(theme) => GlobalTheme::with_scoped_theme(cx, theme.clone(), |cx| {
+                self.render_content(window, cx)
+            }),
+            None => self.render_content(window, cx),
+        };
+        ThemeScope::new(theme, content)
     }
 }
 

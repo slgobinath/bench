@@ -19,9 +19,11 @@ mod registry;
 mod scale;
 mod schema;
 mod styles;
+mod theme_scope;
 mod theme_settings_provider;
 mod ui_density;
 
+use std::borrow::BorrowMut;
 use std::sync::Arc;
 
 use gpui::BorrowAppContext;
@@ -43,6 +45,7 @@ pub use crate::registry::*;
 pub use crate::scale::*;
 pub use crate::schema::*;
 pub use crate::styles::*;
+pub use crate::theme_scope::*;
 pub use crate::theme_settings_provider::*;
 pub use crate::ui_density::*;
 
@@ -141,7 +144,7 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
             .unwrap()
     });
     let icon_theme = themes.default_icon_theme().unwrap();
-    cx.set_global(GlobalTheme { theme, icon_theme });
+    cx.set_global(GlobalTheme::new(theme, icon_theme));
 }
 
 /// Implementing this trait allows accessing the active theme.
@@ -322,13 +325,20 @@ pub fn deserialize_icon_theme(bytes: &[u8]) -> anyhow::Result<IconThemeFamilyCon
 pub struct GlobalTheme {
     theme: Arc<Theme>,
     icon_theme: Arc<IconTheme>,
+    /// Themes that part of a window is being drawn in, innermost last. See
+    /// [`ThemeScope`].
+    scoped: Vec<Arc<Theme>>,
 }
 impl Global for GlobalTheme {}
 
 impl GlobalTheme {
     /// Creates a new [`GlobalTheme`] with the given theme and icon theme.
     pub fn new(theme: Arc<Theme>, icon_theme: Arc<IconTheme>) -> Self {
-        Self { theme, icon_theme }
+        Self {
+            theme,
+            icon_theme,
+            scoped: Vec::new(),
+        }
     }
 
     /// Updates the active theme.
@@ -341,9 +351,31 @@ impl GlobalTheme {
         cx.update_global::<Self, _>(|this, _| this.icon_theme = icon_theme);
     }
 
-    /// Returns the active theme.
+    /// Returns the active theme: the one the element being drawn is scoped to,
+    /// if it is in a [`ThemeScope`], and the app's otherwise.
     pub fn theme(cx: &App) -> &Arc<Theme> {
-        &cx.global::<Self>().theme
+        let this = cx.global::<Self>();
+        this.scoped.last().unwrap_or(&this.theme)
+    }
+
+    /// Runs `f` with `theme` as the active theme. Observers of the global
+    /// theme aren't told, since the app's theme is back in place by the time
+    /// they could run.
+    pub fn with_scoped_theme<C: BorrowMut<App>, R>(
+        cx: &mut C,
+        theme: Arc<Theme>,
+        f: impl FnOnce(&mut C) -> R,
+    ) -> R {
+        cx.borrow_mut()
+            .global_mut_without_notifying::<Self>()
+            .scoped
+            .push(theme);
+        let result = f(cx);
+        cx.borrow_mut()
+            .global_mut_without_notifying::<Self>()
+            .scoped
+            .pop();
+        result
     }
 
     /// Returns the active icon theme.
