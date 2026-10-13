@@ -984,6 +984,7 @@ pub(crate) struct Frame {
     pub(crate) dispatch_tree: DispatchTree,
     pub(crate) scene: Scene,
     pub(crate) composition_surface_starts: Vec<(crate::CompositionSurfaceId, usize)>,
+    pub(crate) painted_native_surfaces: Vec<crate::CompositionSurfaceId>,
     pub(crate) hitboxes: Vec<Hitbox>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
@@ -1019,6 +1020,7 @@ pub(crate) struct PaintIndex {
     mouse_listeners_index: usize,
     input_handlers_index: usize,
     cursor_styles_index: usize,
+    painted_native_surfaces_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
@@ -1041,6 +1043,7 @@ impl Frame {
             dispatch_tree,
             scene: Scene::default(),
             composition_surface_starts: Vec::new(),
+            painted_native_surfaces: Vec::new(),
             hitboxes: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
@@ -1069,6 +1072,7 @@ impl Frame {
         self.dispatch_tree.clear();
         self.scene.clear();
         self.composition_surface_starts.clear();
+        self.painted_native_surfaces.clear();
         self.input_handlers.clear();
         self.tooltip_requests.clear();
         self.cursor_styles.clear();
@@ -1163,6 +1167,9 @@ struct WindowCompositionState {
     base_surface: crate::CompositionSurfaceId,
     overlay_surface: crate::CompositionSurfaceId,
     geometry_dirty: Rc<Cell<bool>>,
+    /// Platform surfaces shown only in frames that paint them, with whether
+    /// each is currently shown.
+    painted_visibility: FxHashMap<crate::CompositionSurfaceId, bool>,
 }
 
 impl WindowCompositionState {
@@ -1176,6 +1183,7 @@ impl WindowCompositionState {
             base_surface,
             overlay_surface,
             geometry_dirty: Rc::new(Cell::new(false)),
+            painted_visibility: FxHashMap::default(),
         })
     }
 }
@@ -1285,6 +1293,23 @@ impl WindowComposition<'_> {
         )
     }
 
+    /// Shows a platform surface only in frames that paint it with
+    /// [`Window::paint_native_surface`], so that native content hosted by an
+    /// element disappears when the element stops being drawn, such as when
+    /// its tab is switched away from.
+    pub fn show_only_when_painted(
+        &self,
+        surface: crate::CompositionSurfaceId,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.borrow_mut();
+        anyhow::ensure!(
+            state.platform_surfaces.contains_key(&surface),
+            "only platform composition surfaces can follow painting"
+        );
+        state.painted_visibility.insert(surface, true);
+        Ok(())
+    }
+
     /// Creates another GPUI-rendered surface in the composition tree.
     pub fn create_gpui_surface(
         &self,
@@ -1378,6 +1403,7 @@ impl WindowComposition<'_> {
         }
         state.tree.remove(surface)?;
         state.platform_surfaces.remove(&surface);
+        state.painted_visibility.remove(&surface);
         drop(state);
         if let Err(error) = self.synchronize_platform_order() {
             let mut state = self.state.borrow_mut();
@@ -2689,6 +2715,32 @@ impl Window {
         Ok(result)
     }
 
+    /// Marks a platform composition surface as drawn in this frame. Surfaces
+    /// registered with [`WindowComposition::show_only_when_painted`] are
+    /// hidden in frames that don't mark them.
+    pub fn paint_native_surface(&mut self, surface: crate::CompositionSurfaceId) {
+        self.invalidator.debug_assert_paint();
+        self.next_frame.painted_native_surfaces.push(surface);
+    }
+
+    fn update_painted_surface_visibility(&mut self) {
+        let mut composition = self.composition.borrow_mut();
+        let composition = &mut *composition;
+        for (surface, visible) in composition.painted_visibility.iter_mut() {
+            let painted = self
+                .rendered_frame
+                .painted_native_surfaces
+                .contains(surface);
+            if painted == *visible {
+                continue;
+            }
+            if let Some(platform_surface) = composition.platform_surfaces.get(surface) {
+                platform_surface.set_visible(painted).log_err();
+            }
+            *visible = painted;
+        }
+    }
+
     fn set_composition_surface(&mut self, surface: crate::CompositionSurfaceId) {
         if self
             .next_frame
@@ -3878,6 +3930,7 @@ impl Window {
                 log::error!("updating window composition geometry: {error:#}");
             }
         }
+        self.update_painted_surface_visibility();
         let composition = self.composition.borrow();
         let layers = crate::composition::composed_scene_layers(
             &composition.tree,
@@ -4344,6 +4397,7 @@ impl Window {
             mouse_listeners_index: self.next_frame.mouse_listeners.len(),
             input_handlers_index: self.next_frame.input_handlers.len(),
             cursor_styles_index: self.next_frame.cursor_styles.len(),
+            painted_native_surfaces_index: self.next_frame.painted_native_surfaces.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             line_layout_index: self.text_system.layout_index(),
@@ -4364,6 +4418,10 @@ impl Window {
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
                 .iter()
                 .cloned(),
+        );
+        self.next_frame.painted_native_surfaces.extend_from_slice(
+            &self.rendered_frame.painted_native_surfaces[range.start.painted_native_surfaces_index
+                ..range.end.painted_native_surfaces_index],
         );
         self.next_frame.input_handlers.extend(
             self.rendered_frame.input_handlers

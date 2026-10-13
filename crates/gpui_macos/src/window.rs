@@ -26,13 +26,14 @@ use cocoa::{
 use collections::{FxHashMap, FxHashSet};
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
-    ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
-    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformSurfaceAttachment,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, SharedString, Size,
-    SystemWindowTab, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowKind, WindowParams, WindowVisibility, point, px, size,
+    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, ContentMask, CursorStyle,
+    ExternalDragPayload, ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke,
+    Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformSurfaceAttachment, PlatformWindow, Point, PromptButton, PromptLevel,
+    RequestFrameOptions, ScaledPixels, SharedString, Size, SystemWindowTab, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowParams,
+    WindowVisibility, point, px, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -83,7 +84,7 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
-const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
+const OVERLAY_INPUT_IVAR: &str = "overlayInputRegions";
 
 static RESTORES_WORKSPACE_AT_LAUNCH_DEFAULT: Once = Once::new();
 
@@ -120,12 +121,100 @@ const NSDragOperationMove: NSDragOperation = 16;
 const NSDRAGGING_CONTEXT_OUTSIDE_APPLICATION: NSInteger = 0;
 const NSDRAGGING_CONTEXT_WITHIN_APPLICATION: NSInteger = 1;
 
-extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
-    let active = unsafe {
+/// Where an overlay surface drew last frame. The overlay view covers the
+/// whole window, so it takes the mouse only over what it drew and lets it
+/// through to the native views below everywhere else; otherwise a toast or a
+/// notification anywhere in the window would stop a web view taking clicks.
+#[derive(Default)]
+struct OverlayInputRegions(Mutex<OverlayInputRegionsState>);
+
+#[derive(Default)]
+struct OverlayInputRegionsState {
+    scale_factor: f32,
+    /// Window-relative, from the top left.
+    regions: Vec<Bounds<ScaledPixels>>,
+}
+
+impl OverlayInputRegions {
+    fn update(&self, scene: &gpui::Scene, scale_factor: f32) {
+        let visible = |bounds: &Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>| {
+            bounds.intersect(&mask.bounds)
+        };
+        let regions = scene
+            .quads
+            .iter()
+            .map(|quad| visible(&quad.bounds, &quad.content_mask))
+            .chain(
+                scene
+                    .paths
+                    .iter()
+                    .map(|path| visible(&path.bounds, &path.content_mask)),
+            )
+            .chain(
+                scene
+                    .underlines
+                    .iter()
+                    .map(|underline| visible(&underline.bounds, &underline.content_mask)),
+            )
+            .chain(
+                scene
+                    .monochrome_sprites
+                    .iter()
+                    .map(|sprite| visible(&sprite.bounds, &sprite.content_mask)),
+            )
+            .chain(
+                scene
+                    .subpixel_sprites
+                    .iter()
+                    .map(|sprite| visible(&sprite.bounds, &sprite.content_mask)),
+            )
+            .chain(
+                scene
+                    .polychrome_sprites
+                    .iter()
+                    .map(|sprite| visible(&sprite.bounds, &sprite.content_mask)),
+            )
+            .chain(
+                scene
+                    .surfaces
+                    .iter()
+                    .map(|surface| visible(&surface.bounds, &surface.content_mask)),
+            )
+            .filter(|bounds| !bounds.is_empty())
+            .collect();
+        *self.0.lock() = OverlayInputRegionsState {
+            scale_factor,
+            regions,
+        };
+    }
+
+    fn contains(&self, position: Point<Pixels>) -> bool {
+        let state = self.0.lock();
+        let position = position.scale(state.scale_factor);
+        state
+            .regions
+            .iter()
+            .any(|region| region.contains(&position))
+    }
+}
+
+extern "C" fn overlay_hit_test(this: &Object, _: Sel, point: NSPoint) -> id {
+    let regions = unsafe {
         let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
-        &*(raw as *const AtomicBool)
+        &*(raw as *const OverlayInputRegions)
     };
-    if active.load(Ordering::Acquire) {
+    // `point` is in the superview's coordinates, and AppKit views have their
+    // origin at the bottom left where GPUI's is at the top left.
+    let position = unsafe {
+        let superview: id = msg_send![this, superview];
+        let local: NSPoint = msg_send![this, convertPoint: point fromView: superview];
+        let bounds = NSView::bounds(this as *const Object as id);
+        gpui::point(
+            px(local.x as f32),
+            px((bounds.size.height - local.y) as f32),
+        )
+    };
+    if regions.contains(position) {
         this as *const Object as id
     } else {
         nil
@@ -782,14 +871,14 @@ struct MacWindowState {
 struct MacGpuiSurface {
     view: NonNull<Object>,
     renderer: renderer::Renderer,
-    input_active: Arc<AtomicBool>,
+    input_regions: Arc<OverlayInputRegions>,
 }
 
 unsafe fn create_gpui_composition_surface(
     window_state: &Arc<Mutex<MacWindowState>>,
     state: &mut MacWindowState,
 ) -> anyhow::Result<MacGpuiSurface> {
-    let input_active = Arc::new(AtomicBool::new(false));
+    let input_regions = Arc::new(OverlayInputRegions::default());
     let native_view = state.native_view.as_ptr() as id;
     let view: id = unsafe { msg_send![OVERLAY_VIEW_CLASS, alloc] };
     let view = unsafe { NSView::initWithFrame_(view, NSView::bounds(native_view)) };
@@ -801,7 +890,7 @@ unsafe fn create_gpui_composition_surface(
         );
         (*view).set_ivar(
             OVERLAY_INPUT_IVAR,
-            Arc::into_raw(input_active.clone()) as *const c_void,
+            Arc::into_raw(input_regions.clone()) as *const c_void,
         );
     }
 
@@ -827,7 +916,7 @@ unsafe fn create_gpui_composition_surface(
     Ok(MacGpuiSurface {
         view: NonNull::new(view).context("GPUI composition view is null")?,
         renderer,
-        input_active,
+        input_regions,
     })
 }
 
@@ -2318,6 +2407,7 @@ impl PlatformWindow for MacWindow {
 
     fn draw_composed(&self, scene: gpui::ComposedScene<'_>) {
         let mut this = self.0.lock();
+        let scale_factor = this.scale_factor();
         if this.base_composition_surface.is_none() {
             this.renderer.draw(scene.scene());
             return;
@@ -2334,9 +2424,7 @@ impl PlatformWindow for MacWindow {
             if this.base_composition_surface == Some(layer.surface) {
                 this.renderer.draw(&surface_scene);
             } else if let Some(surface) = this.gpui_composition_surfaces.get_mut(&layer.surface) {
-                surface
-                    .input_active
-                    .store(!surface_scene.is_empty(), Ordering::Release);
+                surface.input_regions.update(&surface_scene, scale_factor);
                 surface.renderer.draw(&surface_scene);
             } else {
                 log::error!(
@@ -2862,7 +2950,7 @@ extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
     unsafe {
         drop_window_state(this);
         let raw: *mut c_void = *this.get_ivar(OVERLAY_INPUT_IVAR);
-        drop(Arc::from_raw(raw as *const AtomicBool));
+        drop(Arc::from_raw(raw as *const OverlayInputRegions));
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
     }
 }
