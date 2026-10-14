@@ -4669,6 +4669,17 @@ pub enum LspStoreEvent {
     WorkspaceEditApplied(ProjectTransaction),
 }
 
+/// A language server that a buffer's language and settings call for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LanguageServerChoice {
+    pub name: LanguageServerName,
+    /// The server's id, when it is running for the buffer.
+    pub running: Option<LanguageServerId>,
+    /// Whether it was stopped by hand, which keeps it from starting until it
+    /// is started again.
+    pub stopped: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LanguageServerStatus {
     pub name: LanguageServerName,
@@ -9799,6 +9810,49 @@ impl LspStore {
                     _ => None,
                 },
             )
+    }
+
+    /// The language servers a local buffer's language and settings call for, in
+    /// the order the settings give them, with whether each is running for it.
+    pub fn language_server_choices_for_local_buffer(
+        &self,
+        buffer: &Entity<Buffer>,
+        cx: &mut App,
+    ) -> Vec<LanguageServerChoice> {
+        let Some(local) = self.as_local() else {
+            return Vec::new();
+        };
+        buffer.update(cx, |buffer, cx| {
+            let Some(language) = buffer.language().cloned() else {
+                return Vec::new();
+            };
+            let settings = LanguageSettings::for_buffer(buffer, cx);
+            if !settings.enable_language_server {
+                return Vec::new();
+            }
+            let available = self
+                .languages
+                .lsp_adapters(&language.name())
+                .iter()
+                .map(|adapter| adapter.name())
+                .collect::<Vec<_>>();
+            let running = self
+                .running_language_servers_for_local_buffer(buffer, cx)
+                .map(|(adapter, server)| (adapter.name(), server.server_id()))
+                .collect::<Vec<_>>();
+            settings
+                .customized_language_servers(&available)
+                .into_iter()
+                .map(|name| LanguageServerChoice {
+                    running: running
+                        .iter()
+                        .find(|(running_name, _)| *running_name == name)
+                        .map(|(_, id)| *id),
+                    stopped: local.stopped_language_servers.contains(&name),
+                    name,
+                })
+                .collect()
+        })
     }
 
     pub fn language_servers_for_local_buffer(

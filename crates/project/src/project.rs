@@ -166,9 +166,9 @@ pub use task_inventory::{
 pub use buffer_store::ProjectTransaction;
 pub use lsp_command::{CallHierarchyItem, IncomingCall, OutgoingCall};
 pub use lsp_store::{
-    DiagnosticSummary, InvalidationStrategy, LanguageServerLogType, LanguageServerProgress,
-    LanguageServerPromptRequest, LanguageServerShowDocumentRequest, LanguageServerStatus,
-    LanguageServerToQuery, LspStore, LspStoreEvent, ProgressToken,
+    DiagnosticSummary, InvalidationStrategy, LanguageServerChoice, LanguageServerLogType,
+    LanguageServerProgress, LanguageServerPromptRequest, LanguageServerShowDocumentRequest,
+    LanguageServerStatus, LanguageServerToQuery, LspStore, LspStoreEvent, ProgressToken,
     SERVER_PROGRESS_THROTTLE_TIMEOUT,
 };
 pub use toolchain_store::{ToolchainStore, Toolchains};

@@ -21449,3 +21449,82 @@ async fn code_action_project(
 
     (project, buffer, handle, fake_servers)
 }
+
+#[gpui::test]
+async fn test_language_server_choices_follow_stopping_and_starting(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "main.rs": "fn main() {}" }))
+        .await;
+    let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    let mut fake_servers = language_registry.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "the-rust-language-server",
+            ..Default::default()
+        },
+    );
+    language_registry.add(rust_lang());
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/dir/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+
+    let choices = |cx: &mut gpui::TestAppContext| {
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store
+                    .language_server_choices_for_local_buffer(&buffer, cx)
+                    .into_iter()
+                    .map(|choice| {
+                        (
+                            choice.name.to_string(),
+                            choice.running.is_some(),
+                            choice.stopped,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+    };
+    assert_eq!(
+        choices(cx),
+        [("the-rust-language-server".to_string(), true, false)]
+    );
+
+    let _shutdown = fake_server
+        .set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| future::ready(Ok(())));
+    project.update(cx, |project, cx| {
+        project.stop_language_servers_for_buffers(vec![buffer.clone()], HashSet::default(), cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        choices(cx),
+        [("the-rust-language-server".to_string(), false, true)],
+        "a stopped server should be listed as stopped rather than dropped"
+    );
+
+    project.update(cx, |project, cx| {
+        project.restart_language_servers_for_buffers(
+            vec![buffer.clone()],
+            HashSet::from_iter([lsp::LanguageServerSelector::Name(
+                "the-rust-language-server".into(),
+            )]),
+            true,
+            cx,
+        );
+    });
+    let _restarted_server = fake_servers.next().await.unwrap();
+    cx.executor().run_until_parked();
+    assert_eq!(
+        choices(cx),
+        [("the-rust-language-server".to_string(), true, false)],
+        "starting a stopped server by name should start it again"
+    );
+}
