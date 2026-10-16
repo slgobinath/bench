@@ -545,6 +545,11 @@ pub struct GutterContent {
     ///
     /// Default: true
     pub bookmarks: Option<bool>,
+    /// Whether to show markers next to types and members that have
+    /// implementations or parents, as reported by the language server.
+    ///
+    /// Default: true
+    pub inheritance: Option<bool>,
     /// Whether to show fold buttons in the gutter.
     ///
     /// Default: true

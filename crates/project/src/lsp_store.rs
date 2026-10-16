@@ -17,6 +17,7 @@ mod document_symbols;
 mod dynamic_registration;
 pub mod emmet_ext;
 mod folding_ranges;
+pub mod inheritance;
 mod inlay_hints;
 pub mod json_language_server_ext;
 pub mod log_store;
@@ -4804,6 +4805,8 @@ impl LspStore {
         client.add_entity_request_handler(
             Self::handle_lsp_command::<lsp_ext_command::GoToParentModule>,
         );
+        client.add_entity_request_handler(Self::handle_get_inheritance_flags);
+        client.add_entity_request_handler(Self::handle_get_inheritance_targets);
         client.add_entity_request_handler(
             Self::handle_lsp_command::<lsp_ext_command::GetLspRunnables>,
         );

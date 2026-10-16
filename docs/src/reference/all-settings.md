@@ -1065,6 +1065,7 @@ Set `[]` to clear the inherited list. Omit this setting to inherit it unchanged.
     "line_numbers": true,
     "runnables": true,
     "breakpoints": true,
+    "inheritance": true,
     "folds": true,
     "min_line_number_digits": 4,
     "git_gutter_width": "default"
@@ -1077,6 +1078,7 @@ Set `[]` to clear the inherited list. Omit this setting to inherit it unchanged.
 - `line_numbers`: Whether to show line numbers in the gutter
 - `runnables`: Whether to show runnable buttons in the gutter
 - `breakpoints`: Whether to show breakpoints in the gutter
+- `inheritance`: Whether to show markers next to types and members that have implementations or parents. Clicking a marker lists them
 - `folds`: Whether to show fold buttons in the gutter
 - `min_line_number_digits`: Minimum number of characters to reserve space for in the gutter
 - `git_gutter_width`: The width, in pixels, of the git diff hunk indicators in the gutter. When `default`, the width scales with the buffer font size

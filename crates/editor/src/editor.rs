@@ -31,6 +31,7 @@ mod highlight_matching_bracket;
 pub mod hover_links;
 pub mod hover_popover;
 mod indent_guides;
+mod inheritance_markers;
 mod inlays;
 mod inline_input;
 pub mod items;
@@ -1213,6 +1214,7 @@ pub struct Editor {
     pub(crate) refresh_matching_bracket_highlights_task: Task<()>,
     refresh_document_symbols_task: Shared<Task<()>>,
     lsp_document_links: LspDocumentLinks,
+    inheritance_markers: inheritance_markers::InheritanceMarkers,
     lsp_document_symbols: HashMap<BufferId, Vec<OutlineItem<text::Anchor>>>,
     refresh_outline_symbols_at_cursor_at_cursor_task: Task<()>,
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
@@ -1259,6 +1261,7 @@ pub struct EditorSnapshot {
     show_gutter: bool,
     offset_content: bool,
     sticky_line_number_digits: usize,
+    has_inheritance_markers: bool,
     show_line_numbers: Option<bool>,
     number_deleted_lines: bool,
     show_git_diff_gutter: Option<bool>,
@@ -1298,6 +1301,8 @@ pub struct GutterDimensions {
     pub width: Pixels,
     pub margin: Pixels,
     pub git_blame_entries_width: Option<Pixels>,
+    /// The column of inheritance markers, which `right_padding` includes on its left.
+    pub inheritance_markers_width: Pixels,
 }
 
 impl GutterDimensions {
@@ -1659,6 +1664,8 @@ pub enum GotoDefinitionKind {
     Declaration,
     Type,
     Implementation,
+    /// Supertypes, or the members a member implements or overrides.
+    Super,
 }
 
 pub enum FormatTarget {
@@ -2090,6 +2097,7 @@ impl Editor {
                     }
                     project::Event::RefreshCodeLens { .. } => {
                         editor.refresh_code_lenses(None, window, cx);
+                        editor.refresh_inheritance_markers(true, cx);
                     }
                     project::Event::RefreshDocumentColors { .. } => {
                         editor.refresh_document_colors(None, window, cx);
@@ -2113,9 +2121,13 @@ impl Editor {
                             },
                             cx,
                         );
+                        // Servers ask for refreshes once they have (re)indexed the
+                        // project, which is also when implementations elsewhere change.
+                        editor.refresh_inheritance_markers(true, cx);
                     }
                     project::Event::RefreshSemanticTokens { .. } => {
                         editor.refresh_semantic_tokens(None, true, cx);
+                        editor.refresh_inheritance_markers(true, cx);
                     }
                     project::Event::LanguageServerRemoved(_) => {
                         editor.registered_buffers.clear();
@@ -2123,6 +2135,7 @@ impl Editor {
                         editor.invalidate_semantic_tokens(None);
                         editor.refresh_runnables(None, window, cx);
                         editor.update_lsp_data(None, window, cx);
+                        editor.refresh_inheritance_markers(true, cx);
                         editor.refresh_inlay_hints(InlayHintRefreshReason::ServerRemoved, cx);
                         editor.refresh_document_highlights(cx);
                     }
@@ -2155,6 +2168,7 @@ impl Editor {
                             editor.refresh_runnables(Some(buffer_id), window, cx);
                             editor.invalidate_semantic_tokens(Some(buffer_id));
                             editor.update_lsp_data(Some(buffer_id), window, cx);
+                            editor.refresh_inheritance_markers(true, cx);
                             editor.refresh_inlay_hints(
                                 InlayHintRefreshReason::LanguageServerRegistered,
                                 cx,
@@ -2584,6 +2598,7 @@ impl Editor {
             refresh_matching_bracket_highlights_task: Task::ready(()),
             refresh_document_symbols_task: Task::ready(()).shared(),
             lsp_document_links: LspDocumentLinks::new(cx),
+            inheritance_markers: Default::default(),
             lsp_document_symbols: HashMap::default(),
             refresh_outline_symbols_at_cursor_at_cursor_task: Task::ready(()),
             outline_symbols_at_cursor: None,
@@ -3140,6 +3155,7 @@ impl Editor {
             sticky_line_number_digits: self
                 .search_results_hold
                 .map_or(0, |hold| hold.min_line_number_digits),
+            has_inheritance_markers: !self.inheritance_markers.is_empty(),
             show_line_numbers: self.show_line_numbers,
             number_deleted_lines: self.number_deleted_lines,
             show_git_diff_gutter: self.show_git_diff_gutter,
@@ -10210,7 +10226,12 @@ impl Editor {
                 }
             }
             multi_buffer::Event::DirtyChanged => cx.emit(EditorEvent::DirtyChanged),
-            multi_buffer::Event::Saved => cx.emit(EditorEvent::Saved),
+            multi_buffer::Event::Saved => {
+                // Saving is when edits elsewhere most likely changed this file's
+                // implementations, as servers index files on save.
+                self.refresh_inheritance_markers(true, cx);
+                cx.emit(EditorEvent::Saved)
+            }
             multi_buffer::Event::FileHandleChanged => {
                 cx.emit(EditorEvent::TitleChanged);
                 cx.emit(EditorEvent::FileHandleChanged);
@@ -10422,6 +10443,12 @@ impl Editor {
                     self.lsp_document_links.per_buffer.clear();
                     self.lsp_document_links.refresh_task = Task::ready(());
                 }
+            }
+
+            if EditorSettings::get_global(cx).gutter.inheritance
+                != self.inheritance_markers.enabled()
+            {
+                self.refresh_inheritance_markers(true, cx);
             }
 
             self.refresh_inlay_hints(
@@ -11375,6 +11402,7 @@ impl Editor {
         self.refresh_folding_ranges(for_buffer, window, cx);
         self.refresh_code_lenses(for_buffer, window, cx);
         self.refresh_document_symbols(for_buffer, cx);
+        self.refresh_inheritance_markers(false, cx);
     }
 
     fn is_eligible_for_language_detection(buffer: &Buffer) -> bool {
@@ -11924,6 +11952,9 @@ impl SemanticsProvider for WeakEntity<Project> {
             GotoDefinitionKind::Declaration => project.declarations(buffer, position, cx),
             GotoDefinitionKind::Type => project.type_definitions(buffer, position, cx),
             GotoDefinitionKind::Implementation => project.implementations(buffer, position, cx),
+            // Finding parents depends on the kind of symbol at the position, so they
+            // are only looked up through inheritance markers, which know it.
+            GotoDefinitionKind::Super => Task::ready(Ok(None)),
         })
         .ok()
     }
@@ -12259,7 +12290,15 @@ impl EditorSnapshot {
 
             let shows_folds = is_singleton && gutter_settings.folds;
 
-            let right_padding = if shows_folds && show_line_numbers {
+            let inheritance_markers_width =
+                if is_singleton && self.has_inheritance_markers {
+                    ch_width * 2.0
+                } else {
+                    px(0.)
+                };
+
+            let right_padding = inheritance_markers_width
+                + if shows_folds && show_line_numbers {
                 ch_width * 4.0
             } else if shows_folds || (!is_singleton && show_line_numbers) {
                 ch_width * 3.0
@@ -12275,6 +12314,7 @@ impl EditorSnapshot {
                 width: line_gutter_width + left_padding + right_padding,
                 margin: GutterDimensions::default_gutter_margin(font_id, font_size, cx),
                 git_blame_entries_width,
+                inheritance_markers_width,
             }
         } else if self.offset_content {
             GutterDimensions::default_with_margin(font_id, font_size, cx)

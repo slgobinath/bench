@@ -2026,7 +2026,7 @@ pub async fn location_links_from_lsp(
     Ok(definitions)
 }
 
-fn definition_locations_from_lsp(
+pub(crate) fn definition_locations_from_lsp(
     message: Option<lsp::GotoDefinitionResponse>,
 ) -> Vec<(Option<lsp::Range>, lsp::Uri, lsp::Range)> {
     let Some(message) = message else {

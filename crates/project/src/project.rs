@@ -165,6 +165,7 @@ pub use task_inventory::{
 
 pub use buffer_store::ProjectTransaction;
 pub use lsp_command::{CallHierarchyItem, IncomingCall, OutgoingCall};
+pub use lsp_store::inheritance::{InheritanceDirection, InheritanceFlags, InheritanceQuery};
 pub use lsp_store::{
     DiagnosticSummary, InvalidationStrategy, LanguageServerChoice, LanguageServerLogType,
     LanguageServerProgress, LanguageServerPromptRequest, LanguageServerShowDocumentRequest,
@@ -4579,6 +4580,41 @@ impl Project {
             GetDocumentSymbols,
             cx,
         )
+    }
+
+    pub fn inheritance_flags(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        queries: Vec<InheritanceQuery>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<InheritanceFlags>>> {
+        let guard = self.retain_remotely_created_models(cx);
+        let task = self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.inheritance_flags(buffer, queries, cx)
+        });
+        cx.background_spawn(async move {
+            let result = task.await;
+            drop(guard);
+            result
+        })
+    }
+
+    pub fn inheritance_targets(
+        &mut self,
+        buffer: &Entity<Buffer>,
+        query: InheritanceQuery,
+        direction: InheritanceDirection,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Vec<LocationLink>>> {
+        let guard = self.retain_remotely_created_models(cx);
+        let task = self.lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.inheritance_targets(buffer, query, direction, cx)
+        });
+        cx.background_spawn(async move {
+            let result = task.await;
+            drop(guard);
+            result
+        })
     }
 
     pub fn symbols(&self, query: &str, cx: &mut Context<Self>) -> Task<Result<Vec<Symbol>>> {

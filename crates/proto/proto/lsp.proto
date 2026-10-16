@@ -358,6 +358,40 @@ message LspExtGoToParentModuleResponse {
   repeated LocationLink links = 1;
 }
 
+message InheritanceQuery {
+  Anchor position = 1;
+  int32 symbol_kind = 2;
+}
+
+message InheritanceFlags {
+  bool has_children = 1;
+  bool has_parents = 2;
+  bool parents_are_interfaces = 3;
+}
+
+message GetInheritanceFlags {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  repeated InheritanceQuery queries = 3;
+  repeated VectorClockEntry version = 4;
+}
+
+message GetInheritanceFlagsResponse {
+  repeated InheritanceFlags flags = 1;
+}
+
+message GetInheritanceTargets {
+  uint64 project_id = 1;
+  uint64 buffer_id = 2;
+  InheritanceQuery query = 3;
+  bool parents = 4;
+  repeated VectorClockEntry version = 5;
+}
+
+message GetInheritanceTargetsResponse {
+  repeated LocationLink links = 1;
+}
+
 message GetCompletionsResponse {
   repeated Completion completions = 1;
   repeated VectorClockEntry version = 2;

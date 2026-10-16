@@ -1099,6 +1099,9 @@ impl LanguageServer {
                     call_hierarchy: Some(CallHierarchyClientCapabilities {
                         dynamic_registration: Some(true),
                     }),
+                    type_hierarchy: Some(TypeHierarchyClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
                     document_symbol: Some(DocumentSymbolClientCapabilities {
                         hierarchical_document_symbol_support: Some(true),
                         dynamic_registration: Some(true),

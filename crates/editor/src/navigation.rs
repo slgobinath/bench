@@ -1782,6 +1782,7 @@ impl Editor {
                     Some(GotoDefinitionKind::Symbol) | None => "Definitions",
                     Some(GotoDefinitionKind::Declaration) => "Declarations",
                     Some(GotoDefinitionKind::Type) => "Types",
+                    Some(GotoDefinitionKind::Super) => "Parents",
                 };
                 let title = editor
                     .update_in(cx, |_, _, cx| {

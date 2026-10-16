@@ -376,7 +376,7 @@ impl Editor {
         }
     }
 
-    fn reveal_clicked_links(
+    pub(crate) fn reveal_clicked_links(
         &mut self,
         kind: GotoDefinitionKind,
         links: Vec<HoverLink>,

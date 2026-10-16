@@ -2251,7 +2251,7 @@ fn editor_page() -> SettingsPage {
         ]
     }
 
-    fn gutter_section() -> [SettingsPageItem; 10] {
+    fn gutter_section() -> [SettingsPageItem; 11] {
         [
             SettingsPageItem::SectionHeader("Gutter"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -2359,6 +2359,30 @@ fn editor_page() -> SettingsPage {
                             .gutter
                             .get_or_insert_default()
                             .bookmarks = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Show Inheritance Markers",
+                description: "Show markers next to types and members that have implementations or parents.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("gutter.inheritance"),
+                    pick: |settings_content| {
+                        settings_content
+                            .editor
+                            .gutter
+                            .as_ref()
+                            .and_then(|gutter| gutter.inheritance.as_ref())
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .editor
+                            .gutter
+                            .get_or_insert_default()
+                            .inheritance = value;
                     },
                 }),
                 metadata: None,

@@ -385,6 +385,8 @@ impl Server {
                 forward_read_only_project_request::<proto::LspExtSwitchSourceHeader>,
             )
             .add_request_handler(forward_read_only_project_request::<proto::LspExtGoToParentModule>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetInheritanceFlags>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetInheritanceTargets>)
             .add_request_handler(forward_read_only_project_request::<proto::LspExtCancelFlycheck>)
             .add_request_handler(forward_read_only_project_request::<proto::LspExtRunFlycheck>)
             .add_request_handler(forward_read_only_project_request::<proto::LspExtClearFlycheck>)

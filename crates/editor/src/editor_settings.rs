@@ -155,6 +155,7 @@ pub struct Gutter {
     pub runnables: bool,
     pub breakpoints: bool,
     pub bookmarks: bool,
+    pub inheritance: bool,
     pub folds: bool,
     pub git_gutter_width: settings::GitGutterWidth,
 }
@@ -279,6 +280,7 @@ impl Settings for EditorSettings {
                 line_numbers: gutter.line_numbers.unwrap(),
                 runnables: gutter.runnables.unwrap(),
                 bookmarks: gutter.bookmarks.unwrap(),
+                inheritance: gutter.inheritance.unwrap(),
                 breakpoints: gutter.breakpoints.unwrap(),
                 folds: gutter.folds.unwrap(),
                 git_gutter_width: gutter.git_gutter_width.unwrap(),

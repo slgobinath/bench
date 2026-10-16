@@ -1775,7 +1775,8 @@ impl EditorElement {
 
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
-                    gutter_dimensions.width - gutter_dimensions.right_padding,
+                    gutter_dimensions.width - gutter_dimensions.right_padding
+                        + gutter_dimensions.inheritance_markers_width,
                     line_height * (display_row.as_f64() - scroll_position.y) as f32,
                 );
                 let centering_offset = point(
@@ -5661,6 +5662,10 @@ impl EditorElement {
                 test_indicator.paint(window, cx);
             }
 
+            for inheritance_marker in layout.inheritance_markers.iter_mut() {
+                inheritance_marker.paint(window, cx);
+            }
+
             if let Some(diff_review_button) = layout.diff_review_button.as_mut() {
                 diff_review_button.paint(window, cx);
             }
@@ -7146,6 +7151,35 @@ impl Gutter<'_> {
             cx,
         );
         button
+    }
+
+    /// Places an inheritance marker in its column, between the line numbers
+    /// and the fold toggles.
+    fn layout_inheritance_marker(
+        &self,
+        display_row: DisplayRow,
+        mut marker: AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let available_space = size(
+            AvailableSpace::MinContent,
+            AvailableSpace::Definite(self.line_height),
+        );
+        let marker_size = marker.layout_as_root(available_space, window, cx);
+        let x = self.dimensions.width - self.dimensions.right_padding
+            + (self.dimensions.inheritance_markers_width - marker_size.width) / 2.;
+        let y = Pixels::from(
+            (display_row.as_f64() - self.scroll_position.y)
+                * ScrollPixelOffset::from(self.line_height),
+        ) + (self.line_height - marker_size.height) / 2.;
+        marker.prepaint_as_root(
+            self.hitbox.origin + point(x, y),
+            available_space,
+            window,
+            cx,
+        );
+        marker
     }
 }
 
@@ -9750,6 +9784,25 @@ impl Element for EditorElement {
                         Vec::new()
                     };
 
+                    let inheritance_markers = if self.split_side == Some(SplitSide::Left)
+                        || gutter_dimensions.inheritance_markers_width == Pixels::ZERO
+                    {
+                        Vec::new()
+                    } else {
+                        self.editor.update(cx, |editor, cx| {
+                            editor
+                                .active_inheritance_markers(start_row..end_row, &snapshot)
+                                .into_iter()
+                                .map(|(row, marker)| {
+                                    let element = editor
+                                        .render_inheritance_marker(row, marker, cx)
+                                        .into_any_element();
+                                    gutter.layout_inheritance_marker(row, element, window, cx)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    };
+
                     let show_bookmarks =
                         snapshot.show_bookmarks.unwrap_or(gutter_settings.bookmarks);
 
@@ -10092,6 +10145,7 @@ impl Element for EditorElement {
                         diff_hunk_controls,
                         mouse_context_menu,
                         test_indicators,
+                        inheritance_markers,
                         bookmarks,
                         breakpoints,
                         diff_review_button,
@@ -10309,6 +10363,7 @@ pub struct EditorLayout {
     navigation_overlay_paint_commands: Vec<NavigationOverlayPaintCommand>,
     selections: Vec<(PlayerColor, Vec<SelectionLayout>)>,
     test_indicators: Vec<AnyElement>,
+    inheritance_markers: Vec<AnyElement>,
     bookmarks: Vec<AnyElement>,
     breakpoints: Vec<AnyElement>,
     diff_review_button: Option<AnyElement>,
@@ -11495,6 +11550,7 @@ mod tests {
             width: px(30.0),
             margin: Pixels::ZERO,
             git_blame_entries_width: None,
+            inheritance_markers_width: Pixels::ZERO,
         };
         const EMPTY_ROW_INFO: RowInfo = RowInfo {
             buffer_id: None,

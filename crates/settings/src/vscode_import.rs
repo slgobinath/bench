@@ -365,6 +365,7 @@ impl VsCodeSettings {
             runnables: None,
             breakpoints: None,
             bookmarks: None,
+            inheritance: None,
             folds: self.read_enum("editor.showFoldingControls", |s| match s {
                 "always" | "mouseover" => Some(true),
                 "never" => Some(false),

@@ -5,7 +5,7 @@ impl GutterDimensions {
     /// use alongside 'justify_end' and `gutter_width` to
     /// right align content with the line numbers
     pub fn fold_area_width(&self) -> Pixels {
-        self.margin + self.right_padding
+        self.margin + self.right_padding - self.inheritance_markers_width
     }
 }
 
