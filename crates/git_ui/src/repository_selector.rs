@@ -48,12 +48,13 @@ impl RepositorySelector {
             repos
         });
         let filtered_repositories = repository_entries.clone();
+        let repository_count = repository_entries.len();
 
         let active_repository = git_store.read(cx).active_repository();
         let selected_index = active_repository
             .as_ref()
             .and_then(|active| filtered_repositories.iter().position(|repo| repo == active))
-            .unwrap_or(0);
+            .map_or(0, |index| index + usize::from(repository_count > 1));
         let delegate = RepositorySelectorDelegate {
             project: project_handle,
             repository_selector: cx.entity().downgrade(),
@@ -61,6 +62,7 @@ impl RepositorySelector {
             filtered_repositories,
             active_repository,
             selected_index,
+            show_all: repository_count > 1,
         };
 
         let picker = cx.new(|cx| {
@@ -131,12 +133,20 @@ pub struct RepositorySelectorDelegate {
     filtered_repositories: Vec<Entity<Repository>>,
     active_repository: Option<Entity<Repository>>,
     selected_index: usize,
+    /// Bench: whether a row above the repositories selects all of them. It is
+    /// offered while the list is whole, not while it is searched.
+    show_all: bool,
 }
 
 impl RepositorySelectorDelegate {
+    fn all_row_offset(&self) -> usize {
+        usize::from(self.show_all)
+    }
+
     pub fn update_repository_entries(&mut self, all_repositories: Vec<Entity<Repository>>) {
         self.repository_entries = all_repositories.clone();
         self.filtered_repositories = all_repositories;
+        self.show_all = self.filtered_repositories.len() > 1;
         self.selected_index = self
             .active_repository
             .as_ref()
@@ -145,7 +155,7 @@ impl RepositorySelectorDelegate {
                     .iter()
                     .position(|repo| repo == active)
             })
-            .unwrap_or(0);
+            .map_or(0, |index| index + self.all_row_offset());
     }
 }
 
@@ -157,7 +167,7 @@ impl PickerDelegate for RepositorySelectorDelegate {
     }
 
     fn match_count(&self) -> usize {
-        self.filtered_repositories.len()
+        self.filtered_repositories.len() + self.all_row_offset()
     }
 
     fn selected_index(&self) -> usize {
@@ -170,7 +180,7 @@ impl PickerDelegate for RepositorySelectorDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.selected_index = ix.min(self.filtered_repositories.len().saturating_sub(1));
+        self.selected_index = ix.min(self.match_count().saturating_sub(1));
         cx.notify();
     }
 
@@ -189,6 +199,7 @@ impl PickerDelegate for RepositorySelectorDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         let all_repositories = self.repository_entries.clone();
+        self.show_all = query.is_empty() && all_repositories.len() > 1;
 
         let repo_names: Vec<(Entity<Repository>, String)> = all_repositories
             .iter()
@@ -224,7 +235,7 @@ impl PickerDelegate for RepositorySelectorDelegate {
                     .active_repository
                     .as_ref()
                     .and_then(|active| sorted_repositories.iter().position(|repo| repo == active))
-                    .unwrap_or(0);
+                    .map_or(0, |index| index + this.delegate.all_row_offset());
                 this.delegate.filtered_repositories = sorted_repositories;
                 this.delegate.set_selected_index(selected_index, window, cx);
                 cx.notify();
@@ -234,7 +245,18 @@ impl PickerDelegate for RepositorySelectorDelegate {
     }
 
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
-        let Some(selected_repo) = self.filtered_repositories.get(self.selected_index) else {
+        if self.show_all && self.selected_index == 0 {
+            let project = self.project.clone();
+            crate::bench_git_panel::RepositorySelection::global(cx)
+                .update(cx, |selection, cx| selection.select_all(&project, cx));
+            self.dismissed(window, cx);
+            return;
+        }
+        let Some(selected_repo) = self
+            .selected_index
+            .checked_sub(self.all_row_offset())
+            .and_then(|index| self.filtered_repositories.get(index))
+        else {
             return;
         };
         selected_repo.update(cx, |selected_repo, cx| {
@@ -262,7 +284,21 @@ impl PickerDelegate for RepositorySelectorDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
-        let repo_info = self.filtered_repositories.get(ix)?;
+        if self.show_all && ix == 0 {
+            let project = self.project.clone();
+            let all_selected = crate::bench_git_panel::RepositorySelection::global(cx)
+                .update(cx, |selection, cx| selection.all_selected(&project, cx));
+            return Some(
+                ListItem::new("all-repositories")
+                    .inset(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .toggle_state(selected)
+                    .start_slot(ui::Checkbox::new("select-all-repositories", all_selected.into()))
+                    .child(Label::new("All repositories")),
+            );
+        }
+        let repo_index = ix.checked_sub(self.all_row_offset())?;
+        let repo_info = self.filtered_repositories.get(repo_index)?;
         let repo = repo_info.read(cx);
         let display_name = repo.display_name();
         let summary = repo.status_summary();

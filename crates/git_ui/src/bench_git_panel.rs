@@ -133,6 +133,9 @@ pub struct RepositorySelection {
     /// directories. Loaded from the database the first time a worktree is
     /// asked about.
     extra: HashMap<PathBuf, Vec<PathBuf>>,
+    /// Worktrees nothing has been chosen for yet, which show every repository
+    /// until the first choice is made.
+    unchosen: HashSet<PathBuf>,
 }
 
 pub enum SelectionChanged {
@@ -155,16 +158,60 @@ impl RepositorySelection {
         selection
     }
 
-    fn extra_for(&mut self, root: &Path, cx: &App) -> &mut Vec<PathBuf> {
-        self.extra.entry(root.to_path_buf()).or_insert_with(|| {
-            db::kvp::KeyValueStore::global(cx)
-                .scoped(SELECTION_NAMESPACE)
-                .read(&root.to_string_lossy())
-                .log_err()
-                .flatten()
-                .and_then(|stored| serde_json::from_str(&stored).log_err())
-                .unwrap_or_default()
-        })
+    fn load(&mut self, root: &Path, cx: &App) {
+        if self.extra.contains_key(root) {
+            return;
+        }
+        let stored: Option<Vec<PathBuf>> = db::kvp::KeyValueStore::global(cx)
+            .scoped(SELECTION_NAMESPACE)
+            .read(&root.to_string_lossy())
+            .log_err()
+            .flatten()
+            .and_then(|stored| serde_json::from_str(&stored).log_err());
+        if stored.is_none() {
+            self.unchosen.insert(root.to_path_buf());
+        }
+        self.extra
+            .insert(root.to_path_buf(), stored.unwrap_or_default());
+    }
+
+    /// The selection to change. A worktree nothing was chosen for yet is
+    /// first given the choice it was showing: every repository.
+    fn extra_for(&mut self, project: &Entity<Project>, root: &Path, cx: &App) -> &mut Vec<PathBuf> {
+        self.load(root, cx);
+        let everything: Option<Vec<PathBuf>> = self.unchosen.remove(root).then(|| {
+            repositories(project, cx)
+                .iter()
+                .map(|repository| work_directory(repository, cx))
+                .collect()
+        });
+        let extra = self.extra.entry(root.to_path_buf()).or_default();
+        if let Some(everything) = everything {
+            *extra = everything;
+        }
+        extra
+    }
+
+    /// Selects every repository of `project`.
+    pub fn select_all(&mut self, project: &Entity<Project>, cx: &mut Context<Self>) {
+        let Some(root) = project_root(project, cx) else {
+            return;
+        };
+        let everything: Vec<PathBuf> = repositories(project, cx)
+            .iter()
+            .map(|repository| work_directory(repository, cx))
+            .collect();
+        self.load(&root, cx);
+        self.unchosen.remove(&root);
+        self.extra.insert(root.clone(), everything);
+        self.store(&root, cx);
+        cx.emit(SelectionChanged::Changed);
+        cx.notify();
+    }
+
+    pub fn all_selected(&mut self, project: &Entity<Project>, cx: &App) -> bool {
+        let selected = self.selected(project, cx).len();
+        selected == repositories(project, cx).len()
     }
 
     fn store(&self, root: &Path, cx: &App) {
@@ -202,8 +249,9 @@ impl RepositorySelection {
         let active = project.read(cx).git_store().read(cx).active_repository();
         let is_active = active.as_ref() == Some(repository);
 
-        let extra = self.extra_for(&root, cx);
+        let extra = self.extra_for(project, &root, cx);
         if is_active {
+            extra.retain(|held| *held != path);
             let Some(next) = extra.first().cloned() else {
                 return;
             };
@@ -230,7 +278,7 @@ impl RepositorySelection {
         let Some(root) = project_root(project, cx) else {
             return;
         };
-        let extra = self.extra_for(&root, cx);
+        let extra = self.extra_for(project, &root, cx);
         if extra.is_empty() {
             return;
         }
@@ -247,7 +295,11 @@ impl RepositorySelection {
         let Some(root) = project_root(project, cx) else {
             return active.into_iter().collect();
         };
-        let extra: HashSet<PathBuf> = self.extra_for(&root, cx).iter().cloned().collect();
+        self.load(&root, cx);
+        if self.unchosen.contains(&root) {
+            return repositories(project, cx);
+        }
+        let extra: HashSet<PathBuf> = self.extra.get(&root).into_iter().flatten().cloned().collect();
         repositories(project, cx)
             .into_iter()
             .filter(|repository| {
@@ -510,7 +562,7 @@ impl BenchGitPanel {
             project,
             focus_handle: cx.focus_handle(),
             tab: Tab::Changes,
-            changes_mode: ChangesMode::Working,
+            changes_mode: ChangesMode::Branch,
             tree: view_options.tree,
             zen: view_options.zen,
             collapsed: HashSet::new(),
@@ -1637,8 +1689,8 @@ impl BenchGitPanel {
             .child(
                 h_flex()
                     .gap_0p5()
-                    .child(mode("changes-working", "Uncommitted", ChangesMode::Working))
-                    .child(mode("changes-branch", "Branch", ChangesMode::Branch)),
+                    .child(mode("changes-branch", "Branch", ChangesMode::Branch))
+                    .child(mode("changes-working", "Uncommitted", ChangesMode::Working)),
             )
             .child(
                 h_flex()
