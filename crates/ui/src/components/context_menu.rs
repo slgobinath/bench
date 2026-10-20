@@ -228,6 +228,7 @@ pub struct ContextMenu {
     _on_blur_subscription: Subscription,
     keep_open_on_confirm: bool,
     fixed_width: Option<DefiniteLength>,
+    spacing: ListItemSpacing,
     main_menu: Option<Entity<ContextMenu>>,
     main_menu_observed_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     // Docs aide-related fields
@@ -360,6 +361,7 @@ impl ContextMenu {
                     _on_blur_subscription,
                     keep_open_on_confirm: true,
                     fixed_width: None,
+                    spacing: MENU_ITEM_SPACING,
                     main_menu: None,
                     main_menu_observed_bounds: Rc::new(Cell::new(None)),
                     documentation_aside: None,
@@ -430,6 +432,7 @@ impl ContextMenu {
                 ),
                 keep_open_on_confirm: false,
                 fixed_width: None,
+                spacing: self.spacing,
                 main_menu: None,
                 main_menu_observed_bounds: Rc::new(Cell::new(None)),
                 documentation_aside: None,
@@ -447,6 +450,7 @@ impl ContextMenu {
         );
 
         self.items = new_menu.items;
+        self.spacing = new_menu.spacing;
 
         cx.notify();
     }
@@ -873,6 +877,11 @@ impl ContextMenu {
         self
     }
 
+    pub fn spacing(mut self, spacing: ListItemSpacing) -> Self {
+        self.spacing = spacing;
+        self
+    }
+
     pub fn end_slot_action(mut self, action: Box<dyn Action>) -> Self {
         self.end_slot_action = Some(action);
         self
@@ -1267,6 +1276,7 @@ impl ContextMenu {
                 _on_blur_subscription,
                 keep_open_on_confirm: false,
                 fixed_width: None,
+                spacing: MENU_ITEM_SPACING,
                 documentation_aside: None,
                 aside_trigger_bounds: Rc::new(RefCell::new(HashMap::default())),
                 main_menu: Some(parent_entity),
@@ -1438,7 +1448,7 @@ impl ContextMenu {
             }
             ContextMenuItem::Label(label) => ListItem::new(ix)
                 .inset(true)
-                .spacing(MENU_ITEM_SPACING)
+                .spacing(self.spacing)
                 .disabled(true)
                 .child(Label::new(label.clone()))
                 .into_any_element(),
@@ -1491,7 +1501,7 @@ impl ContextMenu {
                     .child(
                         ListItem::new(ix)
                             .inset(true)
-                            .spacing(MENU_ITEM_SPACING)
+                            .spacing(self.spacing)
                             .when(selectable, |item| item.aria_role(Role::MenuItem))
                             .when(is_active_descendant(selectable), |item| {
                                 item.aria_active_descendant()
@@ -1579,7 +1589,7 @@ impl ContextMenu {
             .child(
                 ListItem::new(ix)
                     .inset(true)
-                    .spacing(MENU_ITEM_SPACING)
+                    .spacing(self.spacing)
                     .aria_role(Role::MenuItem)
                     .when(is_active_descendant, |item| item.aria_active_descendant())
                     .aria_label(label.clone())
@@ -1915,7 +1925,7 @@ impl ContextMenu {
                 ListItem::new(ix)
                     .group_name("label_container")
                     .inset(true)
-                    .spacing(MENU_ITEM_SPACING)
+                    .spacing(self.spacing)
                     .disabled(*disabled)
                     .aria_role(if toggle.is_some() {
                         Role::MenuItemCheckBox
@@ -2180,6 +2190,7 @@ impl ContextMenu {
             _on_blur_subscription,
             keep_open_on_confirm: false,
             fixed_width: None,
+            spacing: MENU_ITEM_SPACING,
             main_menu: None,
             main_menu_observed_bounds: Rc::new(Cell::new(None)),
             documentation_aside: None,

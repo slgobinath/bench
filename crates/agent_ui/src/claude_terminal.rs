@@ -282,8 +282,8 @@ fn mention_path(path: &Path, working_directory: &Path, workspace: &Workspace, cx
     let path_style = workspace.project().read(cx).path_style(cx);
     path_style
         .strip_prefix(path, working_directory)
-        .map(|relative| relative.display(path_style).into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
 }
 
 /// Opens a terminal in the worktree root, names it, and types the launch

@@ -523,10 +523,12 @@ message Envelope {
     ExecuteLspCommand execute_lsp_command = 491;
     ExecuteLspCommandResponse execute_lsp_command_response = 492;
     RefreshDocumentHighlights refresh_document_highlights = 493;
-    GetInheritanceFlags get_inheritance_flags = 494;
-    GetInheritanceFlagsResponse get_inheritance_flags_response = 495;
-    GetInheritanceTargets get_inheritance_targets = 496;
-    GetInheritanceTargetsResponse get_inheritance_targets_response = 497; // current max
+    GetTerminalShell get_terminal_shell = 494;
+    GetTerminalShellResponse get_terminal_shell_response = 495;
+    GetInheritanceFlags get_inheritance_flags = 496;
+    GetInheritanceFlagsResponse get_inheritance_flags_response = 497;
+    GetInheritanceTargets get_inheritance_targets = 498;
+    GetInheritanceTargetsResponse get_inheritance_targets_response = 499; // current max
   }
 
   reserved 87 to 88;

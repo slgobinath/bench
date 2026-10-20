@@ -47,7 +47,7 @@ use gpui::{
     PromptLevel, Subscription, Task, WeakEntity, Window, anchored, deferred, prelude::*,
 };
 use language_model::{
-    CompletionIntent, ConfiguredModel, LanguageModelRegistry, LanguageModelRequest,
+    CompletionIntent, LanguageModelRegistry, LanguageModelRequest,
     LanguageModelRequestMessage, Role,
 };
 use project::git_store::{CommitDataState, Repository, RepositoryEvent};
@@ -1149,11 +1149,17 @@ impl BenchGitPanel {
         if self.generating || !AgentSettings::get_global(cx).enabled(cx) {
             return;
         }
-        let Some(ConfiguredModel { provider, model }) =
-            LanguageModelRegistry::read_global(cx).commit_message_model(cx)
-        else {
+        let registry = LanguageModelRegistry::read_global(cx);
+        let Some(model) = registry.commit_message_model(cx) else {
             self.toast("Set a model for commit messages to write one.".into(), cx);
             return;
+        };
+        let provider = match registry.provider_for_model(&model) {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.toast(format!("Failed to write a commit message: {error}").into(), cx);
+                return;
+            }
         };
         let repositories = self.selected(cx);
         let Some(first) = repositories.first().cloned() else {
@@ -1259,7 +1265,7 @@ impl BenchGitPanel {
                     compact_at_tokens: None,
                     max_output_tokens: None,
                 };
-                let mut stream = model.stream_completion_text(request, cx).await?;
+                let mut stream = provider.stream_completion_text(&model, request, cx).await?;
                 let mut written = if subject.trim().is_empty() {
                     String::new()
                 } else {

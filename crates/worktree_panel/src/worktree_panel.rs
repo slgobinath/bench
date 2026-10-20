@@ -1030,7 +1030,9 @@ impl WorktreePanel {
             .worktree_paths(cx)
             .ordered_pairs()
             .next()
-            .and_then(|(main, own)| linked_worktree_short_name(main, own))
+            .and_then(|(main, own)| {
+                linked_worktree_short_name(main, own, project.path_style(cx))
+            })
             .unwrap_or_else(|| "main".into())
     }
 

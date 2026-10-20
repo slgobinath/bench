@@ -121,7 +121,6 @@ impl LanguageServerPickerDelegate {
             project.restart_language_servers_for_buffers(
                 buffers,
                 HashSet::from_iter([LanguageServerSelector::Name(choice.name.clone())]),
-                true,
                 cx,
             );
         });
