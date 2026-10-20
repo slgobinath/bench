@@ -441,7 +441,7 @@ impl LinearPanel {
                     .disabled(loading)
                     .tooltip(Tooltip::text("Refresh"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.linear.update(cx, |linear, cx| linear.refresh(cx));
+                        this.linear.update(cx, |linear, cx| linear.reload(cx));
                     })),
             )
             .child(
@@ -637,7 +637,7 @@ impl LinearPanel {
                     Button::new("retry-issues", "Try Again")
                         .label_size(LabelSize::Small)
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.linear.update(cx, |linear, cx| linear.refresh(cx));
+                            this.linear.update(cx, |linear, cx| linear.reload(cx));
                         })),
                 )
                 .into_any_element();

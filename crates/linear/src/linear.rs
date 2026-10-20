@@ -931,6 +931,13 @@ impl Linear {
         })
     }
 
+    /// Like `refresh`, and also asks again for the projects and labels the
+    /// filters offer, so ones created since connecting show up.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        self.load_catalog(cx);
+    }
+
     /// Asks Linear again for what the panel shows.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(key) = self.key() else {
