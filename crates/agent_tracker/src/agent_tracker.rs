@@ -24,10 +24,13 @@
 //! # What it drives
 //!
 //! - The worktree panel's per-row count and status dot.
+//! - The agent board, which also shows what phase of the work each agent is
+//!   in, read from its transcript; see [`activity`].
 //! - A system notification when an agent stops to ask, or finishes.
 //! - The stay-awake assertion, so a long run does not end in a sleeping Mac;
 //!   see [`awake`].
 
+pub mod activity;
 pub mod awake;
 pub mod claude_model;
 pub mod claude_usage;
@@ -46,11 +49,17 @@ use gpui::{
 use settings::Settings as _;
 use terminal::Terminal;
 
+pub use activity::{
+    Activity, FeedEntry, Phase, PhaseSource, PhaseSpan, Subagent, Todo, TodoStatus,
+    TranscriptStats,
+};
 pub use claude_model::{ClaudeModel, ModelFamily};
 pub use ports_button::PortsButton;
 pub use terminal::ListeningPort;
 pub use claude_usage::{ClaudeUsage, ClaudeUsageButton};
-pub use keep_awake_button::{KeepAwakeButton, ToggleKeepAwake, agent_state_color};
+pub use keep_awake_button::{
+    InstallClaudeHooks, KeepAwakeButton, ToggleKeepAwake, agent_state_color,
+};
 
 /// Which terminal processes count as agents, and what Bench does while one of
 /// them is working. See the `agents` section of the settings file.
@@ -61,6 +70,8 @@ pub struct AgentSettings {
     pub commands: Vec<SharedString>,
     pub notify: bool,
     pub keep_awake: bool,
+    /// The user's own phases for skills, by name; see [`activity::skill_phase`].
+    pub skill_phases: HashMap<String, Phase>,
 }
 
 impl AgentSettings {
@@ -82,6 +93,12 @@ impl settings::Settings for AgentSettings {
                 .collect(),
             notify: agents.notify.unwrap_or(true),
             keep_awake: agents.keep_awake.unwrap_or(true),
+            skill_phases: agents
+                .skill_phases
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(skill, phase)| (skill, Phase::from(phase)))
+                .collect(),
         }
     }
 }
@@ -205,6 +222,8 @@ struct Watched {
     /// What the newest Claude Code transcript in this terminal's directory
     /// says about the model; see [`claude_model`].
     model: Option<claude_model::Probe>,
+    /// What the same transcript says the session has used.
+    transcript: Option<activity::TranscriptProgress>,
     /// The command in the foreground when it is neither an agent nor the
     /// shell at its prompt: a dev server, a build, a test run.
     running: Option<SharedString>,
@@ -216,6 +235,37 @@ struct ModelRequest {
     directory: PathBuf,
     process_id: Option<u32>,
     previous: Option<claude_model::Probe>,
+    transcript: Option<activity::TranscriptProgress>,
+}
+
+/// What the background half of a sweep read from one agent's transcript.
+type TranscriptRead = (Option<claude_model::Probe>, Option<activity::TranscriptProgress>);
+
+/// Looks up an agent's model and reads on in its transcript. Blocking.
+fn read_transcript(
+    directory: &Path,
+    process_id: Option<u32>,
+    previous: Option<&claude_model::Probe>,
+    transcript: Option<activity::TranscriptProgress>,
+    skill_phases: &HashMap<String, Phase>,
+) -> TranscriptRead {
+    let probe = claude_model::probe(directory, process_id, previous);
+    let transcript = probe.as_ref().and_then(|probe| {
+        activity::advance_transcript(probe.path(), transcript, skill_phases)
+    });
+    (probe, transcript)
+}
+
+/// Whether two reads of a transcript found anything different.
+fn transcript_moved(
+    before: Option<&activity::TranscriptProgress>,
+    after: Option<&activity::TranscriptProgress>,
+) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => !before.same_as(after),
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 /// An agent in a terminal-host session that no `Terminal` in this process is
@@ -227,6 +277,7 @@ struct Detached {
     directory: PathBuf,
     state: AgentState,
     model: Option<claude_model::Probe>,
+    transcript: Option<activity::TranscriptProgress>,
 }
 
 /// A non-agent process running in a daemon session nothing is attached to.
@@ -253,6 +304,7 @@ struct DetachedFound {
     session_id: String,
     directory: PathBuf,
     model: Option<claude_model::Probe>,
+    transcript: Option<activity::TranscriptProgress>,
 }
 
 pub struct AgentTracker {
@@ -347,6 +399,7 @@ impl AgentTracker {
                         agent_commands,
                         previous_models,
                         live_shells,
+                        skill_phases,
                     )) =
                         this.read_with(cx, |this, cx| {
                             (
@@ -357,10 +410,14 @@ impl AgentTracker {
                                 this.detached
                                     .iter()
                                     .map(|detached| {
-                                        (detached.session_id.clone(), detached.model.clone())
+                                        (
+                                            detached.session_id.clone(),
+                                            (detached.model.clone(), detached.transcript.clone()),
+                                        )
                                     })
                                     .collect::<HashMap<_, _>>(),
                                 scan_ports.then(|| this.terminal_shells(cx)),
+                                AgentSettings::get_global(cx).skill_phases.clone(),
                             )
                         })
                     else {
@@ -376,15 +433,18 @@ impl AgentTracker {
                                 .map(|request| {
                                     (
                                         request.terminal,
-                                        claude_model::probe(
+                                        read_transcript(
                                             &request.directory,
                                             request.process_id,
                                             request.previous.as_ref(),
+                                            request.transcript,
+                                            &skill_phases,
                                         ),
                                     )
                                 })
                                 .collect();
-                            let detached = find_detached(&agent_commands, &previous_models);
+                            let detached =
+                                find_detached(&agent_commands, &previous_models, &skill_phases);
                             let ports = match live_shells {
                                 Some(mut shells) => {
                                     shells.extend(detached.shells.iter().cloned());
@@ -437,27 +497,31 @@ impl AgentTracker {
                     directory: watched.directory.clone()?,
                     process_id: watched.process_id,
                     previous: watched.model.clone(),
+                    transcript: watched.transcript.clone(),
                 })
             })
             .collect()
     }
 
-    fn take_models(
-        &mut self,
-        models: Vec<(EntityId, Option<claude_model::Probe>)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn take_models(&mut self, models: Vec<(EntityId, TranscriptRead)>, cx: &mut Context<Self>) {
         let mut changed = false;
-        for (terminal, probe) in models {
+        let mut used = false;
+        for (terminal, (probe, transcript)) in models {
             let Some(watched) = self.watched.get_mut(&terminal) else {
                 continue;
             };
             changed |= watched.model.as_ref().and_then(|probe| probe.model.as_ref())
                 != probe.as_ref().and_then(|probe| probe.model.as_ref());
+            used |= transcript_moved(watched.transcript.as_ref(), transcript.as_ref());
             watched.model = probe;
+            watched.transcript = transcript;
         }
         if changed {
             cx.emit(AgentsChanged);
+            cx.notify();
+        } else if used {
+            // Only the board shows what a session is doing and has used, and
+            // it observes rather than subscribes; see `AgentsChanged`.
             cx.notify();
         }
     }
@@ -524,6 +588,7 @@ impl AgentTracker {
                     directory: found.directory,
                     state,
                     model: found.model,
+                    transcript: found.transcript,
                 }
             })
             .collect();
@@ -543,10 +608,20 @@ impl AgentTracker {
         };
         let changed = describe(&self.detached) != describe(&detached)
             || self.detached_processes != processes;
+        let used = self.detached.len() != detached.len()
+            || self
+                .detached
+                .iter()
+                .zip(&detached)
+                .any(|(before, after)| {
+                    transcript_moved(before.transcript.as_ref(), after.transcript.as_ref())
+                });
         self.detached = detached;
         self.detached_processes = processes;
         if changed {
             cx.emit(AgentsChanged);
+            cx.notify();
+        } else if used {
             cx.notify();
         }
     }
@@ -580,6 +655,7 @@ impl AgentTracker {
                 had_agent: false,
                 working_since: None,
                 model: None,
+                transcript: None,
                 running: None,
             },
         );
@@ -591,7 +667,7 @@ impl AgentTracker {
         let now = Instant::now();
         let settings = AgentSettings::get_global(cx).clone();
 
-        self.reports.ingest(appended, now);
+        let reported = self.reports.ingest(appended, now);
         self.reports.prune(now, REPORTS_KEPT_FOR);
 
         let mut changed = false;
@@ -626,6 +702,7 @@ impl AgentTracker {
                 watched.had_agent = false;
                 watched.working_since = None;
                 watched.model = None;
+                watched.transcript = None;
                 changed |= was.is_some() || watched.running != running;
                 watched.running = running;
                 if watched.running.is_some() {
@@ -690,7 +767,71 @@ impl AgentTracker {
         if changed {
             cx.emit(AgentsChanged);
             cx.notify();
+        } else if reported {
+            // A question an agent is asking can change without its state
+            // changing, and only the board shows it; see `take_models`.
+            cx.notify();
         }
+    }
+
+    /// Every agent Bench can see, with what is known about what it is doing,
+    /// for the agent board. Agents in terminals come first, in no particular
+    /// order; [`AgentEntry::id`] is what to sort or key them by.
+    pub fn agents(&self) -> Vec<AgentEntry<'_>> {
+        let attached = self.watched.iter().filter_map(|(terminal, watched)| {
+            let command = watched.command.clone()?;
+            Some(AgentEntry {
+                id: SharedString::from(format!("terminal-{terminal}")),
+                terminal: Some(*terminal),
+                command,
+                directory: watched.directory.as_deref(),
+                state: watched.state,
+                model: watched.model.as_ref().and_then(|probe| probe.model.clone()),
+                question: self.question_for(
+                    watched.state,
+                    watched.model.as_ref(),
+                    watched.directory.as_deref(),
+                ),
+                activity: watched.transcript.as_ref().map(|progress| &progress.activity),
+                stats: watched.transcript.as_ref().map(|progress| &progress.stats),
+            })
+        });
+        let detached = self.detached.iter().map(|detached| AgentEntry {
+            id: SharedString::from(format!("session-{}", detached.session_id)),
+            terminal: None,
+            command: SharedString::new_static("claude"),
+            directory: Some(detached.directory.as_path()),
+            state: detached.state,
+            model: detached.model.as_ref().and_then(|probe| probe.model.clone()),
+            question: self.question_for(
+                detached.state,
+                detached.model.as_ref(),
+                Some(&detached.directory),
+            ),
+            activity: detached.transcript.as_ref().map(|progress| &progress.activity),
+            stats: detached.transcript.as_ref().map(|progress| &progress.stats),
+        });
+        attached.chain(detached).collect()
+    }
+
+    /// What an agent that is waiting on you asked, as its hook reported: the
+    /// report of the session its transcript is named after, or else the
+    /// freshest in its directory. Only the hooks know, and only while they are
+    /// allowed to run.
+    fn question_for(
+        &self,
+        state: AgentState,
+        probe: Option<&claude_model::Probe>,
+        directory: Option<&Path>,
+    ) -> Option<SharedString> {
+        if state != AgentState::NeedsInput {
+            return None;
+        }
+        probe
+            .and_then(claude_model::Probe::session_id)
+            .and_then(|session_id| self.reports.report(session_id))
+            .or_else(|| self.reports.for_directory(directory?))
+            .and_then(|report| report.question.clone())
     }
 
     /// The agents whose working directory is inside `directory` — one
@@ -867,6 +1008,25 @@ impl AgentTracker {
     }
 }
 
+/// One agent, as [`AgentTracker::agents`] lists it.
+pub struct AgentEntry<'a> {
+    /// Stable for as long as the agent runs: its terminal, or for an agent no
+    /// terminal here is attached to, its terminal-host session.
+    pub id: SharedString,
+    /// The terminal it is running in, when one in this process is.
+    pub terminal: Option<EntityId>,
+    pub command: SharedString,
+    pub directory: Option<&'a Path>,
+    pub state: AgentState,
+    pub model: Option<ClaudeModel>,
+    /// What it asked, while it is waiting on you and Claude Code's hooks have
+    /// said; see [`AgentTracker::question_for`].
+    pub question: Option<SharedString>,
+    /// `None` until the session's transcript has been found and read.
+    pub activity: Option<&'a Activity>,
+    pub stats: Option<&'a TranscriptStats>,
+}
+
 struct Announcement {
     tag: SharedString,
     title: SharedString,
@@ -936,7 +1096,11 @@ fn announcement(
 /// Bench's.
 fn find_detached(
     agent_commands: &[SharedString],
-    previous_models: &HashMap<String, Option<claude_model::Probe>>,
+    previous_models: &HashMap<
+        String,
+        (Option<claude_model::Probe>, Option<activity::TranscriptProgress>),
+    >,
+    skill_phases: &HashMap<String, Phase>,
 ) -> DetachedSessions {
     let Some(host) = terminal_host::host() else {
         return DetachedSessions::default();
@@ -964,9 +1128,20 @@ fn find_detached(
             continue;
         };
         if agent_commands.iter().any(|agent| *agent == command) {
-            let previous = previous_models.get(&session.id).and_then(Option::as_ref);
+            let (previous, transcript) = previous_models
+                .get(&session.id)
+                .map(|(probe, transcript)| (probe.as_ref(), transcript.clone()))
+                .unwrap_or_default();
+            let (model, transcript) = read_transcript(
+                &foreground.directory,
+                Some(foreground.pid),
+                previous,
+                transcript,
+                skill_phases,
+            );
             found.agents.push(DetachedFound {
-                model: claude_model::probe(&foreground.directory, Some(foreground.pid), previous),
+                model,
+                transcript,
                 directory: foreground.directory,
                 session_id: session.id,
             });
@@ -1013,6 +1188,7 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             state,
             at: now.checked_sub(age).unwrap_or(now),
+            question: None,
         };
         let long_ago = REPORT_TRUSTED_FOR + Duration::from_secs(60);
         assert!(is_trusted(&report(AgentState::Working, Duration::ZERO), now));

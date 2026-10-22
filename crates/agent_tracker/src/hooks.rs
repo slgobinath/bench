@@ -13,7 +13,10 @@
 //! socket, nothing to keep running: Claude Code writes the event's JSON to the
 //! hook's stdin, and the hook appends it to a file Bench reads on its sweep.
 //! Every event carries `session_id`, `cwd` and `hook_event_name`, which is all
-//! the state model needs.
+//! the state model needs, and a `Notification` says what the agent is asking.
+//! Everything else the agent board shows comes from the session's transcript
+//! instead, which is written whether or not an organization allows user
+//! hooks; see [`crate::activity`].
 //!
 //! Two consequences of that choice, both deliberate:
 //!
@@ -40,6 +43,8 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+
+use gpui::SharedString;
 
 use crate::AgentState;
 
@@ -135,6 +140,9 @@ pub struct Report {
     pub cwd: PathBuf,
     pub state: AgentState,
     pub at: Instant,
+    /// What the agent asked, while this report is the one that says it is
+    /// waiting on you.
+    pub question: Option<SharedString>,
 }
 
 impl HookReports {
@@ -167,12 +175,16 @@ impl HookReports {
                 continue;
             };
             changed = true;
+            let question = (state == AgentState::NeedsInput)
+                .then(|| event.message.map(SharedString::from))
+                .flatten();
             self.sessions.insert(
                 event.session_id,
                 Report {
                     cwd: PathBuf::from(event.cwd),
                     state,
                     at: now,
+                    question,
                 },
             );
         }
@@ -189,6 +201,22 @@ impl HookReports {
             .max_by_key(|report| report.at)
     }
 
+    /// The session with the freshest report for a directory, by id; see
+    /// [`Self::for_directory`].
+    pub fn session_for_directory(&self, directory: &Path) -> Option<&str> {
+        self.sessions
+            .iter()
+            .filter(|(_, report)| {
+                directory.starts_with(&report.cwd) || report.cwd.starts_with(directory)
+            })
+            .max_by_key(|(_, report)| report.at)
+            .map(|(session_id, _)| session_id.as_str())
+    }
+
+    pub fn report(&self, session_id: &str) -> Option<&Report> {
+        self.sessions.get(session_id)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
@@ -200,6 +228,7 @@ impl HookReports {
         self.sessions.retain(|_, report| {
             report.state == AgentState::Idle || now.duration_since(report.at) < keep
         });
+
     }
 }
 
@@ -221,13 +250,16 @@ fn state_of(event: &str) -> Option<AgentState> {
 }
 
 /// The fields of a hook payload that Bench reads. Claude Code sends a good
-/// deal more, and sends more over time, so everything else is ignored.
+/// deal more, and sends more over time, so everything else is ignored. Only
+/// the first three are in every event; `message` is a `Notification`'s.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 struct HookEvent {
     session_id: String,
     cwd: String,
     hook_event_name: String,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// Whether Bench's hooks are already in Claude Code's settings.
@@ -404,6 +436,45 @@ mod tests {
             Some(AgentState::Working)
         );
         assert!(reports.for_directory(Path::new("/elsewhere")).is_none());
+    }
+
+    /// A notification says what the agent is asking, and the next event, which
+    /// means it has carried on, takes the question away.
+    #[test]
+    fn a_question_lasts_until_the_agent_carries_on() {
+        fn take(reports: &mut HookReports, text: &str) {
+            reports.ingest(
+                Appended::Events {
+                    text: text.to_owned(),
+                    offset: 0,
+                },
+                Instant::now(),
+            );
+        }
+        let mut reports = HookReports::default();
+        take(
+            &mut reports,
+            r#"{"session_id":"a","cwd":"/repo/fix","hook_event_name":"Notification","message":"Claude needs your permission to use Bash"}"#,
+        );
+        let question = |reports: &HookReports| {
+            reports
+                .report("a")
+                .and_then(|report| report.question.clone())
+        };
+        assert_eq!(
+            question(&reports).as_deref(),
+            Some("Claude needs your permission to use Bash")
+        );
+        assert_eq!(
+            reports.session_for_directory(Path::new("/repo/fix")),
+            Some("a")
+        );
+
+        take(
+            &mut reports,
+            r#"{"session_id":"a","cwd":"/repo/fix","hook_event_name":"PreToolUse"}"#,
+        );
+        assert_eq!(question(&reports), None);
     }
 
     /// A truncated file is read from the top again rather than from the middle

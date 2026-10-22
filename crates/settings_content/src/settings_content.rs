@@ -770,6 +770,38 @@ pub struct AgentTrackingSettingsContent {
     ///
     /// Default: true
     pub keep_awake: Option<bool>,
+    /// The phase of work each Claude Code skill or slash command puts an agent
+    /// in on the agent board, by skill name, such as
+    /// `{"my-plugin:spec": "planning"}`. Names may leave out the plugin
+    /// prefix. These come before Bench's own guesses from the name.
+    ///
+    /// Default: {}
+    pub skill_phases: Option<HashMap<String, AgentPhaseContent>>,
+}
+
+/// Bench: a column of the agent board.
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    PartialEq,
+    Eq,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhaseContent {
+    Planning,
+    Exploring,
+    Coding,
+    Testing,
+    Reviewing,
+    Shipping,
+    Debugging,
 }
 
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]

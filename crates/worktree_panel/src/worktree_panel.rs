@@ -23,6 +23,7 @@
 //! the only owner of the workspace and project list, and a second copy of it
 //! here would be a second thing to keep honest.
 
+pub mod agent_board;
 mod worktree_switcher;
 
 use std::collections::{HashMap, HashSet};
@@ -125,6 +126,7 @@ fn expand_paths(paths: Vec<String>) -> Vec<PathBuf> {
 }
 
 pub fn init(cx: &mut App) {
+    agent_board::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<WorktreePanel>(window, cx);
@@ -196,6 +198,15 @@ pub struct WorktreeListing {
     pub is_active: bool,
     pub agents: AgentSummary,
     pub processes: Vec<SharedString>,
+    /// The worktree's colour, as one of [`worktree_metadata::HUES`].
+    pub hue: Option<u8>,
+    /// The identifier of the worktree's Linear issue, such as `ENG-123`.
+    pub issue: Option<SharedString>,
+    pub pull_request: Option<PullRequestState>,
+    /// How many entries `git status` lists.
+    pub changes: usize,
+    /// How far the branch is ahead of its upstream, when it has one.
+    pub ahead: Option<u32>,
 }
 
 /// What creating a worktree does when a branch of its name already exists.
@@ -1778,12 +1789,30 @@ impl WorktreePanel {
                     .into_iter()
                     .map(|worktree| WorktreeListing {
                         name: worktree.name,
-                        root: worktree.root,
+                        root: worktree.root.clone(),
                         branch: worktree.branch,
                         title: worktree.title,
                         is_open: worktree.workspace.is_some(),
                         is_main: worktree.is_main,
                         is_active: worktree.is_active,
+                        hue: worktree
+                            .root
+                            .as_ref()
+                            .zip(store.as_ref())
+                            .map(|(root, store)| store.read(cx).get(root, cx).hue_for(root)),
+                        issue: worktree
+                            .issue
+                            .as_ref()
+                            .map(|issue| issue.identifier.clone())
+                            .or_else(|| {
+                                worktree
+                                    .linked_issue
+                                    .as_ref()
+                                    .map(|issue| issue.identifier.clone().into())
+                            }),
+                        pull_request: worktree.pull_request,
+                        changes: worktree.status.changes,
+                        ahead: worktree.status.ahead_behind.map(|(ahead, _)| ahead),
                         agents: worktree.agents,
                         processes: worktree.processes,
                     })
@@ -5303,6 +5332,17 @@ impl Render for WorktreePanel {
                             .flex_1()
                             .min_w_0()
                             .child(self.filter.render(window, cx)),
+                    )
+                    .child(
+                        IconButton::new("open-agent-board", IconName::ZedAgent)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::for_action_title(
+                                "Agent Board",
+                                &agent_board::OpenAgentBoard,
+                            ))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(agent_board::OpenAgentBoard), cx);
+                            }),
                     )
                     .child(
                         IconButton::new("add-project", IconName::FolderAdd)

@@ -1094,7 +1094,12 @@
     // something, or finishes a turn.
     "notify": true,
     // Whether to keep the machine awake while an agent is working.
-    "keep_awake": true
+    "keep_awake": true,
+    // The agent board column each Claude Code skill or slash command puts an
+    // agent in, by skill name, such as {"my-plugin:spec": "planning"}. One of
+    // planning, exploring, coding, testing, reviewing, shipping or debugging.
+    // Bench guesses from the name for skills not listed here.
+    "skill_phases": {}
   },
   // Bench: the worktree panel.
   "worktree_panel": {

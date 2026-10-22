@@ -161,6 +161,20 @@ pub struct Probe {
     pub model: Option<ClaudeModel>,
 }
 
+impl Probe {
+    /// The transcript this was read from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The session the transcript belongs to, which Claude Code names it
+    /// after. A guess when the probe fell back to the newest transcript in a
+    /// directory.
+    pub fn session_id(&self) -> Option<&str> {
+        self.path.file_stem()?.to_str()
+    }
+}
+
 /// The model of the Claude Code session in process `process_id`, or failing
 /// that of the newest transcript for sessions run in `directory`. `None`
 /// where there is no transcript at all.
