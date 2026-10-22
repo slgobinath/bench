@@ -67,3 +67,34 @@ message GetTerminalShell {
 message GetTerminalShellResponse {
   Shell shell = 1;
 }
+
+message KillTerminalSession {
+  uint64 project_id = 1;
+  string session_id = 2;
+}
+
+message EndTerminalSessionsInside {
+  uint64 project_id = 1;
+  string root = 2;
+}
+
+message ListTerminalSessions {
+  uint64 project_id = 1;
+}
+
+message ListTerminalSessionsResponse {
+  repeated TerminalSession sessions = 1;
+}
+
+message TerminalSession {
+  string id = 1;
+  optional TerminalForeground foreground = 2;
+}
+
+message TerminalForeground {
+  uint32 pid = 1;
+  optional string command = 2;
+  bool is_shell = 3;
+  string directory = 4;
+  optional string shell_directory = 5;
+}

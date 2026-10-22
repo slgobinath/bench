@@ -68,6 +68,7 @@ sysinfo.workspace = true
 task.workspace = true
 telemetry.workspace = true
 terminal.workspace = true
+terminal_host.workspace = true
 util.workspace = true
 watch.workspace = true
 worktree.workspace = true

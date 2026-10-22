@@ -1,6 +1,6 @@
 use crate::{
-    Envelope, PROTOCOL_VERSION, Request, Response, frame, read_frame, read_message, write_frame,
-    write_message,
+    CreateSession, Envelope, PROTOCOL_VERSION, Request, Response, connect_or_start, frame,
+    read_frame, read_message, write_frame, write_message,
 };
 use anyhow::{Context as _, Result, bail};
 use std::{
@@ -17,7 +17,64 @@ use std::{
 /// Relays this process's terminal to session `id` until the session exits or
 /// is attached elsewhere, returning the exit code to exit with.
 pub fn run_attach(socket: &Path, id: &str) -> i32 {
-    match attach(socket, id) {
+    exit_code(
+        UnixStream::connect(socket)
+            .context("the terminal host is not running")
+            .and_then(|stream| {
+                let (cols, rows) = window_size().unwrap_or((80, 24));
+                let request = Request::Attach {
+                    id: id.to_string(),
+                    cols,
+                    rows,
+                    client_pid: std::process::id(),
+                };
+                attach(stream, request)
+            }),
+    )
+}
+
+/// Relays this process's terminal to session `id` of the daemon at `socket`,
+/// starting the daemon with `executable` if it is not running, and starting
+/// the session with `program` in this process's directory and environment if
+/// it never ran.
+///
+/// This is what a remote terminal runs on its host, so the shell lives in the
+/// host's daemon and outlives the ssh connection showing it.
+pub fn run_open(
+    executable: &Path,
+    socket: &Path,
+    id: &str,
+    program: Option<String>,
+    args: Vec<String>,
+) -> i32 {
+    exit_code(connect_or_start(executable, socket).and_then(|stream| {
+        let (cols, rows) = window_size().unwrap_or((80, 24));
+        let create = CreateSession {
+            id: Some(id.to_string()),
+            cwd: std::env::current_dir().ok(),
+            program,
+            args,
+            // Variables that are not UTF-8 cannot cross the JSON protocol, and
+            // nothing a shell needs from Bench is spelled that way.
+            env: std::env::vars_os()
+                .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+                .collect(),
+            cols,
+            rows,
+        };
+        let request = Request::Open {
+            id: id.to_string(),
+            cols,
+            rows,
+            client_pid: std::process::id(),
+            create,
+        };
+        attach(stream, request)
+    }))
+}
+
+fn exit_code(result: Result<i32>) -> i32 {
+    match result {
         Ok(code) => code,
         Err(error) => {
             // The raw-mode guard is gone by now, so plain newlines are fine.
@@ -27,25 +84,22 @@ pub fn run_attach(socket: &Path, id: &str) -> i32 {
     }
 }
 
-fn attach(socket: &Path, id: &str) -> Result<i32> {
-    let stream = UnixStream::connect(socket).context("the terminal host is not running")?;
+fn attach(stream: UnixStream, request: Request) -> Result<i32> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let writer = Arc::new(Mutex::new(stream));
-    let (cols, rows) = window_size().unwrap_or((80, 24));
     write_message(
         &mut *lock(&writer),
         &Envelope {
             version: PROTOCOL_VERSION,
-            request: Request::Attach {
-                id: id.to_string(),
-                cols,
-                rows,
-                client_pid: std::process::id(),
-            },
+            request,
         },
     )?;
     match read_message(&mut reader)? {
         Response::Attached => {}
+        Response::Ended { exit_code } => {
+            println!("[this terminal's shell has exited]");
+            return Ok(exit_code.unwrap_or(0));
+        }
         Response::Error { message } => bail!("{message}"),
         response => bail!("unexpected response from the terminal host: {response:?}"),
     }

@@ -747,16 +747,20 @@ impl WorktreePanel {
                         .as_ref()
                         .and_then(|stored| stored.shown_title())
                         .map(|title| SharedString::from(title.to_string())),
-                    status: plan
-                        .root
-                        .as_ref()
-                        .and_then(|root| {
-                            match cx.try_global::<ProjectScans>()?.statuses.get(root)? {
-                                StatusScan::Found { status, .. } => Some(*status),
-                                StatusScan::Pending { .. } => None,
-                            }
-                        })
-                        .unwrap_or_default(),
+                    status: if key.host().is_some() {
+                        open.and_then(|open| remote_worktree_status(open, cx))
+                            .unwrap_or_default()
+                    } else {
+                        plan.root
+                            .as_ref()
+                            .and_then(|root| {
+                                match cx.try_global::<ProjectScans>()?.statuses.get(root)? {
+                                    StatusScan::Found { status, .. } => Some(*status),
+                                    StatusScan::Pending { .. } => None,
+                                }
+                            })
+                            .unwrap_or_default()
+                    },
                     issue: None,
                     branch: plan.branch,
                     root: plan.root,
@@ -790,9 +794,12 @@ impl WorktreePanel {
             .map(|workspace| workspace.read(cx).project_group_key(cx))
             .collect();
 
+        // A project on a remote host cannot be asked of this machine's git;
+        // its worktrees are listed once it is open.
         multi_workspace
             .project_group_keys()
             .into_iter()
+            .filter(|key| key.host().is_none())
             .filter(|key| !open.iter().any(|held| held.matches(key)))
             .filter_map(|key| project_root(&key))
             .collect()
@@ -1105,18 +1112,11 @@ impl WorktreePanel {
                 workspace.active_modal::<OpeningWorktree>(cx)
             });
             let opened = multi_workspace.update(cx, |multi_workspace, cx| {
-                multi_workspace.find_or_create_local_workspace(
-                    PathList::new(&[root]),
-                    Some(key),
-                    None,
-                    OpenMode::Activate,
-                    None,
-                    window,
-                    cx,
-                )
+                find_or_create_workspace_in_group(multi_workspace, root, key, window, cx)
             });
-            cx.spawn(async move |cx| {
+            window.spawn(cx, async move |cx| {
                 let opened = opened.await;
+                remote_connection::dismiss_connection_modal(&leaving, cx);
                 if let Some(opening) = opening {
                     opening.update(cx, |_, cx| cx.emit(DismissEvent));
                 }
@@ -1317,7 +1317,16 @@ impl WorktreePanel {
     ) {
         let multi_workspace = self.multi_workspace.clone();
         let panel = cx.entity().downgrade();
-        let directory = worktrees_directory(&key);
+        let Some(home) = worktrees_home(&from, cx) else {
+            from.update(cx, |workspace, cx| {
+                workspace.show_error(
+                    "Could not find the home directory to put the worktree in.".to_string(),
+                    cx,
+                )
+            });
+            return;
+        };
+        let directory = worktrees_directory(&key, &home);
         let team = project_root(&key).and_then(|root| {
             WorktreeMetadataStore::try_global(cx)
                 .and_then(|store| store.read(cx).get(&root, cx).linear_team)
@@ -1382,19 +1391,19 @@ impl WorktreePanel {
             };
             let leaving = multi_workspace.read(cx).workspace().clone();
             let opened = multi_workspace.update(cx, |multi_workspace, cx| {
-                multi_workspace.find_or_create_local_workspace(
-                    PathList::new(std::slice::from_ref(&root)),
-                    Some(key.clone()),
-                    None,
-                    OpenMode::Activate,
-                    None,
+                find_or_create_workspace_in_group(
+                    multi_workspace,
+                    root.clone(),
+                    key.clone(),
                     window,
                     cx,
                 )
             });
             window
                 .spawn(cx, async move |cx| {
-                    let workspace = match opened.await {
+                    let opened = opened.await;
+                    remote_connection::dismiss_connection_modal(&leaving, cx);
+                    let workspace = match opened {
                         Ok(workspace) => workspace,
                         Err(error) => {
                             log::error!("opening the project {}: {error:#}", root.display());
@@ -1801,7 +1810,13 @@ impl WorktreePanel {
         let Some(fs) = self.fs(cx) else {
             return Task::ready(Err(anyhow!("Bench has no file system to create worktrees with")));
         };
-        let (path, mut target) = new_worktree(&key, &name);
+        let Some(home) = worktrees_home(&from, cx) else {
+            return Task::ready(Err(anyhow!(
+                "Could not find the home directory to put the worktree “{name}” in"
+            )));
+        };
+        let is_remote = key.host().is_some();
+        let (path, mut target) = new_worktree(&key, &home, &name);
         let snapshot = repository.read(cx).snapshot();
         let common_dir = snapshot.common_dir_abs_path.to_path_buf();
         let work_directory = snapshot.work_directory_abs_path.to_path_buf();
@@ -1907,10 +1922,14 @@ impl WorktreePanel {
             }
 
             if let CreateWorktreeTarget::NewBranch { base_sha, .. } = &mut target {
-                let git_directory = fs.open_repo(&common_dir, which::which("git").ok().as_deref())?;
-                *base_sha = cx
-                    .background_spawn(new_branch_base(git_directory, work_directory))
-                    .await;
+                *base_sha = if is_remote {
+                    remote_new_branch_base(&repository, cx).await
+                } else {
+                    let git_directory =
+                        fs.open_repo(&common_dir, which::which("git").ok().as_deref())?;
+                    cx.background_spawn(new_branch_base(git_directory, work_directory))
+                        .await
+                };
             }
 
             let created = repository
@@ -2014,6 +2033,36 @@ impl WorktreePanel {
             .flat_map(|row| row.worktrees)
             .find(|worktree| worktree.root.as_deref() == Some(root.as_path()));
         let branch = deleted.as_ref().and_then(|worktree| worktree.branch.clone());
+        // A worktree on a remote host is none of this machine's files: its
+        // terminals are ended there, and its branch deleted through the
+        // repository, since its git directory is not here to open. Asked
+        // through a workspace that outlives the deletion where there is one,
+        // since the worktree's own workspaces are closed first.
+        let survivor = deleted
+            .as_ref()
+            .filter(|worktree| worktree.key.host().is_some())
+            .and_then(|worktree| {
+                let multi_workspace = self.multi_workspace.upgrade()?;
+                let multi_workspace = multi_workspace.read(cx);
+                multi_workspace
+                    .workspaces()
+                    .find(|workspace| {
+                        workspace.read(cx).project_group_key(cx).matches(&worktree.key)
+                            && workspace_root(workspace, cx)
+                                .is_some_and(|workspace_root| !workspace_root.starts_with(&root))
+                    })
+                    .cloned()
+                    .or_else(|| worktree.switch_from.clone())
+            });
+        let remote_project = survivor
+            .as_ref()
+            .map(|workspace| workspace.read(cx).project().clone());
+        let repository = survivor
+            .and_then(|workspace| {
+                let root = workspace_root(&workspace, cx);
+                workspace_repository(&OpenWorktree { workspace, root }, cx)
+            })
+            .unwrap_or(repository);
         // Offered to be closed only while it is open, and only when there is
         // a connection to close it through.
         let issue = deleted
@@ -2024,9 +2073,12 @@ impl WorktreePanel {
             });
 
         cx.spawn_in(window, async move |this, cx| {
-            let nested = cx
-                .background_spawn(nested_worktrees(fs.clone(), root.clone()))
-                .await;
+            let nested = if remote_project.is_some() {
+                Vec::new()
+            } else {
+                cx.background_spawn(nested_worktrees(fs.clone(), root.clone()))
+                    .await
+            };
             let mut detail = format!(
                 "{} will be removed from disk. Terminals open in it are closed and the \
                  processes running in them are stopped.",
@@ -2077,12 +2129,21 @@ impl WorktreePanel {
             // a dev server or build still writing into the directory is what
             // makes git fail to empty it. Ended whether or not the worktree
             // was open: after a restart most of them are not.
-            let ended = cx
-                .background_spawn({
-                    let root = root.clone();
-                    async move { terminal::end_sessions_inside(&root) }
-                })
-                .await;
+            let ended = match &remote_project {
+                Some(project) => {
+                    let ended = cx.update(|_, cx| {
+                        project.read(cx).end_remote_terminal_sessions_inside(&root, cx)
+                    })?;
+                    ended.await.map(|()| 0)
+                }
+                None => {
+                    cx.background_spawn({
+                        let root = root.clone();
+                        async move { terminal::end_sessions_inside(&root) }
+                    })
+                    .await
+                }
+            };
             match ended {
                 Ok(0) => {}
                 Ok(count) => log::info!(
@@ -2179,9 +2240,17 @@ impl WorktreePanel {
             }
 
             if let Some(branch) = branch {
-                fs.open_repo(&common_dir, git.as_deref())?
-                    .delete_branch(false, branch.to_string(), true)
-                    .await?;
+                if remote_project.is_some() {
+                    repository
+                        .update(cx, |repository, _| {
+                            repository.delete_branch(false, branch.to_string(), true)
+                        })
+                        .await??;
+                } else {
+                    fs.open_repo(&common_dir, git.as_deref())?
+                        .delete_branch(false, branch.to_string(), true)
+                        .await?;
+                }
             }
 
             multi_workspace
@@ -2669,8 +2738,12 @@ impl WorktreePanel {
         // Only the repository's own checkout: it is where the branch everyone
         // else starts from lives, and keeping it level with its upstream is
         // the chore. A worktree's branch is pushed when its work is done.
+        // Not on a remote host, where the sync's git would have to run.
+        let is_local = row.key.host().is_none();
         let sync = match (&row.root, row.status.ahead_behind) {
-            (Some(root), Some((ahead, behind))) if row.is_main && (ahead > 0 || behind > 0) => {
+            (Some(root), Some((ahead, behind)))
+                if is_local && row.is_main && (ahead > 0 || behind > 0) =>
+            {
                 Some((root.clone(), ahead, behind))
             }
             _ => None,
@@ -4175,9 +4248,9 @@ impl Render for OpeningWorktree {
 /// Where a new worktree goes and what it checks out: a directory named after it
 /// under the project's worktree directory, on a new branch of the same name off
 /// whatever the repository has checked out.
-fn new_worktree(key: &ProjectGroupKey, name: &str) -> (PathBuf, CreateWorktreeTarget) {
+fn new_worktree(key: &ProjectGroupKey, home: &Path, name: &str) -> (PathBuf, CreateWorktreeTarget) {
     (
-        worktrees_directory(key).join(worktree_directory_name(name)),
+        worktrees_directory(key, home).join(worktree_directory_name(name)),
         CreateWorktreeTarget::NewBranch {
             branch_name: name.to_owned(),
             base_sha: None,
@@ -4247,19 +4320,55 @@ fn name_from_description(description: &str) -> String {
     name
 }
 
-/// Where Bench keeps one project's worktrees: `~/bench/<project>`.
+/// Where Bench keeps one project's worktrees: `~/bench/<project>`, in the home
+/// directory of the host the project is on.
 ///
 /// One fixed place, rather than beside the repository as git defaults to and as
 /// `git.worktree_directory` configures. A project's worktrees are then a
 /// directory listing rather than a search, they are all in one place whatever
 /// the repository's own path is, and a repository directory stays a checkout
 /// instead of becoming a container of checkouts.
-fn worktrees_directory(key: &ProjectGroupKey) -> PathBuf {
+fn worktrees_directory(key: &ProjectGroupKey, home: &Path) -> PathBuf {
     let project = project_root(key)
         .as_deref()
         .and_then(directory_name)
         .unwrap_or_else(|| "project".into());
-    home_dir().join(WORKTREES_DIRECTORY).join(project.as_str())
+    home.join(WORKTREES_DIRECTORY).join(project.as_str())
+}
+
+/// The home directory of the host `workspace`'s project is on, which is where
+/// its new worktrees go; see [`worktrees_directory`].
+fn worktrees_home(workspace: &Entity<Workspace>, cx: &App) -> Option<PathBuf> {
+    match workspace.read(cx).project().read(cx).remote_client() {
+        Some(remote_client) => remote_client.read(cx).home_dir().map(PathBuf::from),
+        None => Some(home_dir().clone()),
+    }
+}
+
+/// Opens `root` as a workspace of project group `key`, connecting to the
+/// group's host first when it is a remote one.
+fn find_or_create_workspace_in_group(
+    multi_workspace: &mut MultiWorkspace,
+    root: PathBuf,
+    key: ProjectGroupKey,
+    window: &mut Window,
+    cx: &mut Context<MultiWorkspace>,
+) -> Task<anyhow::Result<Entity<Workspace>>> {
+    let host = key.host();
+    let connect_from = multi_workspace.workspace().clone();
+    multi_workspace.find_or_create_workspace(
+        PathList::new(&[root]),
+        host,
+        Some(key),
+        move |options, window, cx| {
+            remote_connection::connect_with_modal(&connect_from, options, window, cx)
+        },
+        None,
+        OpenMode::Activate,
+        None,
+        window,
+        cx,
+    )
 }
 
 /// The directory under `$HOME` that every project's worktrees go in.
@@ -4664,6 +4773,35 @@ async fn new_branch_base(
     None
 }
 
+/// [`new_branch_base`] for a repository on a remote host, asked through the
+/// repository rather than of a git directory this machine cannot open. Not
+/// fetched first: a fetch there would need its credentials answered here.
+async fn remote_new_branch_base(
+    repository: &Entity<Repository>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Option<String> {
+    for include_remote_name in [true, false] {
+        let branch = repository
+            .update(cx, |repository, _| repository.default_branch(include_remote_name))
+            .await
+            .ok()?
+            .log_err()
+            .flatten();
+        let Some(branch) = branch else {
+            continue;
+        };
+        let commit = repository
+            .update(cx, |repository, _| repository.show(branch.to_string()))
+            .await
+            .ok()?
+            .log_err();
+        if let Some(commit) = commit {
+            return Some(commit.sha.to_string());
+        }
+    }
+    None
+}
+
 /// `git fetch` in the worktree at `root`, quietly: it runs in the background,
 /// with nobody to answer a credentials prompt.
 async fn fetch_upstream(root: &Path) -> anyhow::Result<()> {
@@ -4777,6 +4915,34 @@ async fn worktree_status(fs: Arc<dyn Fs>, root: PathBuf) -> WorktreeStatus {
         changes: parsed.paths.len(),
         ahead_behind: parsed.ahead_behind,
     }
+}
+
+/// [`worktree_status`] for an open worktree on a remote host, from what its
+/// repository already knows rather than from running git here. The last edit
+/// is its last commit, since the host's file times are not to hand, and the
+/// counts are as of the host's last fetch.
+fn remote_worktree_status(open: &OpenWorktree, cx: &App) -> Option<WorktreeStatus> {
+    let repository = workspace_repository(open, cx)?;
+    let snapshot = repository.read(cx).snapshot();
+    let ahead_behind = snapshot
+        .branch
+        .as_ref()
+        .and_then(|branch| branch.upstream.as_ref())
+        .and_then(|upstream| match &upstream.tracking {
+            git::repository::UpstreamTracking::Tracked(status) => {
+                Some((status.ahead, status.behind))
+            }
+            git::repository::UpstreamTracking::Gone => None,
+        });
+    let last_edit = snapshot.head_commit.as_ref().and_then(|commit| {
+        let seconds = u64::try_from(commit.commit_timestamp).ok()?;
+        SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
+    });
+    Some(WorktreeStatus {
+        last_edit,
+        changes: snapshot.status_summary().count,
+        ahead_behind,
+    })
 }
 
 struct ParsedStatus<'a> {
@@ -5061,10 +5227,12 @@ impl Render for WorktreePanel {
         self.discover(&closed, cx);
         let tree = self.tree(cx);
         let filter = self.filter(cx);
-        let roots: Vec<PathBuf> = tree.iter().filter_map(|row| project_root(&row.key)).collect();
+        // The scans run git and `gh` in the worktree's directory on this
+        // machine, which a project on a remote host does not have.
+        let local_rows = || tree.iter().filter(|row| row.key.host().is_none());
+        let roots: Vec<PathBuf> = local_rows().filter_map(|row| project_root(&row.key)).collect();
         self.scan_pull_requests(&roots, cx);
-        let worktree_roots: Vec<(PathBuf, bool)> = tree
-            .iter()
+        let worktree_roots: Vec<(PathBuf, bool)> = local_rows()
             .flat_map(|row| row.worktrees.iter())
             .filter_map(|worktree| Some((worktree.root.clone()?, worktree.is_main)))
             .collect();
@@ -6025,7 +6193,7 @@ mod tests {
         });
         cx.run_until_parked();
         let path = created.await.expect("the worktree is created");
-        let (expected, _) = new_worktree(&key, "dev/rb-116-legal-entities");
+        let (expected, _) = new_worktree(&key, home_dir(), "dev/rb-116-legal-entities");
         assert_eq!(path, expected, "named after the issue's Linear branch");
         let metadata = cx.update(|_, cx| WorktreeMetadataStore::global(cx).read(cx).get(&path, cx));
         assert_eq!(
@@ -6051,7 +6219,7 @@ mod tests {
         });
         cx.run_until_parked();
         let path = created.await.expect("the worktree is created");
-        let (expected, _) = new_worktree(&key, "fix-the-login-redirect");
+        let (expected, _) = new_worktree(&key, home_dir(), "fix-the-login-redirect");
         assert_eq!(path, expected, "a description is made into a name");
         let metadata = cx.update(|_, cx| WorktreeMetadataStore::global(cx).read(cx).get(&path, cx));
         assert_eq!(metadata.title.as_deref(), Some("Fix the login redirect"));
@@ -6159,7 +6327,7 @@ mod tests {
         cx.simulate_prompt_answer("Use Existing Branch");
         cx.run_until_parked();
 
-        let (path, _) = new_worktree(&key, "rb-174");
+        let (path, _) = new_worktree(&key, home_dir(), "rb-174");
         assert!(fs.is_dir(&path).await, "the worktree was made on the branch");
     }
 
@@ -6248,7 +6416,7 @@ mod tests {
         });
         cx.run_until_parked();
 
-        let (path, _) = new_worktree(&key, "dev/rb-116-legal-entities");
+        let (path, _) = new_worktree(&key, home_dir(), "dev/rb-116-legal-entities");
         let (metadata, sibling_hue) = cx.update(|_, cx| {
             let store = WorktreeMetadataStore::global(cx);
             let store = store.read(cx);
@@ -7119,7 +7287,7 @@ mod tests {
     fn a_new_worktree_is_its_name_twice_over() {
         let key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/Developer/bench")]));
 
-        let (path, target) = new_worktree(&key, "fix-login");
+        let (path, target) = new_worktree(&key, home_dir(), "fix-login");
 
         assert_eq!(
             path,
@@ -7144,7 +7312,7 @@ mod tests {
     fn a_branch_name_with_a_slash_keeps_it_and_the_directory_does_not() {
         let key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/Developer/bench")]));
 
-        let (path, target) = new_worktree(&key, "feature/foo");
+        let (path, target) = new_worktree(&key, home_dir(), "feature/foo");
 
         assert_eq!(
             path,

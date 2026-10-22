@@ -273,7 +273,9 @@ impl PtyProcessInfo {
 }
 
 /// What is in the foreground of a persistent session, found from the session's
-/// shell alone, for sessions that no `Terminal` is attached to.
+/// shell alone, for sessions that no `Terminal` is attached to, or whose shell
+/// is on a remote host.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionForeground {
     pub pid: u32,
     pub command: Option<String>,
@@ -327,8 +329,26 @@ pub fn end_sessions_inside(root: &Path) -> anyhow::Result<usize> {
     let Some(host) = terminal_host::host() else {
         return Ok(0);
     };
-    let doomed: Vec<String> = host
-        .sessions()?
+    end_sessions_inside_of(root, || host.sessions(), |id| host.kill(id, None))
+}
+
+/// [`end_sessions_inside`] for the daemon at `socket`, which is how the
+/// remote server ends the sessions of a worktree being deleted on its host.
+#[cfg(unix)]
+pub fn end_sessions_inside_socket(socket: &Path, root: &Path) -> anyhow::Result<usize> {
+    end_sessions_inside_of(
+        root,
+        || terminal_host::sessions_at(socket),
+        |id| terminal_host::kill_at(socket, id),
+    )
+}
+
+fn end_sessions_inside_of(
+    root: &Path,
+    sessions: impl Fn() -> anyhow::Result<Vec<terminal_host::SessionInfo>>,
+    kill: impl Fn(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<usize> {
+    let doomed: Vec<String> = sessions()?
         .into_iter()
         .filter(|session| {
             session_foreground(session.pid).is_some_and(|foreground| {
@@ -341,12 +361,12 @@ pub fn end_sessions_inside(root: &Path) -> anyhow::Result<usize> {
         .map(|session| session.id)
         .collect();
     for id in &doomed {
-        host.kill(id, None)?;
+        kill(id)?;
     }
 
     let deadline = Instant::now() + SESSIONS_END_WITHIN;
     while Instant::now() < deadline {
-        let remaining = host.sessions()?;
+        let remaining = sessions()?;
         if !remaining.iter().any(|session| doomed.contains(&session.id)) {
             break;
         }

@@ -528,7 +528,11 @@ message Envelope {
     GetInheritanceFlags get_inheritance_flags = 496;
     GetInheritanceFlagsResponse get_inheritance_flags_response = 497;
     GetInheritanceTargets get_inheritance_targets = 498;
-    GetInheritanceTargetsResponse get_inheritance_targets_response = 499; // current max
+    GetInheritanceTargetsResponse get_inheritance_targets_response = 499;
+    KillTerminalSession kill_terminal_session = 500;
+    EndTerminalSessionsInside end_terminal_sessions_inside = 501;
+    ListTerminalSessions list_terminal_sessions = 502;
+    ListTerminalSessionsResponse list_terminal_sessions_response = 503; // current max
   }
 
   reserved 87 to 88;

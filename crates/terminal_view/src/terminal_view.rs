@@ -381,14 +381,26 @@ impl TerminalView {
             return;
         };
         let session_id = session.id.clone();
+        let is_remote = session.leader_pid.is_none();
         let attach_pid = terminal
             .pid_getter()
             .map(|pid_getter| pid_getter.fallback_pid().as_u32());
         let terminal = self.terminal.downgrade();
         let workspace = self.workspace.clone();
+        let project = self.project.clone();
         cx.defer(move |cx| {
             // Another view may still be showing this terminal.
             if terminal.upgrade().is_some() || workspace.upgrade().is_none() {
+                return;
+            }
+            if is_remote {
+                let Some(project) = project.upgrade() else {
+                    return;
+                };
+                project
+                    .read(cx)
+                    .end_remote_terminal_session(session_id, cx)
+                    .detach_and_log_err(cx);
                 return;
             }
             let Some(host) = terminal_host::host() else {

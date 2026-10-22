@@ -291,7 +291,12 @@ async fn build_remote_server_from_source(
         if binary_exists_on_server {
             return Ok(None);
         }
-        log::warn!("ZED_BUILD_REMOTE_SERVER is disabled, but no server binary exists on the server")
+        // Building here would need zig to cross-compile, which is what turning the
+        // build off is meant to avoid; the server is installed separately instead.
+        anyhow::bail!(
+            "No remote server is installed on this host and ZED_BUILD_REMOTE_SERVER is off. \
+             Install one with `script/install-remote-server <host>` from the Bench checkout."
+        );
     }
 
     async fn run_cmd(command: &mut Command) -> Result<()> {

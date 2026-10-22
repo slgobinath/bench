@@ -17,6 +17,10 @@
 //! - It is a file you can read and edit, and other tools can find it. An edit
 //!   made outside Bench is picked up while Bench is running.
 //!
+//! A worktree whose git directory this machine cannot see — one on a remote
+//! host — keeps its file in Bench's own data directory instead, named after
+//! the worktree's path.
+//!
 //! Read in the background the first time a worktree is asked about, and
 //! cached: the title bar asks on every draw. Until it has been read — and for
 //! a worktree Bench did not make, which has none — every reader has an answer:
@@ -46,6 +50,10 @@ use util::ResultExt as _;
 
 /// The file's name in the worktree's git directory.
 const FILE_NAME: &str = "bench.json";
+
+/// The directory under Bench's data directory holding the files of worktrees
+/// with no git directory here.
+const FALLBACK_DIRECTORY: &str = "worktree_metadata";
 
 /// How long after a change to a worktree's git directory its file is read
 /// again. Git writes there in bursts — the index, `HEAD`, a lock and its
@@ -389,7 +397,26 @@ async fn git_directory(fs: &dyn Fs, worktree: &Path) -> Option<PathBuf> {
 }
 
 async fn file_for(fs: &dyn Fs, worktree: &Path) -> Option<PathBuf> {
-    Some(git_directory(fs, worktree).await?.join(FILE_NAME))
+    match git_directory(fs, worktree).await {
+        Some(git_directory) => Some(git_directory.join(FILE_NAME)),
+        None => fallback_file(worktree),
+    }
+}
+
+/// Where `worktree`'s file goes when it has no git directory on this machine:
+/// a file named after its path, with the separators escaped so that the path
+/// is one file name.
+fn fallback_file(worktree: &Path) -> Option<PathBuf> {
+    let name = worktree
+        .to_str()?
+        .replace('%', "%25")
+        .replace('/', "%2F")
+        .replace('\\', "%5C");
+    Some(
+        paths::data_dir()
+            .join(FALLBACK_DIRECTORY)
+            .join(format!("{name}.json")),
+    )
 }
 
 async fn read(fs: &dyn Fs, worktree: &Path) -> WorktreeMetadata {
@@ -405,8 +432,11 @@ async fn read(fs: &dyn Fs, worktree: &Path) -> WorktreeMetadata {
 
 async fn write(fs: &dyn Fs, worktree: &Path, metadata: &WorktreeMetadata) -> anyhow::Result<()> {
     let Some(file) = file_for(fs, worktree).await else {
-        anyhow::bail!("{} is not a git worktree", worktree.display());
+        anyhow::bail!("{} has no place to keep its metadata", worktree.display());
     };
+    if let Some(directory) = file.parent() {
+        fs.create_dir(directory).await?;
+    }
     let mut text = serde_json::to_string_pretty(metadata)?;
     text.push('\n');
     fs.atomic_write(file, text).await
@@ -541,6 +571,38 @@ mod tests {
         assert!(
             !fs.is_file(Path::new("/wt/fix/bench.json")).await,
             "nothing in the worktree itself"
+        );
+    }
+
+    /// A worktree on a remote host has no git directory here, so its file is
+    /// kept in Bench's own data directory, and read back from there.
+    #[gpui::test]
+    async fn a_worktree_with_no_git_directory_here_is_kept_in_the_data_directory(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, store) = repository(cx).await;
+        let remote = Path::new("/home/me/bench/project/fix");
+        store.update(cx, |store, cx| {
+            store.update(remote, |metadata| metadata.hue = Some(4), cx);
+        });
+        cx.run_until_parked();
+
+        let file = paths::data_dir()
+            .join(FALLBACK_DIRECTORY)
+            .join("%2Fhome%2Fme%2Fbench%2Fproject%2Ffix.json");
+        assert!(fs.is_file(&file).await);
+
+        let restarted = cx.new(|cx| WorktreeMetadataStore {
+            cache: RefCell::new(HashMap::new()),
+            watches: RefCell::new(HashMap::new()),
+            fs: Some(fs.clone()),
+            this: cx.weak_entity(),
+        });
+        restarted.read_with(cx, |store, cx| store.get(remote, cx));
+        cx.run_until_parked();
+        assert_eq!(
+            restarted.read_with(cx, |store, cx| store.get(remote, cx).hue),
+            Some(4)
         );
     }
 

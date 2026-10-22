@@ -449,6 +449,10 @@ impl RemoteConnection for SshRemoteConnection {
         self.ssh_default_system_shell.clone()
     }
 
+    fn home_dir(&self) -> Option<String> {
+        self.ssh_home_dir.clone()
+    }
+
     fn build_command(
         &self,
         input_program: Option<String>,
@@ -539,6 +543,44 @@ impl RemoteConnection for SshRemoteConnection {
             self.socket.envs.clone(),
         );
         Ok((template, command.encode()?))
+    }
+
+    fn build_remote_server_terminal_command(
+        &self,
+        args: &[String],
+        env: &HashMap<String, String>,
+        working_dir: Option<String>,
+    ) -> Result<Option<CommandTemplate>> {
+        if self.ssh_platform.os.is_windows() {
+            return Ok(None);
+        }
+        let Some(remote_binary_path) = self.remote_binary_path.as_ref() else {
+            return Ok(None);
+        };
+        let remote_binary_path = remote_binary_path.display(PathStyle::Unix);
+        let remote_binary = match self.ssh_home_dir.as_deref() {
+            Some(home_dir) => self
+                .ssh_shell_kind
+                .try_quote(&format!(
+                    "{}/{remote_binary_path}",
+                    home_dir.trim_end_matches('/')
+                ))
+                .context("shell quoting")?
+                .into_owned(),
+            None => home_relative_path(self.ssh_shell_kind, Some(&remote_binary_path))?,
+        };
+        build_remote_server_terminal_command_posix(
+            &remote_binary,
+            args,
+            env,
+            working_dir,
+            self.socket.envs.clone(),
+            self.ssh_path_style,
+            self.ssh_shell_kind,
+            self.socket.ssh_command_options(),
+            &self.socket.connection_options.ssh_destination(),
+        )
+        .map(Some)
     }
 
     fn build_forward_ports_command(
@@ -2076,6 +2118,54 @@ fn build_command_posix(
     ))
 }
 
+/// Like [`build_command_posix`], but runs the remote server binary itself,
+/// which a relative path from the remote home directory names.
+fn build_remote_server_terminal_command_posix(
+    remote_binary: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    working_dir: Option<String>,
+    ssh_env: HashMap<String, String>,
+    ssh_path_style: PathStyle,
+    ssh_shell_kind: ShellKind,
+    mut ssh_options: Vec<String>,
+    ssh_destination: &str,
+) -> Result<CommandTemplate> {
+    let mut exec = posix_working_dir_prefix(working_dir, ssh_path_style, ssh_shell_kind)?;
+    write!(exec, "exec env ")?;
+    for (key, value) in env {
+        let assignment = format!("{key}={value}");
+        let assignment = ssh_shell_kind
+            .try_quote(&assignment)
+            .context("shell quoting")?;
+        write!(exec, "{assignment} ")?;
+    }
+    write!(exec, "{remote_binary}")?;
+    for arg in args {
+        let arg = ssh_shell_kind.try_quote(arg).context("shell quoting")?;
+        write!(exec, " {arg}")?;
+    }
+
+    // Terminals run this command again when their connection drops. Once the
+    // ControlMaster it started on is gone, it connects directly, and a direct
+    // connection has to notice a dead link itself, such as one a sleeping Mac
+    // left behind.
+    ssh_options.extend([
+        "-o".to_string(),
+        "ServerAliveInterval=10".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+    ]);
+    Ok(ssh_command_template(
+        ssh_options,
+        None,
+        Interactive::Yes,
+        ssh_destination,
+        exec,
+        ssh_env,
+    ))
+}
+
 fn posix_working_dir_prefix(
     working_dir: Option<String>,
     ssh_path_style: PathStyle,
@@ -2426,6 +2516,92 @@ mod tests {
         assert_eq!(template.args, expected.args);
         assert_eq!(template.env, expected.env);
         assert_eq!(payload, Vec::<u8>::new());
+        Ok(())
+    }
+
+    #[test]
+    fn test_build_remote_server_terminal_command() -> Result<()> {
+        let mut connection = SshRemoteConnection {
+            socket: SshSocket {
+                connection_options: SshConnectionOptions {
+                    host: SshConnectionHost::from("host"),
+                    username: Some(String::from("user")),
+                    ..SshConnectionOptions::default()
+                },
+                socket_path: PathBuf::from("/tmp/zed-test.sock"),
+                envs: HashMap::default(),
+            },
+            master_process: Mutex::new(None),
+            killed: AtomicBool::new(false),
+            remote_binary_path: None,
+            ssh_platform: RemotePlatform {
+                os: RemoteOs::Linux,
+                arch: RemoteArch::X86_64,
+            },
+            ssh_os_version: None,
+            ssh_path_style: PathStyle::Unix,
+            ssh_shell: String::from("/bin/bash"),
+            ssh_shell_kind: ShellKind::Posix,
+            ssh_default_system_shell: String::from("/bin/sh"),
+            ssh_home_dir: None,
+            _temp_dir: TempDir::new()?,
+        };
+        let args = [
+            String::from("--terminal-open"),
+            String::from("session id"),
+            String::from("/bin/bash"),
+            String::from("-l"),
+        ];
+        let env = HashMap::from_iter([(String::from("TERM_PROGRAM"), String::from("zed"))]);
+        assert!(
+            connection
+                .build_remote_server_terminal_command(&args, &env, None)?
+                .is_none()
+        );
+
+        connection.remote_binary_path = Some(Arc::from(RelPath::from_unix_str(
+            ".local/share/zed/remote server",
+        )?));
+        for (home_dir, expected_binary) in [
+            (None, "\"$HOME\"/'.local/share/zed/remote server'"),
+            (
+                Some("/home/user/"),
+                "'/home/user/.local/share/zed/remote server'",
+            ),
+        ] {
+            connection.ssh_home_dir = home_dir.map(String::from);
+            let template = connection
+                .build_remote_server_terminal_command(&args, &env, Some("~/project".into()))?
+                .context("no command")?;
+            assert_eq!(template.program, "ssh");
+            assert_eq!(
+                template.args,
+                [
+                    "-o",
+                    "ControlMaster=no",
+                    "-o",
+                    "ControlPath=/tmp/zed-test.sock",
+                    "-o",
+                    "ServerAliveInterval=10",
+                    "-o",
+                    "ServerAliveCountMax=3",
+                    "-o",
+                    "LogLevel=ERROR",
+                    "-t",
+                    "user@host",
+                    &format!(
+                        "cd \"$HOME\"/project && exec env 'TERM_PROGRAM=zed' {expected_binary} --terminal-open 'session id' /bin/bash -l"
+                    ),
+                ]
+            );
+        }
+
+        connection.ssh_platform.os = RemoteOs::Windows;
+        assert!(
+            connection
+                .build_remote_server_terminal_command(&args, &env, None)?
+                .is_none()
+        );
         Ok(())
     }
 

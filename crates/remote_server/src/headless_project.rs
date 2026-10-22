@@ -323,6 +323,9 @@ impl HeadlessProject {
         session.add_entity_request_handler(Self::handle_open_server_settings);
         session.add_entity_request_handler(Self::handle_get_directory_environment);
         session.add_entity_request_handler(Self::handle_get_terminal_shell);
+        session.add_entity_request_handler(Self::handle_kill_terminal_session);
+        session.add_entity_request_handler(Self::handle_end_terminal_sessions_inside);
+        session.add_entity_request_handler(Self::handle_list_terminal_sessions);
         session.add_entity_message_handler(Self::handle_toggle_lsp_logs);
         session.add_entity_request_handler(Self::handle_open_image_by_path);
         session.add_entity_request_handler(Self::handle_trust_worktrees);
@@ -1497,6 +1500,76 @@ impl HeadlessProject {
         Ok(proto::GetTerminalShellResponse {
             shell: Some(task::shell_to_proto(shell)),
         })
+    }
+
+    async fn handle_kill_terminal_session(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::KillTerminalSession>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let session_id = envelope.payload.session_id;
+        cx.background_spawn(async move {
+            #[cfg(unix)]
+            return terminal_host::kill_at(&crate::terminal_host_socket(), &session_id);
+            #[cfg(not(unix))]
+            anyhow::bail!("terminal sessions are only hosted on unix, not {session_id}")
+        })
+        .await
+        .context("ending a terminal session")?;
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_end_terminal_sessions_inside(
+        _this: Entity<Self>,
+        envelope: TypedEnvelope<proto::EndTerminalSessionsInside>,
+        cx: AsyncApp,
+    ) -> Result<proto::Ack> {
+        let root = PathBuf::from(envelope.payload.root);
+        let ended = cx
+            .background_spawn(async move {
+                #[cfg(unix)]
+                return terminal::end_sessions_inside_socket(&crate::terminal_host_socket(), &root);
+                #[cfg(not(unix))]
+                anyhow::Ok(0)
+            })
+            .await
+            .context("ending the terminal sessions in a worktree")?;
+        log::info!("ended {ended} terminal session(s)");
+        Ok(proto::Ack {})
+    }
+
+    async fn handle_list_terminal_sessions(
+        _this: Entity<Self>,
+        _envelope: TypedEnvelope<proto::ListTerminalSessions>,
+        cx: AsyncApp,
+    ) -> Result<proto::ListTerminalSessionsResponse> {
+        let sessions = cx
+            .background_spawn(async move {
+                #[cfg(unix)]
+                return terminal_host::sessions_at(&crate::terminal_host_socket());
+                #[cfg(not(unix))]
+                anyhow::Ok(Vec::new())
+            })
+            .await
+            .context("listing the terminal sessions")?;
+        let sessions = sessions
+            .into_iter()
+            .map(|session| proto::TerminalSession {
+                foreground: terminal::session_foreground(session.pid).map(|foreground| {
+                    proto::TerminalForeground {
+                        pid: foreground.pid,
+                        command: foreground.command,
+                        is_shell: foreground.is_shell,
+                        directory: foreground.directory.to_string_lossy().into_owned(),
+                        shell_directory: foreground
+                            .shell_directory
+                            .map(|directory| directory.to_string_lossy().into_owned()),
+                    }
+                }),
+                id: session.id,
+            })
+            .collect();
+        Ok(proto::ListTerminalSessionsResponse { sessions })
     }
 }
 

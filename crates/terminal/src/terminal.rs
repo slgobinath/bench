@@ -6,6 +6,8 @@ mod ports;
 pub mod terminal_settings;
 pub use ports::{ListeningPort, listening_ports};
 pub use pty_info::{SessionForeground, end_sessions_inside, session_foreground};
+#[cfg(unix)]
+pub use pty_info::end_sessions_inside_socket;
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -951,6 +953,12 @@ enum TerminalModeKind {
     Persistent {
         session_id: Option<String>,
     },
+    /// An interactive shell hosted by the remote host's terminal daemon, which
+    /// the terminal's command (re)attaches to.
+    RemotePersistent {
+        session_id: String,
+        restored: bool,
+    },
     InteractiveWithCompletion(Sender<Option<ExitStatus>>),
     Task {
         state: TaskState,
@@ -969,6 +977,16 @@ impl TerminalMode {
     /// [`TerminalMode::interactive`] when persistent terminals are unavailable.
     pub fn persistent(session_id: Option<String>) -> Self {
         Self(TerminalModeKind::Persistent { session_id })
+    }
+
+    /// Creates an interactive terminal showing remote session `session_id`,
+    /// whose command attaches to it on the remote host. `restored` means the
+    /// session may already be running, so its activation script is not run.
+    pub fn remote_persistent(session_id: String, restored: bool) -> Self {
+        Self(TerminalModeKind::RemotePersistent {
+            session_id,
+            restored,
+        })
     }
 
     /// Creates an interactive terminal that reports when its shell exits.
@@ -1045,6 +1063,7 @@ impl TerminalBuilder {
             terminal_type: TerminalType::DisplayOnly,
             subprocess: None,
             persistent_session: None,
+            remote_foreground: None,
             completion_tx: None,
             term,
             term_config: config,
@@ -1139,10 +1158,22 @@ impl TerminalBuilder {
         };
         let fut = async move {
             let mut persistent_session_id = None;
+            let mut remote_session = None;
             let (task, completion_tx) = match mode.0 {
                 TerminalModeKind::Interactive => (None, None),
                 TerminalModeKind::Persistent { session_id } => {
                     persistent_session_id = Some(session_id);
+                    (None, None)
+                }
+                TerminalModeKind::RemotePersistent {
+                    session_id,
+                    restored,
+                } => {
+                    remote_session = Some(PersistentSession {
+                        id: session_id,
+                        leader_pid: None,
+                        restored,
+                    });
                     (None, None)
                 }
                 TerminalModeKind::InteractiveWithCompletion(completion_tx) => {
@@ -1241,7 +1272,7 @@ impl TerminalBuilder {
             };
             let config = pty_term_config(scrolling_history, cursor_shape);
 
-            let persistent_session = persistent_session_id
+            let local_session = persistent_session_id
                 .filter(|_| !no_pty && !is_remote_terminal)
                 .and_then(|session_id| {
                     open_persistent_session(
@@ -1256,10 +1287,16 @@ impl TerminalBuilder {
                         &env,
                     )
                 });
+            let attach_command = local_session
+                .as_ref()
+                .map(|(_, attach_command)| attach_command.clone());
+            let persistent_session = local_session
+                .map(|(session, _)| session)
+                .or(remote_session);
             // A reattached shell already ran its activation script.
             let activation_script = if persistent_session
                 .as_ref()
-                .is_some_and(|(session, _)| session.restored)
+                .is_some_and(|session| session.restored)
             {
                 Vec::new()
             } else {
@@ -1311,8 +1348,8 @@ impl TerminalBuilder {
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
             } else {
-                let alacritty_shell = match &persistent_session {
-                    Some((_, attach_command)) => Some(attach_command.clone()),
+                let alacritty_shell = match attach_command {
+                    Some(attach_command) => Some(attach_command),
                     None => shell_params.as_ref().map(|params| {
                         (
                             params.program.clone(),
@@ -1349,8 +1386,11 @@ impl TerminalBuilder {
                 };
 
                 let mut pty_info = PtyProcessInfo::new(ProcessIdGetter::from(&pty));
-                if let Some((session, _)) = &persistent_session {
-                    pty_info = pty_info.with_session_leader(sysinfo::Pid::from_u32(session.leader_pid));
+                if let Some(leader_pid) = persistent_session
+                    .as_ref()
+                    .and_then(|session| session.leader_pid)
+                {
+                    pty_info = pty_info.with_session_leader(sysinfo::Pid::from_u32(leader_pid));
                 }
 
                 //And connect them together
@@ -1369,7 +1409,8 @@ impl TerminalBuilder {
             let no_task = task.is_none();
             let terminal = Terminal {
                 task,
-                persistent_session: persistent_session.map(|(session, _)| session),
+                persistent_session,
+                remote_foreground: None,
                 terminal_type,
                 subprocess,
                 completion_tx,
@@ -1578,6 +1619,7 @@ pub struct Terminal {
     /// subprocess and the task pumping its output into the grid.
     subprocess: Option<SubprocessHandle>,
     persistent_session: Option<PersistentSession>,
+    remote_foreground: Option<SessionForeground>,
     completion_tx: Option<Sender<Option<ExitStatus>>>,
     term: Arc<AlacrittyTermLock>,
     term_config: AlacrittyTermConfig,
@@ -3020,17 +3062,39 @@ impl Terminal {
 
     pub fn working_directory(&self) -> Option<PathBuf> {
         if self.is_remote_terminal {
-            // We can't yet reliably detect the working directory of a shell on the
-            // SSH host. Until we can do that, it doesn't make sense to display
-            // the working directory on the client and persist that.
-            None
+            // Only a shell hosted by the remote terminal daemon has a working
+            // directory the host reports; any other shell on the SSH host
+            // cannot be asked, and it makes no sense to display or persist
+            // the local ssh process's directory instead.
+            self.remote_foreground
+                .as_ref()
+                .map(|foreground| foreground.directory.clone())
         } else {
             self.client_side_working_directory()
         }
     }
 
+    /// What the remote host reports to be in the foreground of this
+    /// terminal's session, for a shell hosted by its terminal daemon.
+    pub fn set_remote_foreground(
+        &mut self,
+        foreground: Option<SessionForeground>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.remote_foreground != foreground {
+            self.remote_foreground = foreground;
+            cx.notify();
+        }
+    }
+
     /// Normalizes the command name of the foreground process, if one is known.
     pub fn foreground_process_command_name(&self) -> Option<String> {
+        if self.is_remote_terminal {
+            return self
+                .remote_foreground
+                .as_ref()
+                .and_then(|foreground| foreground.command.clone());
+        }
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info
                 .current
@@ -3041,7 +3105,11 @@ impl Terminal {
         }
     }
 
+    /// `None` for a remote terminal, whose processes' ids mean nothing here.
     pub fn foreground_process_id(&self) -> Option<u32> {
+        if self.is_remote_terminal {
+            return None;
+        }
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.current.read().as_ref().map(|process| process.pid),
             TerminalType::DisplayOnly => None,
@@ -3051,6 +3119,12 @@ impl Terminal {
     /// Whether the foreground process is the shell, so that the terminal is
     /// idle at a prompt. `None` when the foreground process is not known yet.
     pub fn foreground_process_is_shell(&self) -> Option<bool> {
+        if self.is_remote_terminal {
+            return self
+                .remote_foreground
+                .as_ref()
+                .map(|foreground| foreground.is_shell);
+        }
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => {
                 info.current.read().as_ref().map(|process| process.is_shell)
@@ -3258,13 +3332,13 @@ impl Terminal {
         }
     }
 
-    /// The `terminal_host` session this terminal shows, if its shell is
-    /// hosted there rather than owned by this process.
     /// The shell this terminal runs, whether it lives in a terminal-host
-    /// session or is this terminal's own child.
+    /// session or is this terminal's own child. `None` for a shell on a
+    /// remote host, whose pid means nothing here.
     pub fn shell_pid(&self) -> Option<u32> {
         match self.persistent_session() {
-            Some(session) => Some(session.leader_pid),
+            Some(session) => session.leader_pid,
+            None if self.is_remote_terminal => None,
             None => self.pid_getter().map(|pid_getter| pid_getter.fallback_pid().as_u32()),
         }
     }
@@ -3406,7 +3480,8 @@ impl Terminal {
 #[derive(Clone, Debug)]
 pub struct PersistentSession {
     pub id: String,
-    pub leader_pid: u32,
+    /// The session's shell, or `None` when it runs on a remote host.
+    pub leader_pid: Option<u32>,
     /// Whether this terminal reattached to a session that was already running.
     pub restored: bool,
 }
@@ -3429,7 +3504,7 @@ fn open_persistent_session(
         {
             return anyhow::Ok(PersistentSession {
                 id: running.id,
-                leader_pid: running.pid,
+                leader_pid: Some(running.pid),
                 restored: true,
             });
         }
@@ -3438,6 +3513,7 @@ fn open_persistent_session(
             None => (None, Vec::new()),
         };
         let created = host.create(terminal_host::CreateSession {
+            id: None,
             cwd: working_directory,
             program,
             args,
@@ -3447,7 +3523,7 @@ fn open_persistent_session(
         })?;
         Ok(PersistentSession {
             id: created.id,
-            leader_pid: created.pid,
+            leader_pid: Some(created.pid),
             restored: false,
         })
     })

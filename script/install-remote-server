@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+# Builds Bench's remote_server from this checkout and installs it on an SSH
+# host, where Bench looks for it when it connects.
+#
+# A dev build of Bench otherwise rebuilds remote_server and uploads it on every
+# connection, which needs zig on this Mac to cross-compile for Linux. With the
+# server installed by this script, start Bench with ZED_BUILD_REMOTE_SERVER=false
+# so it uses the installed server instead (see the message at the end).
+#
+# Run it again after changing anything remote_server is built from: Bench only
+# checks that a server is installed, not that it matches the checkout.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+Usage: $0 [--local] <ssh-destination>
+
+Builds remote_server and installs it on <ssh-destination> (anything ssh takes,
+such as user@host or a Host from ~/.ssh/config).
+
+By default it is built on the host itself, which needs Rust (rustup), a C
+compiler and cmake there. On Debian or Ubuntu:
+
+  sudo apt-get install -y build-essential clang cmake pkg-config
+
+The source is copied to ~/.cache/bench-remote-server on the host.
+
+  --local   Cross-compile on this Mac instead, with cargo-zigbuild. Needs zig.
+EOF
+    exit 1
+}
+
+build_locally=false
+destination=""
+for arg in "$@"; do
+    case "$arg" in
+        --local) build_locally=true ;;
+        -h | --help) usage ;;
+        -*) echo "Unknown option: $arg" >&2; usage ;;
+        *)
+            if [[ -n "$destination" ]]; then usage; fi
+            destination="$arg"
+            ;;
+    esac
+done
+if [[ -z "$destination" ]]; then usage; fi
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+channel="$(tr -d '[:space:]' < "$repo_root/crates/zed/RELEASE_CHANNEL")"
+if [[ "$channel" != "dev" ]]; then
+    # Other channels name the server after the app's version and download it
+    # instead of building it; see `ensure_server_binary` in crates/remote.
+    echo "Only dev builds use a server built from source; this checkout is on $channel." >&2
+    exit 1
+fi
+# Where Bench looks for the server, relative to the remote home directory.
+server_path=".zed_server/zed-remote-server-dev-build"
+
+read -r remote_os remote_arch < <(ssh "$destination" uname -sm)
+case "$remote_os" in
+    Linux) ;;
+    *) echo "Only Linux hosts are supported, not $remote_os." >&2; exit 1 ;;
+esac
+case "$remote_arch" in
+    x86_64 | amd64) remote_arch=x86_64 ;;
+    aarch64 | arm64) remote_arch=aarch64 ;;
+    *) echo "Unsupported host architecture: $remote_arch" >&2; exit 1 ;;
+esac
+
+# Writes the server beside where it goes, then moves it there in one step, so
+# a connection made meanwhile never finds half a file. Run with `sh -c`, since
+# the host's login shell need not be a POSIX one.
+server_dir="$(dirname "$server_path")"
+staged="$server_path.uploading"
+install_on_host="mkdir -p ~/$server_dir && cat > ~/$staged && chmod 755 ~/$staged && mv -f ~/$staged ~/$server_path"
+
+if [[ "$build_locally" == true ]]; then
+    if ! command -v zig > /dev/null; then
+        echo "zig is not installed; install it, or build on the host by leaving out --local." >&2
+        exit 1
+    fi
+    if ! command -v cargo-zigbuild > /dev/null; then
+        cargo install --locked cargo-zigbuild
+    fi
+    # musl and statically linked, as Bench builds it, so it runs on any distro.
+    triple="$remote_arch-unknown-linux-musl"
+    rustup target add "$triple"
+    (
+        cd "$repo_root"
+        RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static" \
+            cargo zigbuild --release --package remote_server \
+            --target-dir target/remote_server --target "$triple"
+    )
+    binary="$repo_root/target/remote_server/$triple/release/remote_server"
+
+    echo "Uploading to $destination:~/$server_path"
+    gzip -c "$binary" | ssh "$destination" "gunzip -c | sh -c '$install_on_host'"
+else
+    # Checked up front, since a missing tool otherwise surfaces minutes into the
+    # build as a panic in some dependency's build script.
+    missing_tools="$(ssh "$destination" "bash -lc 'for tool in cargo cc cmake; do command -v \$tool > /dev/null || echo \$tool; done'")"
+    if [[ -n "$missing_tools" ]]; then
+        echo "Missing on $destination: $(echo $missing_tools)" >&2
+        echo "Install Rust with rustup (https://rustup.rs) and, on Debian or Ubuntu:" >&2
+        echo "    sudo apt-get install -y build-essential clang cmake pkg-config" >&2
+        exit 1
+    fi
+
+    source_dir=".cache/bench-remote-server"
+    echo "Copying the source to $destination:~/$source_dir"
+    ssh "$destination" "mkdir -p ~/$source_dir"
+    # Only what cargo needs; the git history and build output stay here.
+    rsync --archive --compress --delete \
+        --exclude /.git --exclude /target \
+        "$repo_root/" "$destination:$source_dir/"
+
+    echo "Building on $destination"
+    # A login shell, so the PATH that rustup set up is there.
+    ssh "$destination" "bash -lc 'cd ~/$source_dir && cargo build --release --package remote_server'"
+    ssh "$destination" "sh -c '$install_on_host' < ~/$source_dir/target/release/remote_server"
+fi
+
+echo
+echo "Installed ~/$server_path on $destination."
+echo
+echo "To have Bench use it rather than build its own, start Bench with"
+echo "ZED_BUILD_REMOTE_SERVER=false. For Bench opened from the Dock or Finder:"
+echo
+echo "    launchctl setenv ZED_BUILD_REMOTE_SERVER false"
+echo
+echo "then quit and reopen Bench. It lasts until you log out; undo it with"
+echo "launchctl unsetenv ZED_BUILD_REMOTE_SERVER."
+echo
+echo "Already-open connections keep the old server until they reconnect from scratch:"
+echo "close and reopen the project."

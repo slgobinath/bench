@@ -20,5 +20,5 @@ log.workspace = true
 portable-pty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 vte.workspace = true

@@ -91,6 +91,11 @@ pub enum Commands {
     Exec,
 }
 
+/// The socket of the daemon hosting this host's remote terminals.
+pub fn terminal_host_socket() -> PathBuf {
+    paths::data_dir().join(terminal_host::REMOTE_SOCKET_FILE_NAME)
+}
+
 pub fn run(command: Commands) -> anyhow::Result<()> {
     use anyhow::Context;
     use release_channel::{RELEASE_CHANNEL, ReleaseChannel};
@@ -515,7 +520,9 @@ fn start_server(
     is_wsl_interop: bool,
 ) -> AnyProtoClient {
     // This is the server idle timeout. If no connection comes in this timeout, the server will shut down.
-    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+    // It outlasts a night with the client's Mac asleep, so the client can reconnect to it in the morning
+    // instead of having to reopen the project.
+    const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();

@@ -5,7 +5,7 @@ use crate::{
 use anyhow::{Context as _, Result, anyhow, bail};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fs::{self, File, OpenOptions},
     io::{self, BufReader, Read, Write},
     os::{
@@ -30,6 +30,10 @@ use std::{
 /// build start its own daemon, which is the only way a daemon is replaced
 /// without anyone losing a shell.
 const IDLE_EXIT_AFTER: Duration = Duration::from_secs(60);
+
+/// How many exited sessions the daemon remembers, so a client reopening one
+/// learns that it ended rather than starting it again.
+const ENDED_SESSIONS_KEPT: usize = 1024;
 
 /// How long a killed session's shell gets to exit on SIGHUP before it and its
 /// process group are sent SIGKILL.
@@ -226,6 +230,8 @@ fn log(message: std::fmt::Arguments) {
 
 struct Host {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Exited sessions' ids and exit codes, oldest first.
+    ended: Mutex<VecDeque<(String, Option<i32>)>>,
     activity: Mutex<Activity>,
 }
 
@@ -238,6 +244,7 @@ impl Default for Host {
     fn default() -> Self {
         Self {
             sessions: Mutex::default(),
+            ended: Mutex::default(),
             activity: Mutex::new(Activity {
                 connections: 0,
                 last_change: Instant::now(),
@@ -262,9 +269,25 @@ impl Host {
             .ok_or_else(|| anyhow!("no terminal session {id}"))
     }
 
-    fn remove(&self, id: &str) {
+    fn remove(&self, id: &str, exit_code: Option<i32>) {
         self.sessions().remove(id);
+        let mut ended = self.ended.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ended.len() >= ENDED_SESSIONS_KEPT {
+            ended.pop_front();
+        }
+        ended.push_back((id.to_string(), exit_code));
+        drop(ended);
         self.activity().last_change = Instant::now();
+    }
+
+    /// The exit code of session `id`, if it ran and exited.
+    fn ended(&self, id: &str) -> Option<Option<i32>> {
+        self.ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|(ended_id, _)| ended_id == id)
+            .map(|(_, exit_code)| *exit_code)
     }
 }
 
@@ -384,7 +407,30 @@ fn serve(host: &Arc<Host>, stream: UnixStream) -> Result<()> {
             cols,
             rows,
             client_pid,
-        } => return attach(host, &id, cols, rows, client_pid, reader, writer),
+        } => {
+            let session = match host.session(&id) {
+                Ok(session) => session,
+                Err(error) => return respond_error(&mut writer, &error),
+            };
+            return attach(&session, cols, rows, client_pid, reader, writer);
+        }
+        Request::Open {
+            id,
+            cols,
+            rows,
+            client_pid,
+            create: request,
+        } => {
+            let session = match open(host, &id, request) {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    let exit_code = host.ended(&id).flatten();
+                    return write_message(&mut writer, &Response::Ended { exit_code });
+                }
+                Err(error) => return respond_error(&mut writer, &error),
+            };
+            return attach(&session, cols, rows, client_pid, reader, writer);
+        }
     };
     match response {
         Ok(response) => write_message(&mut writer, &response),
@@ -401,7 +447,30 @@ fn respond_error(writer: &mut impl Write, error: &anyhow::Error) -> Result<()> {
     )
 }
 
+/// Finds session `id`, or starts it from `request` if it never ran. `None`
+/// means it ran and has exited.
+fn open(host: &Arc<Host>, id: &str, request: CreateSession) -> Result<Option<Arc<Session>>> {
+    if let Ok(session) = host.session(id) {
+        return Ok(Some(session));
+    }
+    if host.ended(id).is_some() {
+        return Ok(None);
+    }
+    let request = CreateSession {
+        id: Some(id.to_string()),
+        ..request
+    };
+    create(host, request)?;
+    host.session(id).map(Some)
+}
+
 fn create(host: &Arc<Host>, request: CreateSession) -> Result<SessionInfo> {
+    let id = request
+        .id
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if host.sessions().contains_key(&id) {
+        bail!("terminal session {id} is already running");
+    }
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: request.rows.max(1),
@@ -439,7 +508,7 @@ fn create(host: &Arc<Host>, request: CreateSession) -> Result<SessionInfo> {
     let output = pty.master.try_clone_reader()?;
     let input = pty.master.take_writer()?;
     let session = Arc::new(Session {
-        id: uuid::Uuid::new_v4().to_string(),
+        id,
         pid,
         created_at: unix_now(),
         killer: Mutex::new(child.clone_killer()),
@@ -468,7 +537,7 @@ fn create(host: &Arc<Host>, request: CreateSession) -> Result<SessionInfo> {
                 .and_then(|status| i32::try_from(status.exit_code()).ok());
             // Let the output thread forward what the shell wrote last.
             thread::sleep(Duration::from_millis(100));
-            host.remove(&session.id);
+            host.remove(&session.id, exit_code);
             if let Some(attachment) = session.state().attached.take() {
                 attachment.output.send(Outgoing::Exited(exit_code)).ok();
             }
@@ -568,18 +637,13 @@ fn kill(host: &Host, id: &str, attached_pid: Option<u32>) -> bool {
 }
 
 fn attach(
-    host: &Host,
-    id: &str,
+    session: &Session,
     cols: u16,
     rows: u16,
     client_pid: u32,
     mut reader: BufReader<UnixStream>,
     mut writer: UnixStream,
 ) -> Result<()> {
-    let session = match host.session(id) {
-        Ok(session) => session,
-        Err(error) => return respond_error(&mut writer, &error),
-    };
     // Resize before the repaint, so it is drawn at the client's size and a
     // full-screen program redraws for that size too.
     session.resize(cols, rows)?;
@@ -603,7 +667,7 @@ fn attach(
     write_message(&mut writer, &Response::Attached)?;
     thread::spawn(move || forward_output(writer, outgoing));
 
-    let result = forward_input(&session, &mut reader);
+    let result = forward_input(session, &mut reader);
     let mut state = session.state();
     if state
         .attached
@@ -683,6 +747,7 @@ mod tests {
 
     fn command(script: &str) -> CreateSession {
         CreateSession {
+            id: None,
             cwd: None,
             program: Some("/bin/sh".to_string()),
             args: vec!["-c".to_string(), script.to_string()],
@@ -804,6 +869,63 @@ mod tests {
             "30 KB written at once arrived in {burst_frames} frames"
         );
         assert!(host.kill(&session.id, None)?);
+        fs::remove_dir_all(dir).ok();
+        Ok(())
+    }
+
+    fn open(host: &TerminalHost, id: &str, script: &str) -> Result<(BufReader<UnixStream>, UnixStream, Response)> {
+        let stream = UnixStream::connect(&host.socket)?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut writer = stream;
+        write_message(
+            &mut writer,
+            &Envelope {
+                version: PROTOCOL_VERSION,
+                request: Request::Open {
+                    id: id.to_string(),
+                    cols: 80,
+                    rows: 24,
+                    client_pid: 1,
+                    create: command(script),
+                },
+            },
+        )?;
+        let response = read_message(&mut reader)?;
+        Ok((reader, writer, response))
+    }
+
+    #[test]
+    fn opening_starts_a_session_once_and_then_reports_its_exit() -> Result<()> {
+        let (host, dir) = start_daemon()?;
+        let script = "echo ready; read line; exit 3";
+        let (mut reader, writer, response) = open(&host, "chosen-id", script)?;
+        assert!(matches!(response, Response::Attached));
+        read_until(&mut reader, "ready")?;
+        assert!(host.sessions()?.iter().any(|listed| listed.id == "chosen-id"));
+
+        // A second client reopening the running session attaches to it rather
+        // than starting another shell.
+        let (mut second_reader, mut second_writer, response) = open(&host, "chosen-id", script)?;
+        assert!(matches!(response, Response::Attached));
+        read_until(&mut second_reader, "ready")?;
+        assert_eq!(host.sessions()?.len(), 1);
+        drop((reader, writer));
+
+        write_frame(&mut second_writer, frame::DATA, b"\n")?;
+        loop {
+            match read_frame(&mut second_reader)? {
+                Some((frame::EXITED, _)) => break,
+                Some(_) => continue,
+                None => bail!("stream ended without an exit"),
+            }
+        }
+
+        let (_, _, response) = open(&host, "chosen-id", script)?;
+        assert!(matches!(
+            response,
+            Response::Ended { exit_code: Some(3) }
+        ));
+        assert!(host.sessions()?.is_empty());
         fs::remove_dir_all(dir).ok();
         Ok(())
     }

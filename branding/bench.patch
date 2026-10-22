@@ -1,8 +1,8 @@
 diff --git a/crates/agent/src/agent.rs b/crates/agent/src/agent.rs
-index 89dc13d6be..9040629350 100644
+index 8e2a0cc0c2..cb3336ed47 100644
 --- a/crates/agent/src/agent.rs
 +++ b/crates/agent/src/agent.rs
-@@ -2733,6 +2733,7 @@ fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSele
+@@ -3272,6 +3272,7 @@ fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSele
  }
  
  pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Zed Agent"));
@@ -10,7 +10,7 @@ index 89dc13d6be..9040629350 100644
  
  pub fn available_native_agent(cx: &App) -> AvailableAgent {
      let registry = LanguageModelRegistry::read_global(cx);
-@@ -2758,7 +2759,7 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
+@@ -3297,7 +3298,7 @@ pub fn available_native_agent(cx: &App) -> AvailableAgent {
  
      AvailableAgent {
          id: ZED_AGENT_ID.to_string(),
@@ -19,11 +19,11 @@ index 89dc13d6be..9040629350 100644
          is_native: true,
          models,
      }
-diff --git a/crates/agent_servers/src/acp.rs b/crates/agent_servers/src/acp.rs
-index 859cf7bbd3..d32bc42912 100644
---- a/crates/agent_servers/src/acp.rs
-+++ b/crates/agent_servers/src/acp.rs
-@@ -2709,7 +2709,7 @@ mod tests {
+diff --git a/crates/agent_servers/src/acp/v1.rs b/crates/agent_servers/src/acp/v1.rs
+index 4289e873dd..78029c0874 100644
+--- a/crates/agent_servers/src/acp/v1.rs
++++ b/crates/agent_servers/src/acp/v1.rs
+@@ -5338,7 +5338,7 @@ mod tests {
                          url_elicitation_id.clone(),
                          "https://auth.example.com/device",
                      ),
@@ -46,10 +46,10 @@ index 1ae1ab1f36..1025598676 100644
              ))),
          }
 diff --git a/crates/agent_ui/src/agent_panel.rs b/crates/agent_ui/src/agent_panel.rs
-index 74aee63b44..19c504bc70 100644
+index c9a848ccfa..5a729ad994 100644
 --- a/crates/agent_ui/src/agent_panel.rs
 +++ b/crates/agent_ui/src/agent_panel.rs
-@@ -5836,7 +5836,7 @@ impl AgentPanel {
+@@ -5922,7 +5922,7 @@ impl AgentPanel {
                  Some(ContextMenu::build(window, cx, |menu, _window, cx| {
                      menu.context(focus_handle.clone())
                          .item(
@@ -59,10 +59,10 @@ index 74aee63b44..19c504bc70 100644
                                      !showing_terminal && is_agent_selected(Agent::NativeAgent),
                                      |this| this.action(Box::new(NewThread)),
 diff --git a/crates/agent_ui/src/agent_ui.rs b/crates/agent_ui/src/agent_ui.rs
-index 75634ff89d..223b1c0379 100644
+index 302b8ec894..b50524d660 100644
 --- a/crates/agent_ui/src/agent_ui.rs
 +++ b/crates/agent_ui/src/agent_ui.rs
-@@ -465,7 +465,7 @@ impl Agent {
+@@ -561,7 +561,7 @@ impl Agent {
  
      pub fn label(&self) -> SharedString {
          match self {
@@ -72,10 +72,10 @@ index 75634ff89d..223b1c0379 100644
              #[cfg(any(test, feature = "test-support"))]
              Self::Stub => "Stub Agent".into(),
 diff --git a/crates/agent_ui/src/conversation_view.rs b/crates/agent_ui/src/conversation_view.rs
-index 973bf590d0..a2bde7f476 100644
+index ff707a8b74..06855822d8 100644
 --- a/crates/agent_ui/src/conversation_view.rs
 +++ b/crates/agent_ui/src/conversation_view.rs
-@@ -2812,7 +2812,7 @@ impl ConversationView {
+@@ -3257,7 +3257,7 @@ impl ConversationView {
          cx: &mut Context<Self>,
      ) -> AnyElement {
          let (heading_label, description_label) = (
@@ -85,10 +85,10 @@ index 973bf590d0..a2bde7f476 100644
                  format!(
                      "Currently using {}, which does not report a valid --version",
 diff --git a/crates/agent_ui/src/conversation_view/elicitation.rs b/crates/agent_ui/src/conversation_view/elicitation.rs
-index 872eafbb4e..ab857889c3 100644
+index 796cea0828..3258acc01b 100644
 --- a/crates/agent_ui/src/conversation_view/elicitation.rs
 +++ b/crates/agent_ui/src/conversation_view/elicitation.rs
-@@ -816,7 +816,7 @@ mod tests {
+@@ -833,7 +833,7 @@ mod tests {
                      acp::ElicitationId::new("accepted-url"),
                      "https://auth.example.com/device",
                  ),
@@ -97,7 +97,7 @@ index 872eafbb4e..ab857889c3 100644
              ),
              status: ElicitationStatus::Accepted,
          };
-@@ -1254,7 +1254,7 @@ fn render_form_preview(
+@@ -1358,7 +1358,7 @@ fn render_form_preview(
  ) -> AnyElement {
      let request = acp::CreateElicitationRequest::new(
          acp::ElicitationFormMode::new(preview_request_scope(entry_ix), preview_form_schema()),
@@ -106,7 +106,7 @@ index 872eafbb4e..ab857889c3 100644
      );
      let mut form_state = matches!(status, ElicitationStatus::Pending { .. }).then(|| {
          let acp::ElicitationMode::Form(mode) = &request.mode else {
-@@ -1287,7 +1287,7 @@ fn render_url_preview(
+@@ -1391,7 +1391,7 @@ fn render_url_preview(
              acp::ElicitationId::new(format!("preview-url-{entry_ix}")),
              preview_url(),
          ),
@@ -116,7 +116,7 @@ index 872eafbb4e..ab857889c3 100644
  
      render_preview_card(entry_ix, request, status, None, cx)
 diff --git a/crates/agent_ui/src/draft_prompt_store.rs b/crates/agent_ui/src/draft_prompt_store.rs
-index ad053af534..168860eae6 100644
+index 183f1bd5c3..89362f11a6 100644
 --- a/crates/agent_ui/src/draft_prompt_store.rs
 +++ b/crates/agent_ui/src/draft_prompt_store.rs
 @@ -8,7 +8,7 @@
@@ -125,7 +125,7 @@ index ad053af534..168860eae6 100644
  
 -use agent::ZED_AGENT_ID;
 +use agent::{ZED_AGENT_DISPLAY_NAME, ZED_AGENT_ID};
- use agent_client_protocol::schema::v1 as acp;
+ use agent_client_protocol::schema::v2 as acp_v2;
  use anyhow::Context as _;
  use db::kvp::KeyValueStore;
 @@ -172,7 +172,7 @@ pub fn empty_draft_placeholder_label(
@@ -138,7 +138,7 @@ index ad053af534..168860eae6 100644
          workspace
              .map(|ws| ws.read(cx).project().read(cx).agent_server_store().clone())
 diff --git a/crates/agent_ui/src/thread_import.rs b/crates/agent_ui/src/thread_import.rs
-index ca601cc592..6f1f0201e3 100644
+index 13f31831c2..afc4c48acf 100644
 --- a/crates/agent_ui/src/thread_import.rs
 +++ b/crates/agent_ui/src/thread_import.rs
 @@ -572,7 +572,7 @@ impl Render for ThreadImportModal {
@@ -199,10 +199,10 @@ index 903ac34da2..74d638f919 100644
              return_if_failed!(DeleteObject(temp).ok());
  
 diff --git a/crates/cli/src/main.rs b/crates/cli/src/main.rs
-index 0f4d674637..6c03753104 100644
+index c685800b53..d7bc5b5a27 100644
 --- a/crates/cli/src/main.rs
 +++ b/crates/cli/src/main.rs
-@@ -551,7 +551,7 @@ fn run() -> Result<()> {
+@@ -560,7 +560,7 @@ fn run() -> Result<()> {
      if args.system_specs {
          let path = app.path();
          let msg = [
@@ -211,7 +211,7 @@ index 0f4d674637..6c03753104 100644
              "To retrieve the system specs on the command line, run the following command:",
              &format!("{} --system-specs", path.display()),
          ];
-@@ -851,7 +851,7 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
+@@ -915,7 +915,7 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
      let blue = console::Style::new().blue();
      let items = [
          format!(
@@ -220,7 +220,7 @@ index 0f4d674637..6c03753104 100644
              blue.apply_to("zed --existing")
          ),
          format!("Open a new window ({})", blue.apply_to("zed --classic")),
-@@ -860,7 +860,7 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
+@@ -924,7 +924,7 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
      let prompt = format!(
          "Configure default behavior for {}\n{}",
          blue.apply_to("zed <path>"),
@@ -229,7 +229,7 @@ index 0f4d674637..6c03753104 100644
      );
  
      let selection = dialoguer::Select::new()
-@@ -925,7 +925,7 @@ mod linux {
+@@ -989,7 +989,7 @@ mod linux {
      impl InstalledApp for App {
          fn zed_version_string(&self) -> String {
              format!(
@@ -238,7 +238,7 @@ index 0f4d674637..6c03753104 100644
                  if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                      "".to_string()
                  } else {
-@@ -1202,7 +1202,7 @@ mod windows {
+@@ -1266,7 +1266,7 @@ mod windows {
      impl InstalledApp for App {
          fn zed_version_string(&self) -> String {
              format!(
@@ -247,7 +247,7 @@ index 0f4d674637..6c03753104 100644
                  if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
                      "".to_string()
                  } else {
-@@ -1375,7 +1375,7 @@ mod mac_os {
+@@ -1439,7 +1439,7 @@ mod mac_os {
  
      impl InstalledApp for Bundle {
          fn zed_version_string(&self) -> String {
@@ -310,10 +310,10 @@ index ea1d1388e9..4f2cb4f5e7 100644
  
          let (label, button) = if let Some(msg) = self.loading_message() {
 diff --git a/crates/debugger_ui/src/session/running.rs b/crates/debugger_ui/src/session/running.rs
-index 8f4301913d..78b96c5d93 100644
+index 8757683ee5..e3620643d8 100644
 --- a/crates/debugger_ui/src/session/running.rs
 +++ b/crates/debugger_ui/src/session/running.rs
-@@ -1267,7 +1267,7 @@ impl RunningState {
+@@ -1293,7 +1293,7 @@ impl RunningState {
                  let Err(e) = request_type else {
                      unreachable!();
                  };
@@ -323,10 +323,10 @@ index 8f4301913d..78b96c5d93 100644
  
              Ok(DebugTaskDefinition {
 diff --git a/crates/edit_prediction/src/edit_prediction.rs b/crates/edit_prediction/src/edit_prediction.rs
-index 650bc9173a..0b42ab20df 100644
+index 7e72a008e3..f46a95ca45 100644
 --- a/crates/edit_prediction/src/edit_prediction.rs
 +++ b/crates/edit_prediction/src/edit_prediction.rs
-@@ -3476,7 +3476,7 @@ fn merge_anchor_ranges(
+@@ -3517,7 +3517,7 @@ fn merge_anchor_ranges(
  
  #[derive(Error, Debug)]
  #[error(
@@ -349,10 +349,10 @@ index 78dcd9eb60..364f4f173d 100644
                      }
  
 diff --git a/crates/editor/src/editor.rs b/crates/editor/src/editor.rs
-index a26cf4a88d..7e4f0b1b64 100644
+index 61230a14dc..f582c587d7 100644
 --- a/crates/editor/src/editor.rs
 +++ b/crates/editor/src/editor.rs
-@@ -2977,7 +2977,7 @@ impl Editor {
+@@ -3008,7 +3008,7 @@ impl Editor {
              cx,
              |e, _, _| match e.error_code() {
                  ErrorCode::RemoteUpgradeRequired => Some(format!(
@@ -361,7 +361,7 @@ index a26cf4a88d..7e4f0b1b64 100644
                  e.error_tag("required").unwrap_or("the latest version")
              )),
                  _ => None,
-@@ -3063,7 +3063,7 @@ impl Editor {
+@@ -3094,7 +3094,7 @@ impl Editor {
          .detach_and_prompt_err("Failed to create buffer", window, cx, |e, _, _| {
              match e.error_code() {
                  ErrorCode::RemoteUpgradeRequired => Some(format!(
@@ -397,10 +397,10 @@ index 34d75c8a89..88396f2227 100644
  
      Ok(())
 diff --git a/crates/extensions_ui/src/components/extension_card.rs b/crates/extensions_ui/src/components/extension_card.rs
-index ce74c0cc88..6fe90c81e5 100644
+index 9adcaf0532..a863941865 100644
 --- a/crates/extensions_ui/src/components/extension_card.rs
 +++ b/crates/extensions_ui/src/components/extension_card.rs
-@@ -359,7 +359,7 @@ impl ExtensionCard {
+@@ -369,7 +369,7 @@ impl ExtensionCard {
                              move |_, cx| {
                                  Tooltip::simple(
                                      format!(
@@ -410,138 +410,137 @@ index ce74c0cc88..6fe90c81e5 100644
                                      cx,
                                  )
 diff --git a/crates/extensions_ui/src/extensions_ui.rs b/crates/extensions_ui/src/extensions_ui.rs
-index a251f05682..867db420df 100644
+index 77be3070d9..e97bd5511d 100644
 --- a/crates/extensions_ui/src/extensions_ui.rs
 +++ b/crates/extensions_ui/src/extensions_ui.rs
-@@ -1094,110 +1094,110 @@ impl ExtensionsPage {
-         for feature in &self.upsells {
-             let banner = match feature {
-                 Feature::AgentClaude => self.render_feature_upsell_banner(
--                    "Claude Agent support is built-in to Zed!".into(),
-+                    "Claude Agent support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/ai/external-agents#claude-agent".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::AgentCodex => self.render_feature_upsell_banner(
--                    "Codex CLI support is built-in to Zed!".into(),
-+                    "Codex CLI support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/ai/external-agents#codex-cli".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::AgentGemini => self.render_feature_upsell_banner(
--                    "Gemini CLI support is built-in to Zed!".into(),
-+                    "Gemini CLI support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/ai/external-agents#gemini-cli".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::ExtensionBasedpyright => self.render_feature_upsell_banner(
--                    "Basedpyright (Python language server) support is built-in to Zed!".into(),
-+                    "Basedpyright (Python language server) support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/python#basedpyright".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::ExtensionRuff => self.render_feature_upsell_banner(
--                    "Ruff (linter for Python) support is built-in to Zed!".into(),
-+                    "Ruff (linter for Python) support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/python#code-formatting--linting".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::ExtensionTailwind => self.render_feature_upsell_banner(
--                    "Tailwind CSS support is built-in to Zed!".into(),
-+                    "Tailwind CSS support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/tailwindcss".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::ExtensionTy => self.render_feature_upsell_banner(
--                    "Ty (Python language server) support is built-in to Zed!".into(),
-+                    "Ty (Python language server) support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/python".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::Git => self.render_feature_upsell_banner(
--                    "Zed comes with basic Git support—more features are coming in the future."
-+                    "Bench comes with basic Git support—more features are coming in the future."
-                         .into(),
-                     "https://zed.dev/docs/git".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageBash => self.render_feature_upsell_banner(
--                    "Shell support is built-in to Zed!".into(),
-+                    "Shell support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/bash".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageC => self.render_feature_upsell_banner(
--                    "C support is built-in to Zed!".into(),
-+                    "C support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/c".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageCpp => self.render_feature_upsell_banner(
--                    "C++ support is built-in to Zed!".into(),
-+                    "C++ support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/cpp".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageGo => self.render_feature_upsell_banner(
--                    "Go support is built-in to Zed!".into(),
-+                    "Go support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/go".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguagePython => self.render_feature_upsell_banner(
--                    "Python support is built-in to Zed!".into(),
-+                    "Python support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/python".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageReact => self.render_feature_upsell_banner(
--                    "React support is built-in to Zed!".into(),
-+                    "React support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/typescript".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageRust => self.render_feature_upsell_banner(
--                    "Rust support is built-in to Zed!".into(),
-+                    "Rust support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/rust".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::LanguageTypescript => self.render_feature_upsell_banner(
--                    "Typescript support is built-in to Zed!".into(),
-+                    "Typescript support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/languages/typescript".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::OpenIn => self.render_feature_upsell_banner(
--                    "Zed supports linking to a source line on GitHub and others.".into(),
-+                    "Bench supports linking to a source line on GitHub and others.".into(),
-                     "https://zed.dev/docs/git#git-integrations".into(),
-                     false,
-                     cx,
-                 ),
-                 Feature::Vim => self.render_feature_upsell_banner(
--                    "Vim support is built-in to Zed!".into(),
-+                    "Vim support is built-in to Bench!".into(),
-                     "https://zed.dev/docs/vim".into(),
-                     true,
-                     cx,
+@@ -1193,109 +1193,109 @@ impl ExtensionsPage {
+     fn render_feature_upsells(&self, cx: &Context<Self>) -> impl IntoElement {
+         v_flex().children(self.upsells.iter().map(|feature| match feature {
+             Feature::AgentClaude => self.render_feature_upsell_banner(
+-                "Claude Agent support is built-in to Zed!",
++                "Claude Agent support is built-in to Bench!",
+                 "https://zed.dev/docs/ai/external-agents#claude-agent",
+                 false,
+                 cx,
+             ),
+             Feature::AgentCodex => self.render_feature_upsell_banner(
+-                "Codex CLI support is built-in to Zed!",
++                "Codex CLI support is built-in to Bench!",
+                 "https://zed.dev/docs/ai/external-agents#codex-cli",
+                 false,
+                 cx,
+             ),
+             Feature::AgentGemini => self.render_feature_upsell_banner(
+-                "Gemini CLI support is built-in to Zed!",
++                "Gemini CLI support is built-in to Bench!",
+                 "https://zed.dev/docs/ai/external-agents#gemini-cli",
+                 false,
+                 cx,
+             ),
+             Feature::ExtensionBasedpyright => self.render_feature_upsell_banner(
+-                "Basedpyright (Python language server) support is built-in to Zed!",
++                "Basedpyright (Python language server) support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/python#basedpyright",
+                 false,
+                 cx,
+             ),
+             Feature::ExtensionRuff => self.render_feature_upsell_banner(
+-                "Ruff (linter for Python) support is built-in to Zed!",
++                "Ruff (linter for Python) support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/python#code-formatting--linting",
+                 false,
+                 cx,
+             ),
+             Feature::ExtensionTailwind => self.render_feature_upsell_banner(
+-                "Tailwind CSS support is built-in to Zed!",
++                "Tailwind CSS support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/tailwindcss",
+                 false,
+                 cx,
+             ),
+             Feature::ExtensionTy => self.render_feature_upsell_banner(
+-                "Ty (Python language server) support is built-in to Zed!",
++                "Ty (Python language server) support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/python",
+                 false,
+                 cx,
+             ),
+             Feature::Git => self.render_feature_upsell_banner(
+-                "Zed comes with basic Git support—more features are coming in the future.",
++                "Bench comes with basic Git support—more features are coming in the future.",
+                 "https://zed.dev/docs/git",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageBash => self.render_feature_upsell_banner(
+-                "Shell support is built-in to Zed!",
++                "Shell support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/bash",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageC => self.render_feature_upsell_banner(
+-                "C support is built-in to Zed!",
++                "C support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/c",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageCpp => self.render_feature_upsell_banner(
+-                "C++ support is built-in to Zed!",
++                "C++ support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/cpp",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageGo => self.render_feature_upsell_banner(
+-                "Go support is built-in to Zed!",
++                "Go support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/go",
+                 false,
+                 cx,
+             ),
+             Feature::LanguagePython => self.render_feature_upsell_banner(
+-                "Python support is built-in to Zed!",
++                "Python support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/python",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageReact => self.render_feature_upsell_banner(
+-                "React support is built-in to Zed!",
++                "React support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/typescript",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageRust => self.render_feature_upsell_banner(
+-                "Rust support is built-in to Zed!",
++                "Rust support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/rust",
+                 false,
+                 cx,
+             ),
+             Feature::LanguageTypescript => self.render_feature_upsell_banner(
+-                "Typescript support is built-in to Zed!",
++                "Typescript support is built-in to Bench!",
+                 "https://zed.dev/docs/languages/typescript",
+                 false,
+                 cx,
+             ),
+             Feature::OpenIn => self.render_feature_upsell_banner(
+-                "Zed supports linking to a source line on GitHub and others.",
++                "Bench supports linking to a source line on GitHub and others.",
+                 "https://zed.dev/docs/git#git-integrations",
+                 false,
+                 cx,
+             ),
+             Feature::Vim => self.render_feature_upsell_banner(
+-                "Vim support is built-in to Zed!",
++                "Vim support is built-in to Bench!",
+                 "https://zed.dev/docs/vim",
+                 true,
+                 cx,
 diff --git a/crates/inspector_ui/src/inspector.rs b/crates/inspector_ui/src/inspector.rs
 index d2b6179ee7..04dbc5ac41 100644
 --- a/crates/inspector_ui/src/inspector.rs
@@ -607,10 +606,10 @@ index f8b4e731c8..14b8166c0b 100644
                      .size(LabelSize::Small)
                      .color(Color::Muted),
 diff --git a/crates/language_models/src/provider/bedrock.rs b/crates/language_models/src/provider/bedrock.rs
-index 092dcd1ae1..d9277a06aa 100644
+index a05b1f31c6..0fcb95713f 100644
 --- a/crates/language_models/src/provider/bedrock.rs
 +++ b/crates/language_models/src/provider/bedrock.rs
-@@ -707,7 +707,7 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
+@@ -799,7 +799,7 @@ impl LanguageModelProvider for BedrockLanguageModelProvider {
                      .into()
              })
              .description(InlineDescription::Text(
@@ -619,7 +618,7 @@ index 092dcd1ae1..d9277a06aa 100644
              )),
          ))
      }
-@@ -2777,7 +2777,7 @@ impl Render for ConfigurationView {
+@@ -2996,7 +2996,7 @@ impl Render for ConfigurationView {
              .child(Headline::new("Amazon Bedrock").size(HeadlineSize::Small))
              .child(
                  Label::new(
@@ -628,7 +627,7 @@ index 092dcd1ae1..d9277a06aa 100644
                  )
                  .color(Color::Muted),
              )
-@@ -2885,7 +2885,7 @@ impl ConfigurationView {
+@@ -3104,7 +3104,7 @@ impl ConfigurationView {
              )
              .child(
                  Label::new(format!(
@@ -638,10 +637,10 @@ index 092dcd1ae1..d9277a06aa 100644
                      ZED_BEDROCK_SECRET_ACCESS_KEY_VAR.name,
                      ZED_BEDROCK_REGION_VAR.name,
 diff --git a/crates/language_models/src/provider/llama_cpp.rs b/crates/language_models/src/provider/llama_cpp.rs
-index c21494ffc4..b29e677f75 100644
+index 9023cf7ccb..b8f1c7b947 100644
 --- a/crates/language_models/src/provider/llama_cpp.rs
 +++ b/crates/language_models/src/provider/llama_cpp.rs
-@@ -1234,7 +1234,7 @@ impl ConfigurationView {
+@@ -1193,7 +1193,7 @@ impl ConfigurationView {
                      )
                      .child(
                          ListBulletItem::new(
@@ -650,7 +649,7 @@ index c21494ffc4..b29e677f75 100644
                          )
                          .label_color(Color::Muted),
                      ),
-@@ -1278,7 +1278,7 @@ impl ConfigurationView {
+@@ -1237,7 +1237,7 @@ impl ConfigurationView {
              .mb_2()
              .child(
                  Label::new(format!(
@@ -660,10 +659,10 @@ index c21494ffc4..b29e677f75 100644
                  .size(LabelSize::Small)
                  .color(Color::Muted),
 diff --git a/crates/language_models/src/provider/lmstudio.rs b/crates/language_models/src/provider/lmstudio.rs
-index 310932cfc4..2e6ff73a6f 100644
+index e7b186a96a..7326ce725a 100644
 --- a/crates/language_models/src/provider/lmstudio.rs
 +++ b/crates/language_models/src/provider/lmstudio.rs
-@@ -770,7 +770,7 @@ impl ConfigurationView {
+@@ -755,7 +755,7 @@ impl ConfigurationView {
              .mb_2()
              .child(
                  Label::new(format!(
@@ -673,10 +672,10 @@ index 310932cfc4..2e6ff73a6f 100644
                  .size(LabelSize::Small)
                  .color(Color::Muted),
 diff --git a/crates/language_models/src/provider/ollama.rs b/crates/language_models/src/provider/ollama.rs
-index 486111cadc..744cb5466c 100644
+index 64787780a3..07c3585f95 100644
 --- a/crates/language_models/src/provider/ollama.rs
 +++ b/crates/language_models/src/provider/ollama.rs
-@@ -887,7 +887,7 @@ impl ConfigurationView {
+@@ -857,7 +857,7 @@ impl ConfigurationView {
                              .child(Label::new("ollama run gpt-oss:20b").inline_code(cx)),
                      )
                      .child(
@@ -685,7 +684,7 @@ index 486111cadc..744cb5466c 100644
                              .label_color(Color::Muted),
                      ),
              )
-@@ -928,7 +928,7 @@ impl ConfigurationView {
+@@ -898,7 +898,7 @@ impl ConfigurationView {
            .mb_2()
            .child(
                Label::new(
@@ -695,10 +694,10 @@ index 486111cadc..744cb5466c 100644
                .size(LabelSize::Small)
                .color(Color::Muted),
 diff --git a/crates/language_models/src/provider/openai_subscribed.rs b/crates/language_models/src/provider/openai_subscribed.rs
-index bac7831a6d..5e98ac25e4 100644
+index 96279fb832..802e47db1b 100644
 --- a/crates/language_models/src/provider/openai_subscribed.rs
 +++ b/crates/language_models/src/provider/openai_subscribed.rs
-@@ -13,7 +13,7 @@ use std::sync::Arc;
+@@ -17,7 +17,7 @@ use std::sync::Arc;
  use ui::{ConfiguredApiCard, prelude::*};
  
  const SUBSCRIPTION_DESCRIPTION: &str =
@@ -708,10 +707,10 @@ index bac7831a6d..5e98ac25e4 100644
  pub struct OpenAiSubscribedProvider {
      state: Entity<State>,
 diff --git a/crates/language_models/src/provider/opencode.rs b/crates/language_models/src/provider/opencode.rs
-index 17c490e824..bc8d9239a2 100644
+index 3f2e954d72..bd966c0c97 100644
 --- a/crates/language_models/src/provider/opencode.rs
 +++ b/crates/language_models/src/provider/opencode.rs
-@@ -529,7 +529,7 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
+@@ -723,7 +723,7 @@ impl LanguageModelProvider for OpenCodeLanguageModelProvider {
                      .into()
              })
              .description(InlineDescription::Text(
@@ -720,7 +719,7 @@ index 17c490e824..bc8d9239a2 100644
              )),
          ))
      }
-@@ -1332,7 +1332,7 @@ impl Render for ConfigurationView {
+@@ -1337,7 +1337,7 @@ impl Render for ConfigurationView {
          let api_key_section = v_flex()
              .on_action(cx.listener(Self::save_api_key))
              .child(Label::new(
@@ -729,7 +728,7 @@ index 17c490e824..bc8d9239a2 100644
              ).color(Color::Muted))
              .child(
                  List::new()
-@@ -1353,7 +1353,7 @@ impl Render for ConfigurationView {
+@@ -1358,7 +1358,7 @@ impl Render for ConfigurationView {
              .child(api_key_control)
              .child(
                  Label::new(format!(
@@ -739,11 +738,11 @@ index 17c490e824..bc8d9239a2 100644
                  .size(LabelSize::Small)
                  .color(Color::Muted).mt_1p5(),
 diff --git a/crates/language_models/src/provider/x_ai_subscribed.rs b/crates/language_models/src/provider/x_ai_subscribed.rs
-index a9362c3d30..3c96bf1ce5 100644
+index bb9c932d6d..f0b84a9c75 100644
 --- a/crates/language_models/src/provider/x_ai_subscribed.rs
 +++ b/crates/language_models/src/provider/x_ai_subscribed.rs
-@@ -13,7 +13,7 @@ use ui::{ConfiguredApiCard, prelude::*};
- use x_ai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, SuperGrokModel, create_language_model};
+@@ -16,7 +16,7 @@ use ui::{ConfiguredApiCard, prelude::*};
+ use x_ai_subscribed::{PROVIDER_ID, PROVIDER_NAME, State, SuperGrokModel, language_model};
  
  const SUBSCRIPTION_DESCRIPTION: &str =
 -    "Sign in with your SuperGrok subscription to use Grok models in Zed's agent.";
@@ -846,10 +845,10 @@ index 220c2b0005..4dd67993fa 100644
                                                      )
                                                      .child(
 diff --git a/crates/recent_projects/src/remote_servers.rs b/crates/recent_projects/src/remote_servers.rs
-index 9861d72870..ad3d8515bd 100644
+index 2a0949aaab..ab6d40470b 100644
 --- a/crates/recent_projects/src/remote_servers.rs
 +++ b/crates/recent_projects/src/remote_servers.rs
-@@ -2369,7 +2369,7 @@ impl RemoteServerProjects {
+@@ -2371,7 +2371,7 @@ impl RemoteServerProjects {
                                                  .color(Color::Muted)
                                                  .size(IconSize::Small),
                                          )
@@ -926,7 +925,7 @@ index 28fc665de5..67b62f9e00 100644
          ("Atom", Self::Atom),
          ("JetBrains", Self::JetBrains),
 diff --git a/crates/settings_ui/src/page_data.rs b/crates/settings_ui/src/page_data.rs
-index 972d401b68..9a23f37920 100644
+index 18ae7ae0cc..a956a0cecf 100644
 --- a/crates/settings_ui/src/page_data.rs
 +++ b/crates/settings_ui/src/page_data.rs
 @@ -141,7 +141,7 @@ fn general_page(cx: &App) -> SettingsPage {
@@ -974,7 +973,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("telemetry.metrics"),
-@@ -719,7 +719,7 @@ fn appearance_page() -> SettingsPage {
+@@ -740,7 +740,7 @@ fn appearance_page() -> SettingsPage {
                  discriminant: SettingItem {
                      files: USER,
                      title: "Icon Theme",
@@ -983,7 +982,7 @@ index 972d401b68..9a23f37920 100644
                      field: Box::new(SettingField {
                          organization_override: None,
                          json_path: Some("icon_theme$"),
-@@ -3938,7 +3938,7 @@ fn search_and_files_page() -> SettingsPage {
+@@ -4072,7 +4072,7 @@ fn search_and_files_page() -> SettingsPage {
              SettingsPageItem::SectionHeader("File Scan"),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "File Scan Exclusions",
@@ -992,7 +991,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(
                      SettingField {
                          organization_override: None,
-@@ -3961,7 +3961,7 @@ fn search_and_files_page() -> SettingsPage {
+@@ -4095,7 +4095,7 @@ fn search_and_files_page() -> SettingsPage {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "File Scan Inclusions",
@@ -1001,7 +1000,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(
                      SettingField {
                          organization_override: None,
-@@ -5176,7 +5176,7 @@ fn window_and_layout_page() -> SettingsPage {
+@@ -5329,7 +5329,7 @@ fn window_and_layout_page() -> SettingsPage {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Window Decorations",
@@ -1010,7 +1009,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("window_decorations"),
-@@ -7010,7 +7010,7 @@ fn debugger_page() -> SettingsPage {
+@@ -7182,7 +7182,7 @@ fn debugger_page() -> SettingsPage {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Save Breakpoints",
@@ -1019,7 +1018,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("debugger.save_breakpoints"),
-@@ -7047,7 +7047,7 @@ fn debugger_page() -> SettingsPage {
+@@ -7219,7 +7219,7 @@ fn debugger_page() -> SettingsPage {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Log DAP Communications",
@@ -1028,7 +1027,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("debugger.log_dap_communications"),
-@@ -7987,7 +7987,7 @@ fn version_control_page() -> SettingsPage {
+@@ -8159,7 +8159,7 @@ fn version_control_page() -> SettingsPage {
                  discriminant: SettingItem {
                      files: USER,
                      title: "Disable Git Integration",
@@ -1037,7 +1036,7 @@ index 972d401b68..9a23f37920 100644
                      field: Box::new(SettingField::<bool> {
                          organization_override: None,
                          json_path: Some("git.disable_git"),
-@@ -8600,7 +8600,7 @@ fn ai_page(cx: &App) -> SettingsPage {
+@@ -8772,7 +8772,7 @@ fn ai_page(cx: &App) -> SettingsPage {
              SettingsPageItem::SectionHeader("General"),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Disable AI",
@@ -1046,7 +1045,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("disable_ai"),
-@@ -8964,7 +8964,7 @@ fn ai_page(cx: &App) -> SettingsPage {
+@@ -9159,7 +9159,7 @@ fn ai_page(cx: &App) -> SettingsPage {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Terminal Thread Init Command",
@@ -1055,7 +1054,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("agent.terminal_init_command"),
-@@ -9813,7 +9813,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
+@@ -10028,7 +10028,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
              SettingsPageItem::SectionHeader("Autoclose"),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Use Autoclose",
@@ -1064,7 +1063,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("languages.$(language).use_autoclose"),
-@@ -9833,7 +9833,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
+@@ -10048,7 +10048,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Use Auto Surround",
@@ -1073,7 +1072,7 @@ index 972d401b68..9a23f37920 100644
                  field: Box::new(SettingField {
                      organization_override: None,
                      json_path: Some("languages.$(language).use_auto_surround"),
-@@ -10381,7 +10381,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
+@@ -10596,7 +10596,7 @@ fn language_settings_data() -> Box<[SettingsPageItem]> {
              }),
              SettingsPageItem::SettingItem(SettingItem {
                  title: "Prefer LSP",
@@ -1135,10 +1134,10 @@ index d01dd1701d..4e3913dc4f 100644
  /// Tools that support permission rules
  const TOOLS: &[ToolInfo] = &[
 diff --git a/crates/settings_ui/src/settings_ui.rs b/crates/settings_ui/src/settings_ui.rs
-index e139245a56..bb91b509a4 100644
+index f2eef116d9..598e17531a 100644
 --- a/crates/settings_ui/src/settings_ui.rs
 +++ b/crates/settings_ui/src/settings_ui.rs
-@@ -891,7 +891,7 @@ fn open_settings_editor_with(
+@@ -894,7 +894,7 @@ fn open_settings_editor_with(
          cx.open_window(
              WindowOptions {
                  titlebar: Some(TitlebarOptions {
@@ -1148,10 +1147,10 @@ index e139245a56..bb91b509a4 100644
                      traffic_light_position: Some(point(px(12.0), px(12.0))),
                  }),
 diff --git a/crates/sidebar/src/sidebar.rs b/crates/sidebar/src/sidebar.rs
-index 37491eb69e..676775db6e 100644
+index 68e309923d..382931fb2e 100644
 --- a/crates/sidebar/src/sidebar.rs
 +++ b/crates/sidebar/src/sidebar.rs
-@@ -7594,7 +7594,7 @@ impl Sidebar {
+@@ -7675,7 +7675,7 @@ impl Sidebar {
          render_import_onboarding_banner(
              "acp",
              "Looking for threads from external agents?",
@@ -1161,10 +1160,10 @@ index 37491eb69e..676775db6e 100644
                  "Import Threads from External Agents"
              } else {
 diff --git a/crates/sidebar/src/sidebar_tests.rs b/crates/sidebar/src/sidebar_tests.rs
-index 941e1a3f2d..5b45fd00c9 100644
+index 112dc159d8..3318605e85 100644
 --- a/crates/sidebar/src/sidebar_tests.rs
 +++ b/crates/sidebar/src/sidebar_tests.rs
-@@ -2217,7 +2217,7 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
+@@ -2335,7 +2335,7 @@ async fn test_closing_last_agent_panel_terminal_restores_empty_header(cx: &mut T
      // placeholder row, so the header reports having threads.
      assert_eq!(
          visible_entries_as_strings(&sidebar, cx),
@@ -1200,10 +1199,10 @@ index fe418bef36..65b1b9f8b9 100644
  
  pub fn toggle_mute(cx: &mut App) {
 diff --git a/crates/title_bar/src/title_bar.rs b/crates/title_bar/src/title_bar.rs
-index 09c36b3855..391b90d281 100644
+index 3ffc153bbc..990ba74e3d 100644
 --- a/crates/title_bar/src/title_bar.rs
 +++ b/crates/title_bar/src/title_bar.rs
-@@ -1167,13 +1167,13 @@ impl TitleBar {
+@@ -1168,13 +1168,13 @@ impl TitleBar {
              client::Status::UpgradeRequired => {
                  let auto_updater = auto_update::AutoUpdater::get(cx);
                  let label = match auto_updater.map(|auto_update| auto_update.read(cx).status()) {
@@ -1219,7 +1218,7 @@ index 09c36b3855..391b90d281 100644
                  };
  
                  Some(
-@@ -1317,7 +1317,7 @@ impl TitleBar {
+@@ -1318,7 +1318,7 @@ impl TitleBar {
                                      .w_full()
                                      .gap_1()
                                      .justify_between()
@@ -1269,7 +1268,7 @@ index 9c17f498f8..8f96fec012 100644
              .tooltip(version)
              .disabled(true)
 diff --git a/crates/windows_resources/src/windows_resources.rs b/crates/windows_resources/src/windows_resources.rs
-index fee3e7368b..0af9e71a65 100644
+index 3cc5e5ef7a..6338178e2e 100644
 --- a/crates/windows_resources/src/windows_resources.rs
 +++ b/crates/windows_resources/src/windows_resources.rs
 @@ -44,10 +44,10 @@ const MANIFEST_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/mani
@@ -1288,10 +1287,10 @@ index fee3e7368b..0af9e71a65 100644
      let icon = std::path::PathBuf::from(ICON_DIR).join(icon_filename);
      let icon_escaped = icon.to_string_lossy().replace('\\', "\\\\");
 diff --git a/crates/workspace/src/notifications.rs b/crates/workspace/src/notifications.rs
-index 697f4f3ed5..b4dce2d3aa 100644
+index 9a07a77e8a..2870b86b19 100644
 --- a/crates/workspace/src/notifications.rs
 +++ b/crates/workspace/src/notifications.rs
-@@ -1210,7 +1210,7 @@ pub mod simple_message_notification {
+@@ -1269,7 +1269,7 @@ pub mod simple_message_notification {
              });
  
              let with_primary_action = cx.new(|cx| {
@@ -1300,7 +1299,7 @@ index 697f4f3ed5..b4dce2d3aa 100644
                      .with_title("Update Available")
                      .primary_message("Restart Now")
                      .primary_icon(IconName::ArrowCircle)
-@@ -1313,7 +1313,7 @@ pub mod simple_message_notification {
+@@ -1372,7 +1372,7 @@ pub mod simple_message_notification {
                      "Linux desktop portal initialization failed.".into()
                  }
                  fn secondary_message(&self) -> Option<SharedString> {
@@ -1309,7 +1308,7 @@ index 697f4f3ed5..b4dce2d3aa 100644
                  }
                  fn severity(&self) -> ErrorSeverity {
                      ErrorSeverity::Critical
-@@ -1337,7 +1337,7 @@ pub mod simple_message_notification {
+@@ -1396,7 +1396,7 @@ pub mod simple_message_notification {
                      ErrorSeverity::Critical
                  }
                  fn primary_action(&self) -> ErrorAction {
@@ -1353,10 +1352,10 @@ index 837418e8a6..4c512e86f5 100644
  
          h_flex()
 diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
-index ce0e73e318..2c942663a3 100644
+index 1dca749cef..0619a1392c 100644
 --- a/crates/workspace/src/workspace.rs
 +++ b/crates/workspace/src/workspace.rs
-@@ -10776,7 +10776,7 @@ pub fn join_channel(
+@@ -10800,7 +10800,7 @@ pub fn join_channel(
                          let detail: SharedString = match err.error_code() {
                              ErrorCode::SignedOut => "Please sign in to continue.".into(),
                              ErrorCode::UpgradeRequired => concat!(
@@ -53632,7 +53631,7 @@ z{e;){boF%7rxLc)K0*6LOK{&_ZNcEMHi5oh`|jwooyPvS-^wT*4ZNc<($~?+n3${4
 vQ+LxAZXd!u=%{;b?>BIc4jU%T{d7j}p<nBoWAC@WhyIkth5rYd$!Gr;9Pov9
 
 diff --git a/crates/zed/src/main.rs b/crates/zed/src/main.rs
-index 58bb35cda9..f5fe1462c0 100644
+index 41a2eb35bd..8bf6f17c01 100644
 --- a/crates/zed/src/main.rs
 +++ b/crates/zed/src/main.rs
 @@ -92,7 +92,7 @@ fn build_application() -> Application {
@@ -53685,10 +53684,10 @@ index 4d432ea51d..a55b33ade4 100644
  #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
  enum WatcherTab {
 diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
-index 7ff8f5b2b8..806c9d6469 100644
+index 63a1ee3fce..436f1a59fa 100644
 --- a/crates/zed/src/zed.rs
 +++ b/crates/zed/src/zed.rs
-@@ -1800,7 +1800,7 @@ fn open_about_window(cx: &mut App) {
+@@ -1811,7 +1811,7 @@ fn open_about_window(cx: &mut App) {
      cx.open_window(
          WindowOptions {
              titlebar: Some(TitlebarOptions {

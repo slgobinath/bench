@@ -14,12 +14,16 @@
 mod attach;
 #[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
+mod reconnect;
 mod screen;
 
 #[cfg(unix)]
-pub use attach::run_attach;
+pub use attach::{run_attach, run_open};
 #[cfg(unix)]
 pub use daemon::run_daemon;
+#[cfg(unix)]
+pub use reconnect::run_reconnecting;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -38,6 +42,21 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub const SOCKET_FILE_NAME: &str = "terminal-host.sock";
 
+/// The socket of the daemon that `remote_server` runs on a remote host. Named
+/// apart from [`SOCKET_FILE_NAME`] so a host that also runs Bench itself keeps
+/// the two daemons separate.
+pub const REMOTE_SOCKET_FILE_NAME: &str = "remote-terminal-host.sock";
+
+/// The flag that runs the daemon, in both `bench` and `remote_server`.
+pub const DAEMON_FLAG: &str = "--terminal-host";
+
+/// The flag `remote_server` takes to open a session, see [`run_open`].
+pub const OPEN_FLAG: &str = "--terminal-open";
+
+/// The flag `bench` takes to run a command again whenever its connection
+/// drops, see [`run_reconnecting`].
+pub const RECONNECT_FLAG: &str = "--terminal-reconnect";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -50,6 +69,9 @@ pub struct SessionInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CreateSession {
+    /// The id to give the session; the daemon picks one when this is `None`.
+    #[serde(default)]
+    pub id: Option<String>,
     pub cwd: Option<PathBuf>,
     /// `None` runs the user's login shell.
     pub program: Option<String>,
@@ -77,6 +99,17 @@ enum Request {
         rows: u16,
         client_pid: u32,
     },
+    /// Attaches to session `id`, first starting it from `create` if no session
+    /// with that id ever ran. A session that already ran and exited is
+    /// reported as [`Response::Ended`] instead of being started again, so a
+    /// client reconnecting after its shell exited sees that exit.
+    Open {
+        id: String,
+        cols: u16,
+        rows: u16,
+        client_pid: u32,
+        create: CreateSession,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +126,7 @@ enum Response {
     Sessions { sessions: Vec<SessionInfo> },
     Killed { killed: bool },
     Attached,
+    Ended { exit_code: Option<i32> },
     Error { message: String },
 }
 
@@ -182,6 +216,14 @@ pub struct TerminalHost {
 
 impl TerminalHost {
     /// The program a terminal runs to show `session_id`.
+    /// The program a terminal runs to keep `program` connected: it runs it
+    /// again each time it loses its connection, see [`run_reconnecting`].
+    pub fn reconnecting_command(&self, program: String, args: Vec<String>) -> (String, Vec<String>) {
+        let mut reconnect_args = vec![RECONNECT_FLAG.to_string(), program];
+        reconnect_args.extend(args);
+        (self.executable.to_string_lossy().into_owned(), reconnect_args)
+    }
+
     pub fn attach_command(&self, session_id: &str) -> (String, Vec<String>) {
         (
             self.executable.to_string_lossy().into_owned(),
@@ -234,7 +276,7 @@ impl TerminalHost {
     #[cfg(unix)]
     fn request(&self, request: Request, start_daemon: bool) -> Result<Response> {
         let stream = if start_daemon {
-            self.connect_or_start()?
+            connect_or_start(&self.executable, &self.socket)?
         } else {
             connect(&self.socket)?
         };
@@ -253,23 +295,47 @@ impl TerminalHost {
         }
     }
 
-    #[cfg(unix)]
-    fn connect_or_start(&self) -> Result<std::os::unix::net::UnixStream> {
-        if let Ok(stream) = connect(&self.socket) {
-            return Ok(stream);
-        }
-        daemon::spawn(&self.executable, &self.socket)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            match connect(&self.socket) {
-                Ok(stream) => return Ok(stream),
-                Err(error) if std::time::Instant::now() >= deadline => {
-                    return Err(error.context("the terminal host did not start"));
-                }
-                Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+}
+
+#[cfg(unix)]
+fn connect_or_start(
+    executable: &std::path::Path,
+    socket: &std::path::Path,
+) -> Result<std::os::unix::net::UnixStream> {
+    if let Ok(stream) = connect(socket) {
+        return Ok(stream);
+    }
+    daemon::spawn(executable, socket)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match connect(socket) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if std::time::Instant::now() >= deadline => {
+                return Err(error.context("the terminal host did not start"));
             }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
         }
     }
+}
+
+/// Lists the sessions of the daemon at `socket`, or none if it is not running.
+#[cfg(unix)]
+pub fn sessions_at(socket: &std::path::Path) -> Result<Vec<SessionInfo>> {
+    TerminalHost {
+        executable: PathBuf::new(),
+        socket: socket.to_path_buf(),
+    }
+    .sessions()
+}
+
+/// Kills session `id` of the daemon at `socket`, if it is running.
+#[cfg(unix)]
+pub fn kill_at(socket: &std::path::Path, id: &str) -> Result<bool> {
+    TerminalHost {
+        executable: PathBuf::new(),
+        socket: socket.to_path_buf(),
+    }
+    .kill(id, None)
 }
 
 #[cfg(unix)]

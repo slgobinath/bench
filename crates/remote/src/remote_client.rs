@@ -167,7 +167,20 @@ const RECONNECT_HANDSHAKE_TIMEOUT: Duration =
     Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
 const RESYNC_TIMEOUT: Duration = Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 15 });
 
-pub const MAX_RECONNECT_ATTEMPTS: usize = 3;
+/// Enough attempts, with [`reconnect_delay`] between them, to ride out a
+/// network that takes a couple of minutes to return, such as after a Mac wakes
+/// from sleep.
+pub const MAX_RECONNECT_ATTEMPTS: usize = 10;
+
+/// How long to wait before reconnect attempt `attempt`. The first attempt
+/// goes at once, since most drops are brief; later ones back off, so they are
+/// not all spent before the network is back.
+fn reconnect_delay(attempt: usize) -> Duration {
+    match attempt {
+        0 | 1 => Duration::ZERO,
+        attempt => Duration::from_secs(1 << (attempt - 2).min(5)),
+    }
+}
 
 enum State {
     Connecting,
@@ -659,6 +672,11 @@ impl RemoteClient {
         let unique_identifier = self.unique_identifier.clone();
         let client = self.client.clone();
         let reconnect_task = cx.spawn(async move |this, cx| {
+            let delay = reconnect_delay(attempts);
+            if !delay.is_zero() {
+                cx.background_executor().timer(delay).await;
+            }
+
             macro_rules! failed {
                 ($error:expr, $attempts:expr, $remote_connection:expr, $delegate:expr) => {
                     delegate.set_status(Some(&format!("{error:#}", error = $error)), cx);
@@ -971,6 +989,11 @@ impl RemoteClient {
         Some(self.remote_connection()?.default_system_shell())
     }
 
+    /// The remote user's home directory, when the connection found it.
+    pub fn home_dir(&self) -> Option<String> {
+        self.remote_connection()?.home_dir()
+    }
+
     pub fn shares_network_interface(&self) -> bool {
         self.remote_connection()
             .map_or(false, |connection| connection.shares_network_interface())
@@ -994,6 +1017,20 @@ impl RemoteClient {
             return Err(anyhow!("no remote connection"));
         };
         connection.build_command(program, args, env, working_dir, port_forward, interactive)
+    }
+
+    /// The command for an interactive terminal that runs the remote server
+    /// binary with `args`, or `None` if this connection cannot run it that way.
+    pub fn build_remote_server_terminal_command(
+        &self,
+        args: &[String],
+        env: &HashMap<String, String>,
+        working_dir: Option<String>,
+    ) -> Result<Option<CommandTemplate>> {
+        let Some(connection) = self.remote_connection() else {
+            return Err(anyhow!("no remote connection"));
+        };
+        connection.build_remote_server_terminal_command(args, env, working_dir)
     }
 
     pub fn build_stdio_command(
@@ -1480,6 +1517,14 @@ pub trait RemoteConnection: Send + Sync {
             "stdio commands are not supported by this remote connection"
         ))
     }
+    fn build_remote_server_terminal_command(
+        &self,
+        _args: &[String],
+        _env: &HashMap<String, String>,
+        _working_dir: Option<String>,
+    ) -> Result<Option<CommandTemplate>> {
+        Ok(None)
+    }
     fn build_forward_ports_command(
         &self,
         forwards: Vec<(u16, String, u16)>,
@@ -1493,6 +1538,9 @@ pub trait RemoteConnection: Send + Sync {
     fn remote_os_version(&self) -> Option<String>;
     fn shell(&self) -> String;
     fn default_system_shell(&self) -> String;
+    fn home_dir(&self) -> Option<String> {
+        None
+    }
     fn has_wsl_interop(&self) -> bool;
 
     #[cfg(any(test, feature = "test-support"))]

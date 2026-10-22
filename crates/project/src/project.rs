@@ -1472,6 +1472,7 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote_sessions_poll: None,
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -1716,6 +1717,7 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote_sessions_poll: None,
                 },
                 node: Some(node),
                 search_history: Self::new_search_history(),
@@ -2009,6 +2011,7 @@ impl Project {
                 git_diff_debouncer: DebouncedDelay::new(),
                 terminals: Terminals {
                     local_handles: Vec::new(),
+                    remote_sessions_poll: None,
                 },
                 node: None,
                 search_history: Self::new_search_history(),

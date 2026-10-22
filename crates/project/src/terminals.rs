@@ -16,7 +16,7 @@ use std::{
 };
 use task::{Shell, ShellBuilder, ShellKind, SpawnInTerminal};
 use terminal::{
-    Terminal, TerminalBuilder, TerminalMode, insert_zed_terminal_env,
+    SessionForeground, Terminal, TerminalBuilder, TerminalMode, insert_zed_terminal_env,
     terminal_settings::TerminalSettings,
 };
 use util::{
@@ -27,7 +27,14 @@ use crate::{Project, ProjectPath};
 
 pub struct Terminals {
     pub(crate) local_handles: Vec<WeakEntity<terminal::Terminal>>,
+    /// Asks the remote host what its terminal sessions are running, for as
+    /// long as the project has terminals whose shells live there.
+    pub(crate) remote_sessions_poll: Option<Task<()>>,
 }
+
+/// How often the remote host is asked what its terminal sessions are running.
+/// A terminal's agent badge and working directory lag by up to this much.
+const REMOTE_SESSIONS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 impl Project {
     pub fn active_entry_directory(&self, cx: &App) -> Option<PathBuf> {
@@ -438,7 +445,7 @@ impl Project {
 
             let builder = project
                 .update(cx, move |_, cx| {
-                    let (shell, env) = {
+                    let (shell, env, mode) = {
                         match remote_client {
                             Some(remote_client) => {
                                 let empty_args = Vec::new();
@@ -449,17 +456,29 @@ impl Project {
                                         Some((program, args))
                                     }
                                 };
-                                create_remote_shell(spawn_command, env, path, remote_client, cx)?
+                                match create_persistent_remote_shell(
+                                    spawn_command,
+                                    env.clone(),
+                                    path.clone(),
+                                    session_id,
+                                    &remote_client,
+                                    cx,
+                                )? {
+                                    Some(persistent) => persistent,
+                                    None => {
+                                        let (shell, env) = create_remote_shell(
+                                            spawn_command,
+                                            env,
+                                            path,
+                                            remote_client,
+                                            cx,
+                                        )?;
+                                        (shell, env, TerminalMode::interactive())
+                                    }
+                                }
                             }
-                            None => (settings.shell, env),
+                            None => (settings.shell, env, TerminalMode::persistent(session_id)),
                         }
-                    };
-                    // Remote shells run over ssh, which the terminal host
-                    // cannot keep alive on the remote side.
-                    let mode = if is_via_remote {
-                        TerminalMode::interactive()
-                    } else {
-                        TerminalMode::persistent(session_id)
                     };
                     anyhow::Ok(TerminalBuilder::new(
                         local_path.map(|path| path.to_path_buf()),
@@ -485,6 +504,9 @@ impl Project {
                 this.terminals
                     .local_handles
                     .push(terminal_handle.downgrade());
+                if is_via_remote && terminal_handle.read(cx).persistent_session().is_some() {
+                    this.poll_remote_terminal_sessions(cx);
+                }
 
                 let id = terminal_handle.entity_id();
                 cx.observe_release(&terminal_handle, move |project, _terminal, cx| {
@@ -514,6 +536,13 @@ impl Project {
         // We cannot clone the task's terminal, as it will effectively re-spawn the task, which might not be desirable.
         // For now, create a new shell instead.
         if terminal.read(cx).task().is_some() {
+            return self.create_terminal_shell(cwd, cx);
+        }
+        // A remote persistent terminal's command attaches to its own session,
+        // so running it again would take that session over rather than start
+        // another one.
+        if self.is_via_remote_server() && terminal.read(cx).persistent_session().is_some() {
+            let cwd = terminal.read(cx).working_directory().or(cwd);
             return self.create_terminal_shell(cwd, cx);
         }
         let local_path = if self.is_via_remote_server() {
@@ -549,6 +578,120 @@ impl Project {
 
                 terminal_handle
             })
+        })
+    }
+
+    /// Keeps each remote persistent terminal told what its session is running
+    /// on the host, which is how its agent and working directory are known:
+    /// the local process behind it is only ssh. Stops once no such terminal
+    /// is left.
+    fn poll_remote_terminal_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.terminals.remote_sessions_poll.is_some() {
+            return;
+        }
+        let Some(remote_client) = self.remote_client.clone() else {
+            return;
+        };
+        self.terminals.remote_sessions_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let terminals = this
+                    .update(cx, |this, cx| {
+                        this.terminals
+                            .local_handles
+                            .iter()
+                            .filter_map(|terminal| terminal.upgrade())
+                            .filter_map(|terminal| {
+                                let session_id =
+                                    terminal.read(cx).persistent_session()?.id.clone();
+                                Some((session_id, terminal))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if terminals.is_empty() {
+                    this.update(cx, |this, _| this.terminals.remote_sessions_poll = None)
+                        .ok();
+                    return;
+                }
+
+                let request = remote_client.read_with(cx, |remote_client, _| {
+                    remote_client
+                        .proto_client()
+                        .request(proto::ListTerminalSessions {
+                            project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                        })
+                });
+                match request.await {
+                    Ok(response) => {
+                        let mut foregrounds = response
+                            .sessions
+                            .into_iter()
+                            .map(|session| {
+                                let foreground =
+                                    session.foreground.map(|foreground| SessionForeground {
+                                        pid: foreground.pid,
+                                        command: foreground.command,
+                                        is_shell: foreground.is_shell,
+                                        directory: PathBuf::from(foreground.directory),
+                                        shell_directory: foreground
+                                            .shell_directory
+                                            .map(PathBuf::from),
+                                    });
+                                (session.id, foreground)
+                            })
+                            .collect::<HashMap<_, _>>();
+                        for (session_id, terminal) in terminals {
+                            let foreground = foregrounds.remove(&session_id).flatten();
+                            terminal.update(cx, |terminal, cx| {
+                                terminal.set_remote_foreground(foreground, cx)
+                            });
+                        }
+                    }
+                    // Expected while the connection is down; the terminals
+                    // keep what they last heard until it is back.
+                    Err(error) => log::debug!("listing remote terminal sessions: {error:#}"),
+                }
+                cx.background_executor()
+                    .timer(REMOTE_SESSIONS_POLL_INTERVAL)
+                    .await;
+            }
+        }));
+    }
+
+    /// Ends the session a remote persistent terminal showed, on its host.
+    pub fn end_remote_terminal_session(&self, session_id: String, cx: &App) -> Task<Result<()>> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Task::ready(Ok(()));
+        };
+        let request = remote_client
+            .read(cx)
+            .proto_client()
+            .request(proto::KillTerminalSession {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                session_id,
+            });
+        cx.background_spawn(async move {
+            request.await?;
+            Ok(())
+        })
+    }
+
+    /// Ends the remote terminal sessions working inside `root` on this
+    /// project's host, as [`terminal::end_sessions_inside`] does for local ones.
+    pub fn end_remote_terminal_sessions_inside(&self, root: &Path, cx: &App) -> Task<Result<()>> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Task::ready(Ok(()));
+        };
+        let request = remote_client
+            .read(cx)
+            .proto_client()
+            .request(proto::EndTerminalSessionsInside {
+                project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                root: root.to_string_lossy().into_owned(),
+            });
+        cx.background_spawn(async move {
+            request.await?;
+            Ok(())
         })
     }
 
@@ -694,6 +837,60 @@ fn create_remote_shell(
         },
         command.env,
     ))
+}
+
+/// Like [`create_remote_shell`], but hosts the shell in the remote host's
+/// terminal daemon as session `session_id` (a new one when `None`), so it keeps
+/// running while the connection is down, and reconnects to it whenever the
+/// connection drops. `None` when the connection cannot host the shell.
+fn create_persistent_remote_shell(
+    spawn_command: Option<(&String, &Vec<String>)>,
+    mut env: HashMap<String, String>,
+    working_directory: Option<Arc<Path>>,
+    session_id: Option<String>,
+    remote_client: &Entity<RemoteClient>,
+    cx: &mut App,
+) -> Result<Option<(Shell, HashMap<String, String>, TerminalMode)>> {
+    insert_zed_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
+
+    let restored = session_id.is_some();
+    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let mut args = vec![terminal_host::OPEN_FLAG.to_string(), session_id.clone()];
+    match spawn_command {
+        Some((program, program_args)) => {
+            args.push(program.clone());
+            args.extend(program_args.iter().cloned());
+        }
+        None => {
+            let Some(shell) = remote_client.read(cx).shell() else {
+                return Ok(None);
+            };
+            args.extend([shell, "-l".to_string()]);
+        }
+    }
+    let Some(command) = remote_client.read(cx).build_remote_server_terminal_command(
+        &args,
+        &env,
+        working_directory.map(|path| path.display().to_string()),
+    )?
+    else {
+        return Ok(None);
+    };
+
+    let (program, args) = match terminal_host::host() {
+        Some(host) => host.reconnecting_command(command.program, command.args),
+        None => (command.program, command.args),
+    };
+    let host = remote_client.read(cx).connection_options().display_name();
+    Ok(Some((
+        Shell::WithArguments {
+            program,
+            args,
+            title_override: Some(format!("{} — Terminal", host)),
+        },
+        command.env,
+        TerminalMode::remote_persistent(session_id, restored),
+    )))
 }
 
 fn format_task_for_activation(

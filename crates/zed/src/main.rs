@@ -208,6 +208,25 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
+    // `zed --terminal-reconnect <program> [args...]` is what a remote
+    // persistent terminal runs. It is matched before clap, because the ssh
+    // arguments that follow it must not be parsed as ours.
+    #[cfg(unix)]
+    {
+        let mut args = std::env::args_os().skip(1);
+        if args
+            .next()
+            .is_some_and(|flag| flag == terminal_host::RECONNECT_FLAG)
+        {
+            let Some(program) = args.next() else {
+                eprintln!("usage: {} <program> [args...]", terminal_host::RECONNECT_FLAG);
+                process::exit(1);
+            };
+            let args = args.collect::<Vec<_>>();
+            process::exit(terminal_host::run_reconnecting(&program, &args));
+        }
+    }
+
     let args = Args::parse();
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
