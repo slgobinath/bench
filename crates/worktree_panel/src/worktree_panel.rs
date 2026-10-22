@@ -5316,7 +5316,7 @@ fn workspace_repository(open: &OpenWorktree, cx: &App) -> Option<Entity<Reposito
 /// has nowhere to explain itself, and the git panel's Pull Requests tab is
 /// where the reason is shown; here it is logged and the icons stay plain.
 async fn pull_requests_by_branch(root: PathBuf) -> HashMap<SharedString, PullRequestState> {
-    match github_cli::pull_requests(&root, None, github_cli::DEFAULT_LIMIT).await {
+    match github_cli::pull_requests(github_cli::Repository::Local(&root), None, github_cli::DEFAULT_LIMIT).await {
         Ok(pull_requests) => by_branch(pull_requests),
         Err(unavailable) => {
             log::debug!(

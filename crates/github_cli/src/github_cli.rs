@@ -81,7 +81,46 @@ impl Unavailable {
 /// them is there, small enough that the answer is one page and arrives at once.
 pub const DEFAULT_LIMIT: usize = 50;
 
-/// The pull requests of the repository at `work_directory`, newest first.
+/// Where `gh` finds the repository it is asked about.
+#[derive(Clone, Copy, Debug)]
+pub enum Repository<'a> {
+    /// A checkout on this machine. `gh` runs inside it and picks the remote
+    /// itself, honouring `gh repo set-default`.
+    Local(&'a Path),
+    /// A checkout on another machine, such as an SSH host. Its directory does
+    /// not exist here, and the host may have no `gh`, so the `gh` on this
+    /// machine is pointed at the remote URL instead.
+    Remote { remote_url: Option<&'a str> },
+}
+
+/// `HOST/OWNER/REPO` for `gh --repo`, from a remote URL in any of the forms
+/// git accepts: `https://host/owner/repo.git`, `ssh://git@host:22/owner/repo`,
+/// or the scp-like `git@host:owner/repo.git`.
+fn repository_name(remote_url: &str) -> Option<String> {
+    let remote_url = remote_url.trim();
+    let (host, path) = match remote_url.split_once("://") {
+        Some((_scheme, rest)) => {
+            let (authority, path) = rest.split_once('/')?;
+            let host = authority.rsplit('@').next()?;
+            let host = host.split(':').next()?;
+            (host, path)
+        }
+        None => {
+            let (authority, path) = remote_url.split_once(':')?;
+            (authority.rsplit('@').next()?, path)
+        }
+    };
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/');
+    let (owner, name) = (segments.next()?, segments.next()?);
+    if host.is_empty() || owner.is_empty() || name.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some(format!("{host}/{owner}/{name}"))
+}
+
+/// The pull requests of `repository`, newest first.
 ///
 /// `head_branch` narrows the list to the pull requests opened *from* that
 /// branch; without it the answer covers every branch, which is what a caller
@@ -92,21 +131,41 @@ pub const DEFAULT_LIMIT: usize = 50;
 /// has just merged is the case where knowing is worth most, and an empty list
 /// would be indistinguishable from never having opened one.
 pub async fn pull_requests(
-    work_directory: &Path,
+    repository: Repository<'_>,
     head_branch: Option<&str>,
     limit: usize,
 ) -> Result<Vec<PullRequest>, Unavailable> {
     let gh = which::which("gh").map_err(|_| Unavailable::CliMissing)?;
 
     let mut command = util::command::new_command(gh);
+    match repository {
+        Repository::Local(work_directory) => {
+            command.current_dir(work_directory);
+        }
+        Repository::Remote { remote_url } => {
+            let Some(remote_url) = remote_url else {
+                return Err(Unavailable::Refused(
+                    "This repository has no remote to ask GitHub about".into(),
+                ));
+            };
+            let Some(name) = repository_name(remote_url) else {
+                return Err(Unavailable::Refused(
+                    format!("Could not tell which GitHub repository {remote_url} is").into(),
+                ));
+            };
+            command.args(["--repo", &name]);
+        }
+    }
     command
-        .current_dir(work_directory)
         // A `gh` left running is a `gh` nobody is waiting for: the caller drops
         // this future when the panel goes away or the branch changes under it.
         .kill_on_drop(true)
         .args(["pr", "list", "--state", "all"])
         .args(["--limit", &limit.to_string()])
-        .args(["--json", "number,title,url,state,isDraft,author,headRefName"]);
+        .args([
+            "--json",
+            "number,title,url,state,isDraft,author,headRefName",
+        ]);
     if let Some(head_branch) = head_branch {
         command.args(["--head", head_branch]);
     }
@@ -125,8 +184,10 @@ pub async fn pull_requests(
         }));
     }
 
-    let listed: Vec<ListedPullRequest> = serde_json::from_slice(&output.stdout)
-        .map_err(|error| Unavailable::Refused(format!("Could not read gh's answer: {error}").into()))?;
+    let listed: Vec<ListedPullRequest> =
+        serde_json::from_slice(&output.stdout).map_err(|error| {
+            Unavailable::Refused(format!("Could not read gh's answer: {error}").into())
+        })?;
     Ok(listed.into_iter().map(PullRequest::from).collect())
 }
 
@@ -175,6 +236,28 @@ impl From<ListedPullRequest> for PullRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_urls_name_the_repository() {
+        for (remote_url, expected) in [
+            ("https://github.com/o/r.git", Some("github.com/o/r")),
+            ("https://github.com/o/r", Some("github.com/o/r")),
+            ("git@github.com:o/r.git", Some("github.com/o/r")),
+            ("ssh://git@github.com:22/o/r.git", Some("github.com/o/r")),
+            (
+                "https://user:token@ghe.example.com/o/r/",
+                Some("ghe.example.com/o/r"),
+            ),
+            ("/srv/git/r.git", None),
+            ("https://github.com/o", None),
+        ] {
+            assert_eq!(
+                repository_name(remote_url).as_deref(),
+                expected,
+                "{remote_url}"
+            );
+        }
+    }
 
     /// The one piece of this with a decision in it: three fields of `gh`'s
     /// answer collapse into one state, and a draft is an *open* pull request

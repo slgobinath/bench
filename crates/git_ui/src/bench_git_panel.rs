@@ -1380,8 +1380,15 @@ impl BenchGitPanel {
     }
 
     fn load_pull_requests(&mut self, repositories: &[Entity<Repository>], cx: &mut Context<Self>) {
+        let is_local = self.project.read(cx).is_local();
         for repository in repositories {
             let root = work_directory(repository, cx);
+            let snapshot = repository.read(cx).snapshot();
+            // gh's own choice when a checkout has both: the fork's parent.
+            let remote_url = snapshot
+                .remote_upstream_url
+                .clone()
+                .or(snapshot.remote_origin_url.clone());
             let branch = repository
                 .read(cx)
                 .branch
@@ -1401,7 +1408,14 @@ impl BenchGitPanel {
                 async move |this, cx| {
                     let found = cx
                         .background_spawn(async move {
-                            github_cli::pull_requests(&root, branch.as_deref(), github_cli::DEFAULT_LIMIT)
+                            let repository = if is_local {
+                                github_cli::Repository::Local(&root)
+                            } else {
+                                github_cli::Repository::Remote {
+                                    remote_url: remote_url.as_deref(),
+                                }
+                            };
+                            github_cli::pull_requests(repository, branch.as_deref(), github_cli::DEFAULT_LIMIT)
                                 .await
                         })
                         .await;

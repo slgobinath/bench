@@ -7629,8 +7629,15 @@ impl GitPanel {
             self.set_pull_requests(None, PullRequests::Unavailable("No repository".into()), cx);
             return;
         };
+        let is_local = self.project.read(cx).is_local();
         let repository = active_repository.read(cx);
-        let work_directory = repository.snapshot().work_directory_abs_path;
+        let snapshot = repository.snapshot();
+        let work_directory = snapshot.work_directory_abs_path.clone();
+        // gh's own choice when a checkout has both: the fork's parent.
+        let remote_url = snapshot
+            .remote_upstream_url
+            .clone()
+            .or(snapshot.remote_origin_url.clone());
         let Some(branch) = repository
             .branch
             .as_ref()
@@ -7653,8 +7660,15 @@ impl GitPanel {
         self._pull_requests_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_spawn(async move {
+                    let repository = if is_local {
+                        github_cli::Repository::Local(&work_directory)
+                    } else {
+                        github_cli::Repository::Remote {
+                            remote_url: remote_url.as_deref(),
+                        }
+                    };
                     github_cli::pull_requests(
-                        &work_directory,
+                        repository,
                         Some(&branch),
                         github_cli::DEFAULT_LIMIT,
                     )
