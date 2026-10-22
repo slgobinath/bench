@@ -53,6 +53,7 @@ use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
+use remote::{RemoteConnectionIdentity, RemoteConnectionOptions, SshConnectionOptions};
 use ui::{
     Checkbox, CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, TintColor,
     Tooltip, prelude::*,
@@ -61,6 +62,7 @@ use ui_input::{ErasedEditor, InputField};
 use settings::Settings as _;
 use util::path_list::PathList;
 use util::paths::home_dir;
+use util::shell::ShellKind;
 use util::ResultExt as _;
 use workspace::{
     ModalView, MultiWorkspace, MultiWorkspaceEvent, OpenMode, RemovalIntent, Workspace,
@@ -86,8 +88,10 @@ actions!(
 /// the settings file.
 #[derive(Clone, Debug, PartialEq, settings::RegisterSetting)]
 pub struct WorktreePanelSettings {
-    pub include: Vec<PathBuf>,
-    pub exclude: Vec<PathBuf>,
+    /// As written, with any `~` left in: it stands for the home directory of
+    /// the host the worktree is on, which differs between projects.
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl WorktreePanelSettings {
@@ -96,10 +100,17 @@ impl WorktreePanelSettings {
     /// Other tools keep worktrees of the same repositories in directories of
     /// their own, and every one of them is in `git worktree list`. These lists
     /// are how a user keeps those out of a panel that is about Bench's.
-    fn allows(&self, path: &Path) -> bool {
-        let included =
-            self.include.is_empty() || self.include.iter().any(|root| path.starts_with(root));
-        included && !self.exclude.iter().any(|root| path.starts_with(root))
+    ///
+    /// `home` is that of the worktree's host. When it is not known, an entry
+    /// starting with `~` cannot be placed, and is taken to include every
+    /// worktree and exclude none: a worktree listed that should not have been
+    /// is a nuisance, one hidden that should not have been looks lost.
+    fn allows(&self, path: &Path, home: Option<&Path>) -> bool {
+        let inside =
+            |entry: &String| expand_path(entry, home).map(|root| path.starts_with(root));
+        let included = self.include.is_empty()
+            || self.include.iter().any(|entry| inside(entry).unwrap_or(true));
+        included && !self.exclude.iter().any(|entry| inside(entry).unwrap_or(false))
     }
 }
 
@@ -107,22 +118,21 @@ impl settings::Settings for WorktreePanelSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let panel = content.worktree_panel.clone().unwrap_or_default();
         Self {
-            include: expand_paths(panel.include.unwrap_or_default()),
-            exclude: expand_paths(panel.exclude.unwrap_or_default()),
+            include: panel.include.unwrap_or_default(),
+            exclude: panel.exclude.unwrap_or_default(),
         }
     }
 }
 
-fn expand_paths(paths: Vec<String>) -> Vec<PathBuf> {
-    paths
-        .into_iter()
-        .map(|path| match path.strip_prefix('~') {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => {
-                home_dir().join(rest.trim_start_matches('/'))
-            }
-            _ => PathBuf::from(path),
-        })
-        .collect()
+/// `path` with a leading `~` made `home`, or `None` if it has one and `home`
+/// is not known.
+fn expand_path(path: &str, home: Option<&Path>) -> Option<PathBuf> {
+    match path.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            Some(home?.join(rest.trim_start_matches('/')))
+        }
+        _ => Some(PathBuf::from(path)),
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -320,6 +330,9 @@ enum Discovery {
     /// that git could not be asked.
     Found {
         worktrees: Vec<GitWorktree>,
+        /// The home directory of the host the project is on, which is what a
+        /// `~` in the settings means for its worktrees.
+        home: Option<PathBuf>,
         /// When this was asked; `None` once it should be asked again.
         checked: Option<Instant>,
         /// A refresh in flight. The rows already found stay on screen until
@@ -371,7 +384,9 @@ impl Global for PanelView {}
 
 #[derive(Default)]
 struct ProjectScans {
-    discovered: HashMap<PathBuf, Discovery>,
+    /// By host as well as root: two hosts can each have a project at the same
+    /// path.
+    discovered: HashMap<(Option<RemoteConnectionIdentity>, PathBuf), Discovery>,
     pull_requests: HashMap<PathBuf, PullRequestScan>,
     /// By worktree root rather than by project: each worktree has files of
     /// its own.
@@ -659,16 +674,25 @@ impl WorktreePanel {
             .find_map(|open| workspace_repository(open, cx))
             .and_then(|repository| repository_anchor(&repository, cx));
 
+        let mut home = open_worktrees
+            .iter()
+            .find_map(|open| worktrees_home(&open.workspace, cx));
         if open_worktrees.is_empty() {
             let root = project_root(key);
+            let host = key.host().as_ref().map(RemoteConnectionIdentity::from);
             let discovered = root
                 .as_ref()
                 .zip(cx.try_global::<ProjectScans>())
-                .and_then(|(root, scans)| scans.discovered.get(root));
+                .and_then(|(root, scans)| scans.discovered.get(&(host, root.clone())));
             match discovered {
                 Some(Discovery::Found {
-                    worktrees: found, ..
-                }) => worktrees = found.clone(),
+                    worktrees: found,
+                    home: found_home,
+                    ..
+                }) => {
+                    worktrees = found.clone();
+                    home = found_home.clone();
+                }
                 Some(Discovery::Pending { .. }) | None => return Vec::new(),
             }
             anchor = root;
@@ -687,7 +711,7 @@ impl WorktreePanel {
                 || open_roots
                     .iter()
                     .any(|root| root.as_deref() == Some(worktree.path.as_path()))
-                || settings.allows(&worktree.path)
+                || settings.allows(&worktree.path, home.as_deref())
         });
         let switch_from = open_worktrees.first().map(|open| open.workspace.clone());
         let pull_requests = self.scanned_pull_requests(key, cx);
@@ -794,8 +818,8 @@ impl WorktreePanel {
             .collect()
     }
 
-    /// The root of every project the window holds no workspace for.
-    fn closed_project_roots(&self, cx: &App) -> Vec<PathBuf> {
+    /// The host and root of every project the window holds no workspace for.
+    fn closed_project_roots(&self, cx: &App) -> Vec<(Option<RemoteConnectionOptions>, PathBuf)> {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
             return Vec::new();
         };
@@ -805,14 +829,11 @@ impl WorktreePanel {
             .map(|workspace| workspace.read(cx).project_group_key(cx))
             .collect();
 
-        // A project on a remote host cannot be asked of this machine's git;
-        // its worktrees are listed once it is open.
         multi_workspace
             .project_group_keys()
             .into_iter()
-            .filter(|key| key.host().is_none())
             .filter(|key| !open.iter().any(|held| held.matches(key)))
-            .filter_map(|key| project_root(&key))
+            .filter_map(|key| Some((key.host(), project_root(&key)?)))
             .collect()
     }
 
@@ -829,12 +850,27 @@ impl WorktreePanel {
     /// being looked at. It is cheap to call repeatedly: a project already
     /// scanned or being scanned is skipped, so each one costs a single
     /// `git worktree list`.
-    fn discover(&mut self, roots: &[PathBuf], cx: &mut Context<Self>) {
+    ///
+    /// A project on an ssh host is asked over a fresh ssh connection, since
+    /// a restart brings it back as a row with no connection behind it.
+    fn discover(
+        &mut self,
+        roots: &[(Option<RemoteConnectionOptions>, PathBuf)],
+        cx: &mut Context<Self>,
+    ) {
         let Some(fs) = self.fs(cx) else {
             return;
         };
-        for root in roots {
-            match cx.default_global::<ProjectScans>().discovered.get(root) {
+        for (host, root) in roots {
+            let scan_key = (
+                host.as_ref().map(RemoteConnectionIdentity::from),
+                root.clone(),
+            );
+            match cx
+                .default_global::<ProjectScans>()
+                .discovered
+                .get(&scan_key)
+            {
                 Some(Discovery::Pending { .. }) => continue,
                 Some(Discovery::Found {
                     checked, _refresh, ..
@@ -848,17 +884,24 @@ impl WorktreePanel {
 
             let scan = cx.spawn({
                 let fs = fs.clone();
+                let host = host.clone();
                 let root = root.clone();
+                let scan_key = scan_key.clone();
                 async move |_, cx| {
-                    let found = cx
-                        .background_spawn(worktrees_on_disk(fs, root.clone()))
-                        .await;
+                    let (found, home) = match host {
+                        None => (
+                            cx.background_spawn(worktrees_on_disk(fs, root)).await,
+                            Some(home_dir().clone()),
+                        ),
+                        Some(host) => cx.background_spawn(worktrees_on_host(host, root)).await,
+                    };
                     cx.update(|cx| {
                         record_scan(cx, |scans| {
                             scans.discovered.insert(
-                                root,
+                                scan_key,
                                 Discovery::Found {
                                     worktrees: found,
+                                    home,
                                     checked: Some(Instant::now()),
                                     _refresh: None,
                                 },
@@ -868,12 +911,12 @@ impl WorktreePanel {
                 }
             });
             let scans = cx.default_global::<ProjectScans>();
-            match scans.discovered.get_mut(root) {
+            match scans.discovered.get_mut(&scan_key) {
                 Some(Discovery::Found { _refresh, .. }) => *_refresh = Some(scan),
                 _ => {
                     scans
                         .discovered
-                        .insert(root.clone(), Discovery::Pending { _scan: scan });
+                        .insert(scan_key, Discovery::Pending { _scan: scan });
                 }
             }
         }
@@ -886,10 +929,16 @@ impl WorktreePanel {
         let Some(root) = root else {
             return;
         };
-        if let Some(Discovery::Found { checked, .. }) =
-            cx.default_global::<ProjectScans>().discovered.get_mut(&root)
+        // Whichever host it is on: asking a project of the same path on
+        // another host again as well costs one more `git worktree list`.
+        for ((_, discovered_root), discovery) in
+            cx.default_global::<ProjectScans>().discovered.iter_mut()
         {
-            *checked = None;
+            if let Discovery::Found { checked, .. } = discovery
+                && *discovered_root == root
+            {
+                *checked = None;
+            }
         }
         cx.notify();
     }
@@ -4758,6 +4807,78 @@ async fn worktrees_on_disk(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<GitWorktree> {
     }
 }
 
+/// [`worktrees_on_disk`] for a project on a remote host, asked with a
+/// `git worktree list` over ssh, along with the host's home directory. Only
+/// ssh hosts can be asked this way; the others are listed once they are open.
+async fn worktrees_on_host(
+    host: RemoteConnectionOptions,
+    root: PathBuf,
+) -> (Vec<GitWorktree>, Option<PathBuf>) {
+    let RemoteConnectionOptions::Ssh(options) = host else {
+        return (Vec::new(), None);
+    };
+    match list_worktrees_over_ssh(&options, &root).await {
+        Ok(found) => found,
+        Err(error) => {
+            log::warn!(
+                "listing the worktrees of {} on {}: {error:#}",
+                root.display(),
+                options.ssh_destination()
+            );
+            (Vec::new(), None)
+        }
+    }
+}
+
+async fn list_worktrees_over_ssh(
+    options: &SshConnectionOptions,
+    root: &Path,
+) -> anyhow::Result<(Vec<GitWorktree>, Option<PathBuf>)> {
+    let root = root
+        .to_str()
+        .with_context(|| format!("{} is not valid UTF-8", root.display()))?;
+    let root = ShellKind::Posix
+        .try_quote(root)
+        .context("quoting the project path")?;
+    let mut command = util::command::new_command("ssh");
+    command
+        .kill_on_drop(true)
+        .stdin(util::command::Stdio::null())
+        .args(options.additional_args_for_scp())
+        // Nobody is at a terminal to answer a password or host key prompt;
+        // a host that needs one is listed once it is open instead.
+        .args(["-o", "BatchMode=yes"])
+        .args(["-o", "ConnectTimeout=10"]);
+    if let Some(port) = options.port {
+        command.args(["-p", &port.to_string()]);
+    }
+    let output = command
+        .arg(options.ssh_destination())
+        .arg(format!(
+            "printf '%s\\n' \"$HOME\" && git -C {root} worktree list --porcelain"
+        ))
+        .output()
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (home, listing) = stdout.split_once('\n').unwrap_or((&stdout, ""));
+    let home = (!home.is_empty()).then(|| PathBuf::from(home));
+    // Git lists the main worktree first.
+    let main = listing
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from);
+    Ok((
+        git::repository::parse_worktrees_from_str(listing, main.as_deref()),
+        home,
+    ))
+}
+
 /// What git says about a worktree, from one `git status`: its changes, its
 /// branch against its upstream, and when a file last changed.
 ///
@@ -5827,7 +5948,7 @@ mod tests {
             let roots = panel.closed_project_roots(cx);
             assert_eq!(
                 roots,
-                vec![PathBuf::from("/closed")],
+                vec![(None, PathBuf::from("/closed"))],
                 "the project with no workspace open is the one to scan"
             );
             panel.discover(&roots, cx);
@@ -6559,7 +6680,7 @@ mod tests {
             });
         });
         panels[0].update(&mut cx, |panel, cx| {
-            panel.discover(&[PathBuf::from("/closed")], cx);
+            panel.discover(&[(None, PathBuf::from("/closed"))], cx);
         });
         cx.run_until_parked();
 
@@ -6576,7 +6697,7 @@ mod tests {
 
         panels[0].update(&mut cx, |panel, cx| {
             panel.rediscover(Some(PathBuf::from("/closed")), cx);
-            panel.discover(&[PathBuf::from("/closed")], cx);
+            panel.discover(&[(None, PathBuf::from("/closed"))], cx);
         });
         let during = panels[0].read_with(&mut cx, |panel, cx| closed_rows(panel, cx));
         assert_eq!(during, before, "the rows stay while git is asked again");
@@ -7176,6 +7297,22 @@ mod tests {
         });
 
         assert_eq!(names, vec!["main", "opened", "outer-fix"]);
+    }
+
+    #[test]
+    fn a_tilde_in_the_settings_is_the_home_of_the_worktrees_host() {
+        let settings = WorktreePanelSettings {
+            include: vec!["~/bench".to_owned()],
+            exclude: vec!["~/bench/skipped".to_owned()],
+        };
+        let remote_home = Path::new("/home/user");
+        assert!(settings.allows(Path::new("/home/user/bench/project/fix"), Some(remote_home)));
+        assert!(!settings.allows(Path::new("/Users/user/bench/project/fix"), Some(remote_home)));
+        assert!(!settings.allows(Path::new("/home/user/bench/skipped/fix"), Some(remote_home)));
+        assert!(
+            settings.allows(Path::new("/home/user/bench/skipped/fix"), None),
+            "a host whose home is not known has nothing hidden"
+        );
     }
 
     fn pull_request(head_ref: &str, state: PullRequestState) -> PullRequest {
