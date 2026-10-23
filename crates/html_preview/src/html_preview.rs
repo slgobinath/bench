@@ -1,3 +1,4 @@
+mod browser;
 mod web_view;
 
 use std::cell::Cell;
@@ -27,8 +28,12 @@ use zed_actions::claude::{
     AddComment, AddCommentOn, CommentTarget, SendLines, SendSelection, SendText,
 };
 
-use crate::web_view::{PageEvent, WebView, page_url};
+use crate::web_view::{PageEvent, PageSource, WebView, page_url};
 
+pub use browser::{
+    BrowserView, ClickOutcome, ClickTarget, ConsoleEntry, OpenBrowser, Screenshot, TypeOutcome,
+    click, press_key, reveal, run_script, screenshot, type_text,
+};
 pub use zed_actions::preview::html::{OpenPreview, OpenPreviewToTheSide};
 
 actions!(
@@ -50,6 +55,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    browser::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace
             .register_action(|workspace, _: &OpenPreview, window, cx| {
@@ -164,14 +170,12 @@ impl HtmlPreviewView {
         let fs = project.read(cx).fs().clone();
 
         let (events_sender, mut events) = mpsc::unbounded();
-        let (web_view, load_error) = match WebView::new(
-            page_url(&project_path.path),
+        let source = PageSource::Worktree {
+            url: page_url(&project_path.path),
             root,
             fs,
-            events_sender,
-            window,
-            cx,
-        ) {
+        };
+        let (web_view, load_error) = match WebView::new(source, events_sender, window, cx) {
             Ok(web_view) => (Some(web_view), None),
             Err(error) => {
                 log::error!("opening HTML preview: {error:#}");
@@ -255,22 +259,6 @@ impl HtmlPreviewView {
         &self.project_path
     }
 
-    /// Whether another pane or a panel is zoomed over this preview. The zoomed
-    /// view draws on top of the center panes, but below native views, so the
-    /// page has to be hidden for it to show.
-    fn is_covered_by_zoomed_item(&self, preview_id: EntityId, cx: &App) -> bool {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return false;
-        };
-        let workspace = workspace.read(cx);
-        let Some(zoomed) = workspace.zoomed_item().and_then(|zoomed| zoomed.upgrade()) else {
-            return false;
-        };
-        workspace
-            .pane_for_item_id(preview_id)
-            .is_none_or(|pane| pane.entity_id() != zoomed.entity_id())
-    }
-
     fn handle_page_event(&mut self, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             PageEvent::SelectionChanged(selection) => self.selection = selection,
@@ -291,6 +279,12 @@ impl HtmlPreviewView {
                 window.focus(&self.focus_handle, cx);
             }
             PageEvent::OpenExternally(url) => cx.open_url(&url),
+            PageEvent::OpenInNewTab(_)
+            | PageEvent::LoadStarted(_)
+            | PageEvent::LoadFinished(_)
+            | PageEvent::TitleChanged(_)
+            | PageEvent::LocationChanged(_)
+            | PageEvent::Console { .. } => {}
         }
     }
 
@@ -502,8 +496,8 @@ impl Render for HtmlPreviewView {
             web_view.set_appearance(appearance);
             self.applied_appearance = Some(appearance);
         }
-        let show_toggle =
-            self.web_view.is_some() && !self.is_covered_by_zoomed_item(cx.entity_id(), cx);
+        let show_toggle = self.web_view.is_some()
+            && !is_covered_by_zoomed_item(&self.workspace, cx.entity_id(), cx);
 
         v_flex()
             .id("HtmlPreview")
@@ -577,12 +571,54 @@ impl HtmlPreviewView {
     }
 }
 
-/// Places the native web view where the page is laid out.
-struct PageElement {
-    view: Entity<HtmlPreviewView>,
+/// A view that shows a web view through [`PageElement`].
+trait PageHost: 'static {
+    fn web_view(&self) -> Option<&WebView>;
+    /// Where the page is in the window, as last laid out.
+    fn page_bounds(&self) -> &Cell<Bounds<Pixels>>;
+    fn workspace(&self) -> &WeakEntity<Workspace>;
 }
 
-impl IntoElement for PageElement {
+/// Whether another pane or a panel is zoomed over the view. The zoomed view
+/// draws on top of the center panes, but below native views, so the page has
+/// to be hidden for it to show.
+fn is_covered_by_zoomed_item(
+    workspace: &WeakEntity<Workspace>,
+    view_id: EntityId,
+    cx: &App,
+) -> bool {
+    let Some(workspace) = workspace.upgrade() else {
+        return false;
+    };
+    let workspace = workspace.read(cx);
+    let Some(zoomed) = workspace.zoomed_item().and_then(|zoomed| zoomed.upgrade()) else {
+        return false;
+    };
+    workspace
+        .pane_for_item_id(view_id)
+        .is_none_or(|pane| pane.entity_id() != zoomed.entity_id())
+}
+
+impl PageHost for HtmlPreviewView {
+    fn web_view(&self) -> Option<&WebView> {
+        self.web_view.as_ref()
+    }
+
+    fn page_bounds(&self) -> &Cell<Bounds<Pixels>> {
+        &self.page_bounds
+    }
+
+    fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+}
+
+/// Places the native web view where the page is laid out.
+struct PageElement<V: PageHost> {
+    view: Entity<V>,
+}
+
+impl<V: PageHost> IntoElement for PageElement<V> {
     type Element = Self;
 
     fn into_element(self) -> Self::Element {
@@ -590,7 +626,7 @@ impl IntoElement for PageElement {
     }
 }
 
-impl Element for PageElement {
+impl<V: PageHost> Element for PageElement<V> {
     type RequestLayoutState = ();
     type PrepaintState = Option<Hitbox>;
 
@@ -625,11 +661,11 @@ impl Element for PageElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let view = self.view.read(cx);
-        view.page_bounds.set(bounds);
-        if view.is_covered_by_zoomed_item(self.view.entity_id(), cx) {
+        view.page_bounds().set(bounds);
+        if is_covered_by_zoomed_item(view.workspace(), self.view.entity_id(), cx) {
             return None;
         }
-        let web_view = view.web_view.as_ref()?;
+        let web_view = view.web_view()?;
         web_view.set_bounds(bounds, window.scale_factor()).log_err();
         // AppKit sends the clicks over the page to the page, so GPUI content
         // under it must not act as though it were hovered.
@@ -647,7 +683,7 @@ impl Element for PageElement {
         cx: &mut App,
     ) {
         if hitbox.is_some()
-            && let Some(web_view) = &self.view.read(cx).web_view
+            && let Some(web_view) = self.view.read(cx).web_view()
         {
             web_view.paint(window);
         }

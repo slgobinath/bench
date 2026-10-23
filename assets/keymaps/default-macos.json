@@ -1546,6 +1546,32 @@
     },
   },
   {
+    "context": "Browser",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "browser::Copy",
+      "cmd-x": "browser::Cut",
+      "cmd-v": "browser::Paste",
+      "cmd-a": "browser::SelectAll",
+      "cmd-z": "browser::Undo",
+      "cmd-shift-z": "browser::Redo",
+      "cmd-r": "browser::Reload",
+      "cmd-l": "browser::FocusAddressBar",
+      "cmd-[": "browser::GoBack",
+      "cmd-]": "browser::GoForward",
+      "cmd-alt-i": "browser::OpenDevTools",
+      "cmd->": "claude::SendSelection",
+    },
+  },
+  {
+    "context": "BrowserAddressBar > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "menu::Confirm",
+      "escape": "menu::Cancel",
+    },
+  },
+  {
     "context": "HtmlPreview",
     "use_key_equivalents": true,
     "bindings": {

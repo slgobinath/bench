@@ -14,29 +14,51 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+editor.workspace = true
 file_icons.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
+image.workspace = true
 language.workspace = true
 log.workspace = true
+menu.workspace = true
 percent-encoding.workspace = true
 project.workspace = true
 regex.workspace = true
+remote.workspace = true
+schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
 ui.workspace = true
+url.workspace = true
 util.workspace = true
 workspace.workspace = true
 zed_actions.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2.workspace = true
 http.workspace = true
 objc2.workspace = true
-objc2-app-kit = { workspace = true, features = ["NSAppearance"] }
+objc2-app-kit = { workspace = true, features = [
+    "NSAppearance",
+    "NSEvent",
+    "NSGraphicsContext",
+    "NSResponder",
+] }
 objc2-foundation.workspace = true
+objc2-web-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "WKContentWorld",
+    "WKFrameInfo",
+    "WKNavigation",
+    "WKSnapshotConfiguration",
+    "WKWebView",
+] }
 raw-window-handle.workspace = true
 wry = { version = "0.57.0", default-features = false, features = ["devtools"] }

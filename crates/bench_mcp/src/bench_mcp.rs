@@ -1,5 +1,5 @@
 //! Bench's MCP server: tools that let an agent see what Bench is showing,
-//! create worktrees in it and open pages in it.
+//! create worktrees in it, open pages in it and drive its browser.
 //!
 //! It is served on a Unix socket at [`paths::mcp_socket_path`], which only its
 //! owner can open, and agents reach it through `cli --mcp`, a stdio bridge to
@@ -8,22 +8,29 @@
 //! working in.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use context_server::listener::{McpServer, McpServerTool, ToolContext, ToolResponse};
 use context_server::types::{
     self, Implementation, InitializeResponse, ProtocolVersion, Request, ServerCapabilities,
     ToolAnnotations, ToolResponseContent, ToolsCapabilities,
 };
 use editor::Editor;
-use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt as _, WindowHandle};
-use html_preview::HtmlPreviewView;
+use futures::FutureExt as _;
+use futures::channel::oneshot;
+use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt as _, WeakEntity, WindowHandle};
+use html_preview::{
+    BrowserView, ClickOutcome, ClickTarget, ConsoleEntry, HtmlPreviewView, TypeOutcome,
+};
 use language::{DiagnosticSeverity, OffsetRangeExt as _};
+use linear::{Issue, Linear};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace};
-use linear::{Issue, Linear};
 use worktree_panel::{ProjectListing, WorktreePanel};
 
 /// How many characters of a selection are returned. A whole-file selection in
@@ -51,6 +58,15 @@ pub fn init(cx: &mut App) {
         server.add_tool(GetOpenFiles);
         server.add_tool(GetDiagnostics);
         server.add_tool(OpenHtmlFile);
+        server.add_tool(BrowserOpen);
+        server.add_tool(BrowserNavigate);
+        server.add_tool(BrowserScreenshot);
+        server.add_tool(BrowserSnapshot);
+        server.add_tool(BrowserClick);
+        server.add_tool(BrowserType);
+        server.add_tool(BrowserPressKey);
+        server.add_tool(BrowserEval);
+        server.add_tool(BrowserConsoleLogs);
         cx.update(|cx| cx.set_global(BenchMcpServer(server)));
         anyhow::Ok(())
     })
@@ -166,7 +182,9 @@ fn workspace_for_directory(directory: &Path, cx: &App) -> Result<Entity<Workspac
             for root in workspace_roots(workspace, cx) {
                 let depth = root.components().count();
                 if directory.starts_with(&root)
-                    && best.as_ref().is_none_or(|(best_depth, _)| depth > *best_depth)
+                    && best
+                        .as_ref()
+                        .is_none_or(|(best_depth, _)| depth > *best_depth)
                 {
                     best = Some((depth, workspace.clone()));
                 }
@@ -184,7 +202,11 @@ fn workspace_for_directory(directory: &Path, cx: &App) -> Result<Entity<Workspac
 /// Each window's projects, as its worktree panel lists them.
 fn window_projects(
     cx: &App,
-) -> Vec<(WindowHandle<MultiWorkspace>, Entity<WorktreePanel>, Vec<ProjectListing>)> {
+) -> Vec<(
+    WindowHandle<MultiWorkspace>,
+    Entity<WorktreePanel>,
+    Vec<ProjectListing>,
+)> {
     windows(cx)
         .into_iter()
         .filter_map(|window| {
@@ -460,10 +482,18 @@ fn find_project(
     issue: Option<&Issue>,
     client_directory: Option<&Path>,
     cx: &App,
-) -> Result<(WindowHandle<MultiWorkspace>, Entity<WorktreePanel>, PathBuf, String)> {
+) -> Result<(
+    WindowHandle<MultiWorkspace>,
+    Entity<WorktreePanel>,
+    PathBuf,
+    String,
+)> {
     // A project open in several windows is one project.
-    let mut candidates: Vec<(WindowHandle<MultiWorkspace>, Entity<WorktreePanel>, ProjectListing)> =
-        Vec::new();
+    let mut candidates: Vec<(
+        WindowHandle<MultiWorkspace>,
+        Entity<WorktreePanel>,
+        ProjectListing,
+    )> = Vec::new();
     for (window, panel, projects) in window_projects(cx) {
         for project in projects {
             let already_listed = candidates
@@ -503,7 +533,9 @@ fn find_project(
         candidates
             .iter()
             .position(|(_, _, listing)| named(listing, project))
-            .with_context(|| format!("No project named or rooted at “{project}” is open in Bench"))?
+            .with_context(|| {
+                format!("No project named or rooted at “{project}” is open in Bench")
+            })?
     } else {
         let on_team: Vec<(usize, &ProjectListing)> = candidates
             .iter()
@@ -1044,4 +1076,777 @@ async fn file_diagnostics(
         });
     }
     Ok(diagnostics)
+}
+
+/// How long `browser_open` and `browser_navigate` wait for the page to load
+/// before answering without it.
+const PAGE_LOAD_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The browser tab an agent last opened, which browser tools act on when they
+/// aren't given one.
+#[derive(Default)]
+struct AgentBrowserTab(Option<WeakEntity<BrowserView>>);
+
+impl Global for AgentBrowserTab {}
+
+fn browser_tabs(workspace: &Entity<Workspace>, cx: &App) -> Vec<Entity<BrowserView>> {
+    workspace
+        .read(cx)
+        .panes()
+        .iter()
+        .flat_map(|pane| {
+            pane.read(cx)
+                .items_of_type::<BrowserView>()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn all_browser_tabs(cx: &App) -> Vec<Entity<BrowserView>> {
+    windows(cx)
+        .into_iter()
+        .filter_map(|window| window.read(cx).ok())
+        .flat_map(|multi_workspace| {
+            multi_workspace
+                .workspaces()
+                .flat_map(|workspace| browser_tabs(workspace, cx))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The browser tab a tool acts on: the one given; else the one the agent last
+/// opened; else, in the worktree the agent is working in, the one showing in
+/// the active pane or the only one; else the only one open in Bench.
+fn find_browser_tab(
+    tab: Option<u64>,
+    context: &ToolContext,
+    cx: &App,
+) -> Result<Entity<BrowserView>> {
+    let tabs = all_browser_tabs(cx);
+    if let Some(tab) = tab {
+        return tabs
+            .into_iter()
+            .find(|browser| browser.entity_id().as_u64() == tab)
+            .with_context(|| format!("No browser tab {tab} is open"));
+    }
+    if let Some(browser) = cx
+        .try_global::<AgentBrowserTab>()
+        .and_then(|last| last.0.as_ref()?.upgrade())
+        .filter(|browser| tabs.contains(browser))
+    {
+        return Ok(browser);
+    }
+    if let Some(directory) = &context.client_directory
+        && let Ok(workspace) = workspace_for_directory(directory, cx)
+    {
+        let active = workspace
+            .read(cx)
+            .active_pane()
+            .read(cx)
+            .active_item()
+            .and_then(|item| item.downcast::<BrowserView>());
+        if let Some(browser) = active {
+            return Ok(browser);
+        }
+        if let [browser] = browser_tabs(&workspace, cx).as_slice() {
+            return Ok(browser.clone());
+        }
+    }
+    match tabs.as_slice() {
+        [browser] => Ok(browser.clone()),
+        [] => anyhow::bail!("No browser tab is open in Bench. Open one with `browser_open`."),
+        _ => anyhow::bail!(
+            "Several browser tabs are open; pass `tab`, one of {}",
+            tabs.iter()
+                .map(|browser| format!(
+                    "{} ({})",
+                    browser.entity_id().as_u64(),
+                    browser.read(cx).url()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserPageOutput {
+    /// The tab's id, which other browser tools take as `tab`.
+    tab: u64,
+    url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    /// Whether the page finished loading before this answered.
+    loaded: bool,
+}
+
+fn browser_page_output(browser: &Entity<BrowserView>, loaded: bool, cx: &App) -> BrowserPageOutput {
+    let view = browser.read(cx);
+    BrowserPageOutput {
+        tab: browser.entity_id().as_u64(),
+        url: view.url().to_string(),
+        title: view.title().map(|title| title.to_string()),
+        loaded,
+    }
+}
+
+/// Waits for `load` to resolve, up to [`PAGE_LOAD_TIMEOUT`], returning
+/// whether it did.
+async fn wait_for_page_load(load: oneshot::Receiver<()>, cx: &mut AsyncApp) -> bool {
+    let timeout = cx.background_executor().timer(PAGE_LOAD_TIMEOUT);
+    futures::select_biased! {
+        loaded = load.fuse() => loaded.is_ok(),
+        _ = timeout.fuse() => false,
+    }
+}
+
+#[derive(Clone)]
+struct BrowserOpen;
+
+/// Opens a web page in a browser tab in Bench, such as the app the worktree
+/// serves in development (`localhost:3000`). It reuses the tab you last
+/// opened unless `new_tab` is set. In a remote project, `localhost` is the
+/// remote host: its port is forwarded over the project's SSH connection. It
+/// waits up to 15 seconds for the page to load. The tab's engine is WebKit
+/// (Safari's).
+#[derive(Deserialize, JsonSchema)]
+struct BrowserOpenInput {
+    /// The page, such as `http://localhost:5173/login`. A bare host and port
+    /// such as `localhost:3000`, or just a port, is served over HTTP from
+    /// this machine (or the remote host, in a remote project).
+    url: String,
+    /// The worktree's directory, which picks the window the tab opens in.
+    /// Defaults to the worktree the caller is working in.
+    #[serde(default)]
+    worktree: Option<String>,
+    /// A tab to load the page in, rather than the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+    /// Open a new tab even if there is one to reuse.
+    #[serde(default)]
+    new_tab: bool,
+    /// Open a new tab in a split beside the active pane rather than in it.
+    #[serde(default)]
+    to_the_side: bool,
+}
+
+impl McpServerTool for BrowserOpen {
+    type Input = BrowserOpenInput;
+    type Output = BrowserPageOutput;
+
+    const NAME: &'static str = "browser_open";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let existing = cx.update(|cx| {
+            if input.tab.is_none() && input.new_tab {
+                return Ok(None);
+            }
+            match find_browser_tab(input.tab, &context, cx) {
+                Ok(browser) => Ok(Some(browser)),
+                Err(error) if input.tab.is_some() => Err(error),
+                Err(_) => Ok(None),
+            }
+        })?;
+        let browser = match existing {
+            Some(browser) => browser,
+            None => {
+                let directory = input
+                    .worktree
+                    .clone()
+                    .map(PathBuf::from)
+                    .or_else(|| context.client_directory.clone());
+                let (window, workspace) = cx.update(|cx| -> Result<_> {
+                    let workspace = match &directory {
+                        Some(directory) => workspace_for_directory(directory, cx)?,
+                        None => windows(cx)
+                            .first()
+                            .and_then(|window| window.read(cx).ok())
+                            .map(|multi_workspace| multi_workspace.workspace().clone())
+                            .context("No Bench window is open")?,
+                    };
+                    let window = window_for_workspace(&workspace, cx)?;
+                    Ok((window, workspace))
+                })?;
+                window.update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        let pane = workspace.active_pane().clone();
+                        let pane = if input.to_the_side {
+                            workspace.adjacent_pane_of(&pane, window, cx)
+                        } else {
+                            pane
+                        };
+                        BrowserView::open(workspace, pane, false, window, cx)
+                    })
+                })?
+            }
+        };
+        cx.update(|cx| {
+            cx.set_global(AgentBrowserTab(Some(browser.downgrade())));
+        });
+
+        let (navigation, load) = browser.update(cx, |browser, cx| {
+            (browser.navigate(&input.url, cx), browser.wait_for_load())
+        });
+        navigation.await?;
+        html_preview::reveal(&browser, cx).await.log_err();
+        let loaded = wait_for_page_load(load, cx).await;
+        respond(cx.update(|cx| browser_page_output(&browser, loaded, cx)))
+    }
+}
+
+#[derive(Clone)]
+struct BrowserNavigate;
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum BrowserNavigation {
+    Back,
+    Forward,
+    Reload,
+}
+
+/// Goes back or forward in a browser tab's history, or reloads its page, and
+/// waits up to 15 seconds for the page to load. Reloading picks up changes
+/// to the app when its dev server doesn't reload it itself.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserNavigateInput {
+    action: BrowserNavigation,
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+}
+
+impl McpServerTool for BrowserNavigate {
+    type Input = BrowserNavigateInput;
+    type Output = BrowserPageOutput;
+
+    const NAME: &'static str = "browser_navigate";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let (navigation, load) = browser.update(cx, |browser, cx| {
+            let load = browser.wait_for_load();
+            let navigation = match input.action {
+                BrowserNavigation::Back => Task::ready(browser.go_back(cx).map(|()| String::new())),
+                BrowserNavigation::Forward => {
+                    Task::ready(browser.go_forward(cx).map(|()| String::new()))
+                }
+                BrowserNavigation::Reload => browser.reload(cx),
+            };
+            (navigation, load)
+        });
+        navigation.await?;
+        let loaded = wait_for_page_load(load, cx).await;
+        respond(cx.update(|cx| browser_page_output(&browser, loaded, cx)))
+    }
+}
+
+#[derive(Clone)]
+struct BrowserScreenshot;
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserScreenshotOutput {
+    tab: u64,
+    url: String,
+    /// The image's size, which is the page's size in CSS pixels: a point in
+    /// the image is a point `browser_click` takes as `x` and `y`.
+    width: u32,
+    height: u32,
+}
+
+/// Captures what a browser tab shows, as a PNG the size of the page in CSS
+/// pixels. Brings the tab to the front of its pane if it isn't. Use it to
+/// check how the app looks, and with `browser_click` at `x`/`y` for apps
+/// such as Flutter's that draw to a canvas.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserScreenshotInput {
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+}
+
+impl McpServerTool for BrowserScreenshot {
+    type Input = BrowserScreenshotInput;
+    type Output = BrowserScreenshotOutput;
+
+    const NAME: &'static str = "browser_screenshot";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let screenshot = html_preview::screenshot(&browser, cx).await?;
+        let output = BrowserScreenshotOutput {
+            tab: browser.entity_id().as_u64(),
+            url: cx.update(|cx| browser.read(cx).url().to_string()),
+            width: screenshot.width,
+            height: screenshot.height,
+        };
+        Ok(ToolResponse {
+            content: vec![
+                ToolResponseContent::Image {
+                    data: base64::engine::general_purpose::STANDARD.encode(&screenshot.png),
+                    mime_type: "image/png".to_string(),
+                },
+                ToolResponseContent::Text {
+                    text: serde_json::to_string_pretty(&output)?,
+                },
+            ],
+            structured_content: output,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserSnapshot;
+
+#[derive(Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all(deserialize = "camelCase"))]
+struct BrowserSnapshotOutput {
+    #[serde(default)]
+    tab: u64,
+    url: String,
+    title: String,
+    /// Whether the page is a Flutter web app.
+    flutter: bool,
+    /// Whether this call turned on Flutter's semantics tree, which Flutter
+    /// only builds elements for once accessibility is on.
+    flutter_semantics_enabled: bool,
+    /// The page's elements, one per line, indented by nesting. Elements to
+    /// click or type into have a ref, such as `[ref=e3]`.
+    snapshot: String,
+}
+
+/// Lists the elements on a browser tab's page as an outline: links, buttons,
+/// fields, headings and text, with their state (`[checked]`, `[disabled]`,
+/// `value="…"`). Elements you can act on have a `ref` to pass to
+/// `browser_click` and `browser_type`. Refs stay the same for an element
+/// while it's on the page. For a Flutter app, this turns on Flutter's
+/// semantics tree so its widgets are listed; if they still aren't, use
+/// `browser_screenshot` and click by `x`/`y`.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserSnapshotInput {
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+}
+
+impl McpServerTool for BrowserSnapshot {
+    type Input = BrowserSnapshotInput;
+    type Output = BrowserSnapshotOutput;
+
+    const NAME: &'static str = "browser_snapshot";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let value =
+            html_preview::run_script(&browser, "return await window.__bench.snapshot();", cx)
+                .await?;
+        let mut output: BrowserSnapshotOutput =
+            serde_json::from_value(value).context("reading the page's snapshot")?;
+        output.tab = browser.entity_id().as_u64();
+        let mut text = format!(
+            "Tab {}: {}\nURL: {}\n",
+            output.tab, output.title, output.url
+        );
+        if output.flutter {
+            text.push_str(if output.flutter_semantics_enabled {
+                "Flutter app: turned on its semantics tree for this snapshot.\n"
+            } else {
+                "Flutter app.\n"
+            });
+        }
+        text.push('\n');
+        text.push_str(&output.snapshot);
+        Ok(ToolResponse {
+            content: vec![ToolResponseContent::Text { text }],
+            structured_content: output,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserClick;
+
+/// Clicks in a browser tab's page with real mouse events, as a person would:
+/// an element by its `ref` from `browser_snapshot` or a CSS `selector`
+/// (scrolled into view, then clicked at its center), or a point `x`, `y` in
+/// CSS pixels from the page's top left, as measured on `browser_screenshot`.
+/// Brings the tab to the front of its pane if it isn't. Clicking a text field
+/// gives the page the keyboard, as a person's click would; other clicks
+/// leave the keyboard where it was.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserClickInput {
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+    /// An element's ref from `browser_snapshot`, such as `e3`.
+    #[serde(default, rename = "ref")]
+    element_ref: Option<String>,
+    /// A CSS selector for the element, such as `button[type=submit]`. It
+    /// looks inside open shadow roots too.
+    #[serde(default)]
+    selector: Option<String>,
+    /// A point to click, from the page's left edge, in CSS pixels.
+    #[serde(default)]
+    x: Option<f32>,
+    /// A point to click, from the page's top edge, in CSS pixels.
+    #[serde(default)]
+    y: Option<f32>,
+    /// Double-click instead.
+    #[serde(default)]
+    double_click: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserClickOutput {
+    tab: u64,
+    #[serde(flatten)]
+    outcome: ClickOutcome,
+}
+
+/// The element a tool acts on, as the page script takes it.
+fn element_target(
+    element_ref: Option<String>,
+    selector: Option<String>,
+) -> Option<serde_json::Value> {
+    match (element_ref, selector) {
+        (Some(element_ref), _) => Some(serde_json::json!({ "ref": element_ref })),
+        (None, Some(selector)) => Some(serde_json::json!({ "selector": selector })),
+        (None, None) => None,
+    }
+}
+
+impl McpServerTool for BrowserClick {
+    type Input = BrowserClickInput;
+    type Output = BrowserClickOutput;
+
+    const NAME: &'static str = "browser_click";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let target = match (
+            element_target(input.element_ref, input.selector),
+            input.x,
+            input.y,
+        ) {
+            (Some(element), _, _) => ClickTarget::Element(element),
+            (None, Some(x), Some(y)) => ClickTarget::Point(gpui::point(gpui::px(x), gpui::px(y))),
+            _ => anyhow::bail!("Pass `ref`, `selector`, or both `x` and `y`"),
+        };
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let click_count = if input.double_click { 2 } else { 1 };
+        let outcome = html_preview::click(&browser, target, click_count, cx).await?;
+        respond(BrowserClickOutput {
+            tab: browser.entity_id().as_u64(),
+            outcome,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserType;
+
+/// Types text into a text field in a browser tab's page, the way pasting it
+/// would: the page sees the input events a person's typing makes. Pass the
+/// field's `ref` or `selector` to click it first, or leave both out to type
+/// into the field that has focus.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserTypeInput {
+    text: String,
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+    /// The field's ref from `browser_snapshot`.
+    #[serde(default, rename = "ref")]
+    element_ref: Option<String>,
+    /// A CSS selector for the field.
+    #[serde(default)]
+    selector: Option<String>,
+    /// Replace the field's text instead of adding to it.
+    #[serde(default)]
+    clear: bool,
+    /// Press Enter afterwards, as to submit a form.
+    #[serde(default)]
+    submit: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserTypeOutput {
+    tab: u64,
+    #[serde(flatten)]
+    outcome: TypeOutcome,
+}
+
+impl McpServerTool for BrowserType {
+    type Input = BrowserTypeInput;
+    type Output = BrowserTypeOutput;
+
+    const NAME: &'static str = "browser_type";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let target = element_target(input.element_ref, input.selector);
+        let outcome =
+            html_preview::type_text(&browser, target, &input.text, input.clear, input.submit, cx)
+                .await?;
+        respond(BrowserTypeOutput {
+            tab: browser.entity_id().as_u64(),
+            outcome,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserPressKey;
+
+/// Presses a key in a browser tab's page with a real key event, such as
+/// `Enter`, `Tab`, `Escape`, `Backspace`, `ArrowDown` or `a`, optionally
+/// with modifiers: `Shift+Tab`, `Meta+a`, `Control+Enter`, `Alt+ArrowLeft`.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserPressKeyInput {
+    key: String,
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserTabOutput {
+    tab: u64,
+}
+
+impl McpServerTool for BrowserPressKey {
+    type Input = BrowserPressKeyInput;
+    type Output = BrowserTabOutput;
+
+    const NAME: &'static str = "browser_press_key";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        html_preview::press_key(&browser, &input.key, cx).await?;
+        respond(BrowserTabOutput {
+            tab: browser.entity_id().as_u64(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserEval;
+
+/// Runs JavaScript in a browser tab's page and returns its result as JSON.
+/// The script is the body of an async function: `return` a value to get it
+/// back, and `await` freely, as in `return document.title` or
+/// `await fetch('/api/me').then(r => r.json())`. It runs alongside the
+/// page's own scripts, with its globals. Gives up after 30 seconds.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserEvalInput {
+    script: String,
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserEvalOutput {
+    tab: u64,
+    /// What the script returned, or `null` when it returned nothing or
+    /// something JSON can't express.
+    result: serde_json::Value,
+}
+
+impl McpServerTool for BrowserEval {
+    type Input = BrowserEvalInput;
+    type Output = BrowserEvalOutput;
+
+    const NAME: &'static str = "browser_eval";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let result = html_preview::run_script(&browser, &input.script, cx).await?;
+        respond(BrowserEvalOutput {
+            tab: browser.entity_id().as_u64(),
+            result,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct BrowserConsoleLogs;
+
+/// Reads what a browser tab's page logged: console messages, uncaught errors
+/// and unhandled promise rejections, failed requests (`network`: HTTP errors
+/// and requests that didn't complete) and page loads (`navigation`). The tab
+/// keeps its last 1000 entries, across reloads. Pass the `last_id` from one
+/// call as `after` in the next to get only what's new.
+#[derive(Deserialize, JsonSchema)]
+struct BrowserConsoleLogsInput {
+    /// The tab. Defaults to the one you last opened.
+    #[serde(default)]
+    tab: Option<u64>,
+    /// Only entries after this id.
+    #[serde(default)]
+    after: Option<u64>,
+    /// Only entries at these levels: `log`, `info`, `warn`, `error`,
+    /// `debug`, `network` or `navigation`.
+    #[serde(default)]
+    levels: Option<Vec<String>>,
+    /// Clear the tab's entries after reading them.
+    #[serde(default)]
+    clear: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BrowserConsoleLogsOutput {
+    tab: u64,
+    entries: Vec<ConsoleEntry>,
+    /// The id of the last entry the tab has, to pass as `after` next time.
+    last_id: u64,
+}
+
+impl McpServerTool for BrowserConsoleLogs {
+    type Input = BrowserConsoleLogsInput;
+    type Output = BrowserConsoleLogsOutput;
+
+    const NAME: &'static str = "browser_console_logs";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let browser = cx.update(|cx| find_browser_tab(input.tab, &context, cx))?;
+        let (all_entries, last_id) = browser.update(cx, |browser, _| {
+            let entries = browser.console_entries(input.after.unwrap_or(0));
+            if input.clear {
+                browser.clear_console();
+            }
+            (entries, browser.last_console_id())
+        });
+        let entries = all_entries
+            .into_iter()
+            .filter(|entry| {
+                input
+                    .levels
+                    .as_ref()
+                    .is_none_or(|levels| levels.contains(&entry.level))
+            })
+            .collect();
+        respond(BrowserConsoleLogsOutput {
+            tab: browser.entity_id().as_u64(),
+            entries,
+            last_id,
+        })
+    }
 }
