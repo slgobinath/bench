@@ -601,8 +601,7 @@ impl Project {
                             .iter()
                             .filter_map(|terminal| terminal.upgrade())
                             .filter_map(|terminal| {
-                                let session_id =
-                                    terminal.read(cx).persistent_session()?.id.clone();
+                                let session_id = terminal.read(cx).persistent_session()?.id.clone();
                                 Some((session_id, terminal))
                             })
                             .collect::<Vec<_>>()
@@ -682,16 +681,83 @@ impl Project {
         let Some(remote_client) = self.remote_client.as_ref() else {
             return Task::ready(Ok(()));
         };
-        let request = remote_client
-            .read(cx)
-            .proto_client()
-            .request(proto::EndTerminalSessionsInside {
-                project_id: proto::REMOTE_SERVER_PROJECT_ID,
-                root: root.to_string_lossy().into_owned(),
-            });
+        let request =
+            remote_client
+                .read(cx)
+                .proto_client()
+                .request(proto::EndTerminalSessionsInside {
+                    project_id: proto::REMOTE_SERVER_PROJECT_ID,
+                    root: root.to_string_lossy().into_owned(),
+                });
         cx.background_spawn(async move {
             request.await?;
             Ok(())
+        })
+    }
+
+    /// Writes `bytes` to a new file named `file_name` on this project's host,
+    /// and gives back that file's path there.
+    pub fn upload_pasted_file_to_remote_host(
+        &self,
+        bytes: Vec<u8>,
+        file_name: String,
+        cx: &App,
+    ) -> Task<Result<String>> {
+        let Some(remote_client) = self.remote_client.as_ref() else {
+            return Task::ready(Err(anyhow::anyhow!("this project has no remote host")));
+        };
+        // Files a day old were pasted into sessions that have long since read
+        // them, so they are cleared away rather than left to pile up.
+        let script = r#"dir="$HOME/.bench/pasted"
+mkdir -p "$dir" || exit 1
+find "$dir" -type f -mtime +0 -exec rm -f {} + 2>/dev/null
+cat > "$dir/$1" && printf '%s' "$dir/$1""#;
+        let arguments = [
+            "-c".to_owned(),
+            script.to_owned(),
+            "sh".to_owned(),
+            file_name,
+        ];
+        let template = remote_client.read(cx).build_command(
+            Some("sh".to_owned()),
+            &arguments,
+            &HashMap::default(),
+            None,
+            None,
+            Interactive::No,
+        );
+        cx.background_spawn(async move {
+            use futures::AsyncWriteExt as _;
+
+            let template = template?;
+            let mut command = util::command::new_command(template.program);
+            command
+                .args(template.args)
+                .envs(template.env)
+                .stdin(util::command::Stdio::piped())
+                .stdout(util::command::Stdio::piped())
+                .stderr(util::command::Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = command.spawn().context("starting the upload to the host")?;
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("no input to the upload command")?;
+            stdin.write_all(&bytes).await?;
+            stdin.close().await?;
+            drop(stdin);
+            let output = child.output().await?;
+            anyhow::ensure!(
+                output.status.success(),
+                "copying the file to the host failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            let path = String::from_utf8(output.stdout)?;
+            anyhow::ensure!(
+                !path.is_empty(),
+                "the host did not report where it saved the file"
+            );
+            Ok(path)
         })
     }
 
@@ -868,11 +934,13 @@ fn create_persistent_remote_shell(
             args.extend([shell, "-l".to_string()]);
         }
     }
-    let Some(command) = remote_client.read(cx).build_remote_server_terminal_command(
-        &args,
-        &env,
-        working_directory.map(|path| path.display().to_string()),
-    )?
+    let Some(command) = remote_client
+        .read(cx)
+        .build_remote_server_terminal_command(
+            &args,
+            &env,
+            working_directory.map(|path| path.display().to_string()),
+        )?
     else {
         return Ok(None);
     };

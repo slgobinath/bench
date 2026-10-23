@@ -5,7 +5,9 @@ use anyhow::{Context as _, Result};
 use futures::{StreamExt as _, stream};
 use gpui::{AppContext as _, AsyncApp, Context, Entity, Task};
 use itertools::Itertools as _;
-use language::proto::{deserialize_anchor, deserialize_version, serialize_anchor, serialize_version};
+use language::proto::{
+    deserialize_anchor, deserialize_version, serialize_anchor, serialize_version,
+};
 use language::{Buffer, File as _, SymbolKind, point_to_lsp};
 use lsp::{LanguageServer, LanguageServerName};
 use rpc::{TypedEnvelope, proto};
@@ -117,7 +119,10 @@ impl LspStore {
             let request = proto::GetInheritanceFlags {
                 project_id,
                 buffer_id: buffer.read(cx).remote_id().into(),
-                queries: queries.into_iter().map(InheritanceQuery::to_proto).collect(),
+                queries: queries
+                    .into_iter()
+                    .map(InheritanceQuery::to_proto)
+                    .collect(),
                 version: serialize_version(&buffer.read(cx).version()),
             };
             return cx.background_spawn(async move {
@@ -145,7 +150,12 @@ impl LspStore {
         let snapshot = buffer.read(cx).snapshot();
         let positions = queries
             .into_iter()
-            .map(|query| (point_to_lsp(query.position.to_point_utf16(&snapshot)), query.kind))
+            .map(|query| {
+                (
+                    point_to_lsp(query.position.to_point_utf16(&snapshot)),
+                    query.kind,
+                )
+            })
             .collect::<Vec<_>>();
         cx.background_spawn(async move {
             let flags = stream::iter(positions)
@@ -353,7 +363,10 @@ async fn query_flags(
     flags
 }
 
-fn text_document_position(target: &LocalTarget, position: lsp::Position) -> lsp::TextDocumentPositionParams {
+fn text_document_position(
+    target: &LocalTarget,
+    position: lsp::Position,
+) -> lsp::TextDocumentPositionParams {
     lsp::TextDocumentPositionParams {
         text_document: lsp::TextDocumentIdentifier {
             uri: target.uri.clone(),
@@ -367,13 +380,14 @@ async fn children_locations(
     target: &LocalTarget,
     position: lsp::Position,
 ) -> Result<Vec<lsp::Location>> {
-    let supports_implementations = server
-        .capabilities()
-        .implementation_provider
-        .is_some_and(|capability| match capability {
-            lsp::ImplementationProviderCapability::Simple(supported) => supported,
-            lsp::ImplementationProviderCapability::Options(_) => true,
-        });
+    let supports_implementations =
+        server
+            .capabilities()
+            .implementation_provider
+            .is_some_and(|capability| match capability {
+                lsp::ImplementationProviderCapability::Simple(supported) => supported,
+                lsp::ImplementationProviderCapability::Options(_) => true,
+            });
     if !supports_implementations {
         return Ok(Vec::new());
     }

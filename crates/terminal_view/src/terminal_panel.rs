@@ -1283,9 +1283,7 @@ fn terminal_views_in_pane(
     pane.read(cx)
         .items()
         .enumerate()
-        .filter_map(|(index, item)| {
-            Some((index, pane.clone(), item.act_as::<TerminalView>(cx)?))
-        })
+        .filter_map(|(index, item)| Some((index, pane.clone(), item.act_as::<TerminalView>(cx)?)))
         .collect()
 }
 

@@ -12,9 +12,9 @@ use editor::{
 };
 use gpui::{
     Action, AnyElement, App, ClipboardEntry, Corners, DismissEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, Font, KeyContext, KeyDownEvent, Keystroke, MouseButton,
-    MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, ScrollEvent, Styled, Subscription,
-    Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
+    ExternalPaths, FocusHandle, Focusable, Font, Image, KeyContext, KeyDownEvent, Keystroke,
+    MouseButton, MouseDownEvent, Pixels, Point as GpuiPoint, Rems, Render, ScrollEvent, Styled,
+    Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
 use persistence::TerminalDb;
@@ -57,6 +57,7 @@ use workspace::{
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    notifications::NotifyTaskExt,
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -133,9 +134,7 @@ fn end_orphaned_sessions(cx: &mut App) {
             .timer(Duration::from_secs(30))
             .await;
         cx.background_spawn(async move {
-            let started_at = started_at
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs();
+            let started_at = started_at.duration_since(std::time::UNIX_EPOCH)?.as_secs();
             let saved = db
                 .get_all_session_ids()?
                 .into_iter()
@@ -717,12 +716,10 @@ impl TerminalView {
                 .when(
                     assistant_enabled && !matches!(self.mode, TerminalMode::Embedded { .. }),
                     |menu| {
-                        menu.separator().when(
-                            has_selection && self.shows_workspace_actions(),
-                            |menu| {
+                        menu.separator()
+                            .when(has_selection && self.shows_workspace_actions(), |menu| {
                                 menu.action("Send to Agent", Box::new(SendSelection))
-                            },
-                        )
+                            })
                     },
                 )
                 .when(self.shows_workspace_actions(), |menu| {
@@ -1090,7 +1087,11 @@ impl TerminalView {
 
         match clipboard.entries().first() {
             Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
-                self.forward_ctrl_v(cx);
+                if self.terminal.read(cx).is_remote_terminal() {
+                    self.paste_image_on_remote_host(image, window, cx);
+                } else {
+                    self.forward_ctrl_v(cx);
+                }
             }
             Some(ClipboardEntry::ExternalPaths(paths)) => {
                 self.add_paths_to_terminal(paths.paths(), window, cx);
@@ -1137,6 +1138,34 @@ impl TerminalView {
         self.terminal.update(cx, |term, _| {
             term.input(vec![0x16]);
         });
+    }
+
+    /// A TUI agent on an SSH host cannot read this machine's clipboard, so the
+    /// image is copied to the host and its path there is pasted instead, which
+    /// agents such as Claude Code attach just as they would a pasted image.
+    fn paste_image_on_remote_host(
+        &self,
+        image: &Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let file_name = format!("pasted-{:016x}.{}", image.id(), image.format.extension());
+        let upload =
+            project
+                .read(cx)
+                .upload_pasted_file_to_remote_host(image.bytes.clone(), file_name, cx);
+        let terminal = self.terminal.downgrade();
+        cx.spawn(async move |_, cx| {
+            let path = upload
+                .await
+                .context("pasting the image on the remote host")?;
+            let text = format!("{} ", shlex::try_quote(&path)?);
+            terminal.update(cx, |terminal, _| terminal.paste(&text))
+        })
+        .detach_and_notify_err(self.workspace.clone(), window, cx);
     }
 
     pub fn add_paths_to_terminal(&self, paths: &[PathBuf], window: &mut Window, cx: &mut App) {
@@ -2201,10 +2230,7 @@ impl SerializableItem for TerminalView {
                         .log_err()
                         .flatten()
                         .filter(|title| !title.trim().is_empty());
-                    let session_id = db
-                        .get_session_id(item_id, workspace_id)
-                        .log_err()
-                        .flatten();
+                    let session_id = db.get_session_id(item_id, workspace_id).log_err().flatten();
                     (cwd, custom_title, session_id)
                 })
                 .ok()

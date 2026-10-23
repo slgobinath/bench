@@ -37,7 +37,16 @@ pub async fn listening_ports(shells: Vec<(u32, PathBuf)>) -> Result<Vec<Listenin
     // `lsof` exits 1 when nothing matches, which is an answer and not an
     // error, so only a failure to run it is one.
     let output = util::command::new_command("lsof")
-        .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN", "-F", "pcn", "-p", &pids])
+        .args([
+            "-nP",
+            "-a",
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-F",
+            "pcn",
+            "-p",
+            &pids,
+        ])
         .output()
         .await
         .context("running lsof")?;
@@ -204,7 +213,11 @@ mod tests {
         assert_eq!(
             ports
                 .iter()
-                .map(|port| (port.port, port.command.as_str(), port.directory.to_str().unwrap()))
+                .map(|port| (
+                    port.port,
+                    port.command.as_str(),
+                    port.directory.to_str().unwrap()
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 (3000, "node", "/work/a"),
@@ -223,7 +236,10 @@ mod tests {
     )]
     fn finds_a_port_listened_on_below_the_shell() {
         let mut shell = std::process::Command::new("sh")
-            .args(["-c", "python3 -m http.server 0 --bind 127.0.0.1 >/dev/null 2>&1 & wait"])
+            .args([
+                "-c",
+                "python3 -m http.server 0 --bind 127.0.0.1 >/dev/null 2>&1 & wait",
+            ])
             .spawn()
             .expect("starting a shell");
         let directory = PathBuf::from("/work/dev");
@@ -231,8 +247,9 @@ mod tests {
         let mut found = Vec::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            found = futures::executor::block_on(listening_ports(vec![(shell.id(), directory.clone())]))
-                .expect("scanning");
+            found =
+                futures::executor::block_on(listening_ports(vec![(shell.id(), directory.clone())]))
+                    .expect("scanning");
             if !found.is_empty() {
                 break;
             }

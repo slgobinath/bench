@@ -201,7 +201,9 @@ impl PtyProcessInfo {
 
     fn load(&self) -> Option<ProcessInfo> {
         let process = self.refresh()?;
-        let shell_pid = self.session_leader.unwrap_or(self.pid_getter.fallback_pid());
+        let shell_pid = self
+            .session_leader
+            .unwrap_or(self.pid_getter.fallback_pid());
         let is_shell = process.pid() == shell_pid;
         let cwd = process.cwd().map_or(PathBuf::new(), |p| p.to_owned());
 

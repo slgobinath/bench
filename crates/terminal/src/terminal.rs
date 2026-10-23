@@ -1,13 +1,13 @@
 mod mappings;
 
 mod alacritty;
-mod pty_info;
 mod ports;
+mod pty_info;
 pub mod terminal_settings;
 pub use ports::{ListeningPort, listening_ports};
-pub use pty_info::{SessionForeground, end_sessions_inside, session_foreground};
 #[cfg(unix)]
 pub use pty_info::end_sessions_inside_socket;
+pub use pty_info::{SessionForeground, end_sessions_inside, session_foreground};
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -1290,9 +1290,7 @@ impl TerminalBuilder {
             let attach_command = local_session
                 .as_ref()
                 .map(|(_, attach_command)| attach_command.clone());
-            let persistent_session = local_session
-                .map(|(session, _)| session)
-                .or(remote_session);
+            let persistent_session = local_session.map(|(session, _)| session).or(remote_session);
             // A reattached shell already ran its activation script.
             let activation_script = if persistent_session
                 .as_ref()
@@ -3111,7 +3109,9 @@ impl Terminal {
             return None;
         }
         match &self.terminal_type {
-            TerminalType::Pty { info, .. } => info.current.read().as_ref().map(|process| process.pid),
+            TerminalType::Pty { info, .. } => {
+                info.current.read().as_ref().map(|process| process.pid)
+            }
             TerminalType::DisplayOnly => None,
         }
     }
@@ -3339,7 +3339,9 @@ impl Terminal {
         match self.persistent_session() {
             Some(session) => session.leader_pid,
             None if self.is_remote_terminal => None,
-            None => self.pid_getter().map(|pid_getter| pid_getter.fallback_pid().as_u32()),
+            None => self
+                .pid_getter()
+                .map(|pid_getter| pid_getter.fallback_pid().as_u32()),
         }
     }
 
@@ -3446,6 +3448,11 @@ impl Terminal {
 
     pub fn vi_mode_enabled(&self) -> bool {
         self.vi_mode_enabled
+    }
+
+    /// Whether this terminal's shell runs on the project's remote host.
+    pub fn is_remote_terminal(&self) -> bool {
+        self.is_remote_terminal
     }
 
     pub fn clone_builder(&self, cx: &App, cwd: Option<PathBuf>) -> Task<Result<TerminalBuilder>> {

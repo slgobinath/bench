@@ -1563,18 +1563,19 @@ async fn test_a_manifest_that_arrives_after_the_lookup_reroots_the_server(
     );
     language_registry.add(python_lang(fs.clone()));
 
-    let roots_of = |project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut gpui::TestAppContext| {
-        project.update(cx, |project, cx| {
-            project.lsp_store().update(cx, |lsp_store, cx| {
-                buffer.update(cx, |buffer, cx| {
-                    lsp_store
-                        .running_language_servers_for_local_buffer(buffer, cx)
-                        .flat_map(|(_, server)| server.workspace_folders())
-                        .collect::<BTreeSet<_>>()
+    let roots_of =
+        |project: &Entity<Project>, buffer: &Entity<Buffer>, cx: &mut gpui::TestAppContext| {
+            project.update(cx, |project, cx| {
+                project.lsp_store().update(cx, |lsp_store, cx| {
+                    buffer.update(cx, |buffer, cx| {
+                        lsp_store
+                            .running_language_servers_for_local_buffer(buffer, cx)
+                            .flat_map(|(_, server)| server.workspace_folders())
+                            .collect::<BTreeSet<_>>()
+                    })
                 })
             })
-        })
-    };
+        };
 
     let (buffer, handle) = project
         .update(cx, |project, cx| {
