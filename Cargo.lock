@@ -459,6 +459,7 @@ dependencies = [
  "log",
  "paths",
  "project",
+ "remote",
  "serde",
  "serde_json",
  "settings",
@@ -469,6 +470,7 @@ dependencies = [
  "theme_settings",
  "time",
  "ui",
+ "util",
  "workspace",
 ]
 

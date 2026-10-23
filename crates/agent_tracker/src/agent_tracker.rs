@@ -56,7 +56,7 @@ pub use activity::{
 pub use claude_model::{ClaudeModel, ModelFamily};
 pub use ports_button::PortsButton;
 pub use terminal::ListeningPort;
-pub use claude_usage::{ClaudeUsage, ClaudeUsageButton};
+pub use claude_usage::{ClaudeUsage, ClaudeUsageButton, HostUsage};
 pub use keep_awake_button::{
     InstallClaudeHooks, KeepAwakeButton, ToggleKeepAwake, agent_state_color,
 };
@@ -325,6 +325,10 @@ pub struct AgentTracker {
     /// has.
     claude_usage_modified: Option<std::time::SystemTime>,
     claude_status_line_installed: bool,
+    /// The same for each remote host the windows' projects are on; see
+    /// [`claude_usage`].
+    host_claude_usage: HashMap<remote::RemoteConnectionIdentity, claude_usage::HostUsage>,
+    _host_claude_usage_poll: Task<()>,
     _sweep: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
@@ -379,6 +383,21 @@ impl AgentTracker {
             claude_usage: None,
             claude_usage_modified: None,
             claude_status_line_installed: false,
+            host_claude_usage: HashMap::new(),
+            _host_claude_usage_poll: cx.spawn(async move |this, cx| {
+                let mut syncs: u32 = 0;
+                loop {
+                    cx.background_executor().timer(claude_usage::HOST_SYNC).await;
+                    syncs = syncs.wrapping_add(1);
+                    let read_all = syncs.is_multiple_of(claude_usage::HOST_READ_EVERY);
+                    if this
+                        .update(cx, |this, cx| this.sync_hosts(read_all, cx))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }),
             _sweep: cx.spawn(async move |this, cx| {
                 let installed = cx.background_spawn(async { claude_usage::installed() }).await;
                 if this

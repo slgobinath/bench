@@ -183,6 +183,17 @@ struct RepositoryRow {
     worktrees: Vec<WorktreeRow>,
 }
 
+impl RepositoryRow {
+    /// The repository's own checkout, which is the one worktree every project
+    /// has for as long as it is a project.
+    fn main_root(&self) -> Option<PathBuf> {
+        self.worktrees
+            .iter()
+            .find(|worktree| worktree.is_main)
+            .and_then(|worktree| worktree.root.clone())
+    }
+}
+
 /// A project as [`WorktreePanel::projects`] reports it.
 pub struct ProjectListing {
     pub name: SharedString,
@@ -1209,6 +1220,45 @@ impl WorktreePanel {
         });
     }
 
+    /// Opens the worktree `directory` is in, when the window does not have it
+    /// open, and dispatches `then` in it once it is showing. Whether there
+    /// was one to open: a directory in no worktree the panel lists, or in one
+    /// already open, is left to the caller.
+    pub(crate) fn open_worktree_containing(
+        &mut self,
+        directory: &Path,
+        then: Box<dyn gpui::Action>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // The longest root, so a directory in a worktree nested in its
+        // checkout opens the worktree.
+        let worktree = self
+            .tree(cx)
+            .into_iter()
+            .flat_map(|repository| repository.worktrees)
+            .filter(|worktree| {
+                worktree
+                    .root
+                    .as_ref()
+                    .is_some_and(|root| directory.starts_with(root))
+            })
+            .max_by_key(|worktree| {
+                worktree
+                    .root
+                    .as_ref()
+                    .map_or(0, |root| root.as_os_str().len())
+            });
+        let Some(worktree) = worktree.filter(|worktree| worktree.workspace.is_none()) else {
+            return false;
+        };
+        let Some(root) = worktree.root else {
+            return false;
+        };
+        self.open_worktree(worktree.key, root, worktree.name, Some(then), window, cx);
+        true
+    }
+
     /// Adds a project to the window: asks for folders, then opens them.
     ///
     /// A project, not a worktree — the panel groups by repository, so this is
@@ -1585,6 +1635,7 @@ impl WorktreePanel {
                     .zip(store.as_ref())
                     .and_then(|(root, store)| store.read(cx).get(&root, cx).linear_team)
                     .is_some_and(|team| team.id == issue.team.id.as_ref());
+                let icon = stored_project_icon(row.main_root().as_deref(), cx);
                 let open = row
                     .worktrees
                     .iter()
@@ -1593,6 +1644,7 @@ impl WorktreePanel {
                 (
                     ProjectTarget {
                         name: row.name,
+                        icon,
                         open,
                         key: row.key,
                     },
@@ -2583,18 +2635,8 @@ impl WorktreePanel {
         let add_key = row.key.clone();
 
         let remove_key = row.key.clone();
-        // The icon is kept with the repository's own checkout, which is the
-        // one worktree every project has for as long as it is a project.
-        let main_root = row
-            .worktrees
-            .iter()
-            .find(|worktree| worktree.is_main)
-            .and_then(|worktree| worktree.root.clone());
-        let stored_icon = main_root.as_deref().and_then(|root| {
-            WorktreeMetadataStore::try_global(cx)
-                .and_then(|store| store.read(cx).get(root, cx).icon)
-        });
-        let icon = project_icon(stored_icon.as_deref());
+        let main_root = row.main_root();
+        let icon = stored_project_icon(main_root.as_deref(), cx);
 
         ListItem::new(("repository", index))
             .spacing(ListItemSpacing::Sparse)
@@ -3267,6 +3309,13 @@ fn project_icon(stored: Option<&str>) -> IconName {
     stored
         .and_then(|name| name.parse::<IconName>().ok())
         .unwrap_or(IconName::Folder)
+}
+
+fn stored_project_icon(main_root: Option<&Path>, cx: &App) -> IconName {
+    let stored = main_root.and_then(|root| {
+        WorktreeMetadataStore::try_global(cx).and_then(|store| store.read(cx).get(root, cx).icon)
+    });
+    project_icon(stored.as_deref())
 }
 
 /// That something other than an agent is running in one of the worktree's
@@ -4146,6 +4195,7 @@ impl Render for DeleteWorktree {
 /// A project a worktree can be made in, for [`ChooseProject`].
 struct ProjectTarget {
     name: SharedString,
+    icon: IconName,
     /// A workspace showing the project and its repository, which only an open
     /// project has; see [`WorktreePanel::add_worktree_to_closed_project`] for
     /// the rest.
@@ -4246,11 +4296,29 @@ impl Render for ChooseProject {
                     .spacing(ListItemSpacing::Sparse)
                     .toggle_state(index == self.selected)
                     .start_slot(
-                        Icon::new(IconName::Folder)
+                        Icon::new(target.icon)
                             .size(IconSize::Small)
                             .color(Color::Muted),
                     )
-                    .child(Label::new(target.name.clone()))
+                    .child(Label::new(target.name.clone()).single_line().truncate())
+                    // The same project is often both a local checkout and one
+                    // on an SSH host, under the same name.
+                    .when_some(target.key.host(), |this, host| {
+                        this.end_slot(
+                            h_flex()
+                                .gap_1()
+                                .child(
+                                    Icon::new(IconName::Server)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(host.display_name())
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.choose_index(index, window, cx);
                     }))
@@ -5455,17 +5523,6 @@ impl Render for WorktreePanel {
                             .child(self.filter.render(window, cx)),
                     )
                     .child(
-                        IconButton::new("open-agent-board", IconName::ZedAgent)
-                            .icon_size(IconSize::Small)
-                            .tooltip(Tooltip::for_action_title(
-                                "Agent Board",
-                                &agent_board::OpenAgentBoard,
-                            ))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(agent_board::OpenAgentBoard), cx);
-                            }),
-                    )
-                    .child(
                         IconButton::new("add-project", IconName::FolderAdd)
                             .icon_size(IconSize::Small)
                             .tooltip(Tooltip::text("Add Project"))
@@ -5669,7 +5726,7 @@ impl Panel for WorktreePanel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use serde_json::json;
@@ -5720,7 +5777,7 @@ mod tests {
     /// A window with `count` worktrees open, each workspace carrying its own
     /// `WorktreePanel` in an open left dock — which is what the panel's docked
     /// behaviour needs in order to be exercised at all.
-    async fn worktree_panels(
+    pub(crate) async fn worktree_panels(
         cx: &mut TestAppContext,
         count: usize,
     ) -> (
@@ -7326,7 +7383,7 @@ mod tests {
         }
     }
 
-    fn worktree(path: &str, branch: &str, is_main: bool) -> GitWorktree {
+    pub(crate) fn worktree(path: &str, branch: &str, is_main: bool) -> GitWorktree {
         GitWorktree {
             path: PathBuf::from(path),
             ref_name: Some(format!("refs/heads/{branch}").into()),

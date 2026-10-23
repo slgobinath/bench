@@ -631,7 +631,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         // Bench: the ports the programs in this worktree's terminals listen on.
         let listening_ports = cx.new(|cx| agent_tracker::PortsButton::new(workspace, cx));
         // Bench: how much of the Claude plan is used, as Claude Code reports it.
-        let claude_usage = cx.new(agent_tracker::ClaudeUsageButton::new);
+        let claude_usage =
+            cx.new(|cx| agent_tracker::ClaudeUsageButton::new(workspace.weak_handle(), cx));
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
@@ -797,6 +798,8 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
+        let agent_board_panel =
+            worktree_panel::agent_board::AgentBoardPanel::load(workspace_handle.clone(), cx.clone());
         let linear_panel = LinearPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
         let comments_panel =
@@ -826,6 +829,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(agent_board_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(linear_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(comments_panel, workspace_handle.clone(), cx.clone()),

@@ -16,9 +16,11 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 gpui.workspace = true
+util.workspace = true
 log.workspace = true
 paths.workspace = true
 project.workspace = true
+remote.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
