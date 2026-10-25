@@ -40,7 +40,7 @@ mod ports_button;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Global, SharedString,
@@ -925,6 +925,53 @@ impl AgentTracker {
             }
         }
         commands
+    }
+
+    /// When an agent inside `directory` last did anything, or `None` where
+    /// there is no agent.
+    ///
+    /// The transcript's modification time where there is one: it moves when
+    /// the agent works and stays put while it sits at its prompt, whereas a
+    /// terminal's output also moves on a redraw. An agent with no transcript
+    /// has only its output to go by.
+    pub fn last_active_for(&self, directory: &Path) -> Option<SystemTime> {
+        let watched = self
+            .watched
+            .values()
+            .filter(|watched| {
+                watched.command.is_some()
+                    && watched
+                        .directory
+                        .as_deref()
+                        .is_some_and(|agent_directory| agent_directory.starts_with(directory))
+            })
+            .map(|watched| match &watched.model {
+                Some(probe) => probe.modified(),
+                None => SystemTime::now()
+                    .checked_sub(watched.last_output.elapsed())
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            });
+        let detached = self
+            .detached
+            .iter()
+            .filter(|detached| detached.directory.starts_with(directory))
+            .filter_map(|detached| Some(detached.model.as_ref()?.modified()));
+        watched.chain(detached).max()
+    }
+
+    /// The phase of the agent inside `directory` that wants you most, when
+    /// its transcript has said what it is doing.
+    pub fn phase_for(&self, directory: &Path) -> Option<Phase> {
+        self.agents()
+            .into_iter()
+            .filter(|agent| {
+                agent
+                    .directory
+                    .is_some_and(|agent_directory| agent_directory.starts_with(directory))
+            })
+            .filter_map(|agent| Some((agent.state, agent.activity?.phase()?.0)))
+            .max_by_key(|(state, _)| *state)
+            .map(|(_, phase)| phase)
     }
 
     /// The model the agent in one terminal is using, if it has one and it is

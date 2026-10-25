@@ -167,6 +167,12 @@ impl Probe {
         &self.path
     }
 
+    /// When the transcript last changed, which is when the session last did
+    /// anything.
+    pub fn modified(&self) -> SystemTime {
+        self.modified
+    }
+
     /// The session the transcript belongs to, which Claude Code names it
     /// after. A guess when the probe fell back to the newest transcript in a
     /// directory.

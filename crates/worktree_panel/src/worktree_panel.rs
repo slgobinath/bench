@@ -34,11 +34,11 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context as _, Result, anyhow};
 use git::repository::{CreateWorktreeTarget, GitRepository, Worktree as GitWorktree};
 use agent_tracker::{
-    AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, agent_state_color,
+    AgentState, AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, Phase, agent_state_color,
 };
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
-use linear::{Issue, Linear, LinearEvent};
+use linear::{Issue, Linear, LinearEvent, StateType};
 use worktree_metadata::{
     HUE_NAMES, HUES, LinearTeam, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
 };
@@ -55,7 +55,8 @@ use project::{
 };
 use remote::{RemoteConnectionIdentity, RemoteConnectionOptions, SshConnectionOptions};
 use ui::{
-    Checkbox, CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, TintColor,
+    Checkbox, CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, PopoverMenu,
+    TintColor,
     Tooltip, prelude::*,
 };
 use ui_input::{ErasedEditor, InputField};
@@ -292,6 +293,12 @@ struct WorktreeRow {
     /// What git says about the worktree's files and branch; see
     /// [`WorktreePanel::scan_statuses`]. Default until it has said.
     status: WorktreeStatus,
+    /// When an agent in this worktree last did anything; see
+    /// [`AgentTracker::last_active_for`].
+    last_active: Option<SystemTime>,
+    /// What the agent here that wants you most is doing; see
+    /// [`AgentTracker::phase_for`].
+    phase: Option<Phase>,
 }
 
 /// What is known about one project's pull requests; see
@@ -376,14 +383,14 @@ const DISCOVERY_REFRESH: Duration = Duration::from_secs(60);
 /// with itself.
 #[derive(Default)]
 struct PanelView {
-    collapsed: Vec<ProjectGroupKey>,
-    /// The project whose chevron is turning, and when it started.
+    collapsed: Vec<GroupId>,
+    /// The group whose chevron is turning, and when it started.
     ///
     /// The animation has to play on a click and *only* on a click. A panel is
     /// a fresh element tree every time its worktree comes forward, and
     /// `with_animation` replays whenever its element is mounted, so without
     /// this every chevron in the panel spins on every switch.
-    turning: Option<(ProjectGroupKey, Instant)>,
+    turning: Option<(GroupId, Instant)>,
     /// How far the list is scrolled. Held here rather than by each panel's
     /// element: a panel is a fresh element tree whenever its worktree comes
     /// forward, and a scroll position that lived in the tree would go back to
@@ -392,6 +399,138 @@ struct PanelView {
 }
 
 impl Global for PanelView {}
+
+/// One heading of the panel, whichever way it is grouped.
+#[derive(Clone)]
+enum GroupId {
+    Project(ProjectGroupKey),
+    /// A heading of any other grouping. Keyed by the grouping too, so that
+    /// collapsing "Idle" under agent status leaves a project called "Idle"
+    /// alone.
+    Heading(GroupBy, SharedString),
+}
+
+impl GroupId {
+    fn matches(&self, other: &GroupId) -> bool {
+        match (self, other) {
+            (GroupId::Project(this), GroupId::Project(other)) => this.matches(other),
+            (GroupId::Heading(this_grouping, this), GroupId::Heading(other_grouping, other)) => {
+                this_grouping == other_grouping && this == other
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What the panel's worktrees are grouped under.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum GroupBy {
+    #[default]
+    Project,
+    AgentState,
+    AgentPhase,
+    LinearProject,
+    IssueState,
+}
+
+impl GroupBy {
+    const ALL: [GroupBy; 5] = [
+        GroupBy::Project,
+        GroupBy::AgentState,
+        GroupBy::AgentPhase,
+        GroupBy::LinearProject,
+        GroupBy::IssueState,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            GroupBy::Project => "Project",
+            GroupBy::AgentState => "Agent Status",
+            GroupBy::AgentPhase => "Agent Phase",
+            GroupBy::LinearProject => "Linear Project",
+            GroupBy::IssueState => "Issue Status",
+        }
+    }
+}
+
+/// The order of the panel's groups and of the worktrees in each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum SortBy {
+    /// Groups by name, and a project's worktrees with its own checkout first.
+    #[default]
+    Name,
+    /// Most recently active agent first.
+    AgentActivity,
+    /// Most recently worked on first: an agent's activity or a file's edit,
+    /// whichever is later.
+    RecentWork,
+}
+
+impl SortBy {
+    const ALL: [SortBy; 3] = [SortBy::Name, SortBy::AgentActivity, SortBy::RecentWork];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Name => "Name",
+            SortBy::AgentActivity => "Recent Agent Activity",
+            SortBy::RecentWork => "Recently Worked On",
+        }
+    }
+
+    /// When a worktree last saw the activity this order is by, or `None`
+    /// for the order by name.
+    fn recency(self, worktree: &WorktreeRow) -> Option<SystemTime> {
+        match self {
+            SortBy::Name => None,
+            SortBy::AgentActivity => worktree.last_active,
+            SortBy::RecentWork => worktree.last_active.max(worktree.status.last_edit),
+        }
+    }
+}
+
+/// How the panel is grouped and sorted. One for the whole application, like
+/// [`PanelView`], and kept across restarts like the panel's width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Arrangement {
+    group_by: GroupBy,
+    sort_by: SortBy,
+}
+
+impl Global for Arrangement {}
+
+const ARRANGEMENT_KEY: &str = "arrangement";
+
+fn arrangement(cx: &mut App) -> Arrangement {
+    if let Some(arrangement) = cx.try_global::<Arrangement>() {
+        return *arrangement;
+    }
+    let arrangement = db::kvp::KeyValueStore::global(cx)
+        .scoped(WIDTH_NAMESPACE)
+        .read(ARRANGEMENT_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|stored| serde_json::from_str::<Arrangement>(&stored).log_err())
+        .unwrap_or_default();
+    cx.set_global(arrangement);
+    arrangement
+}
+
+fn set_arrangement(arrangement: Arrangement, cx: &mut App) {
+    cx.set_global(arrangement);
+    cx.refresh_windows();
+    let Some(stored) = serde_json::to_string(&arrangement).log_err() else {
+        return;
+    };
+    let store = db::kvp::KeyValueStore::global(cx);
+    cx.background_spawn(async move {
+        store
+            .scoped(WIDTH_NAMESPACE)
+            .write(ARRANGEMENT_KEY.to_owned(), stored)
+            .await
+            .log_err();
+    })
+    .detach();
+}
 
 #[derive(Default)]
 struct ProjectScans {
@@ -788,6 +927,16 @@ impl WorktreePanel {
                         .zip(tracker.as_ref())
                         .map(|(root, tracker)| tracker.read(cx).processes_for(root))
                         .unwrap_or_default(),
+                    last_active: plan
+                        .root
+                        .as_deref()
+                        .zip(tracker.as_ref())
+                        .and_then(|(root, tracker)| tracker.read(cx).last_active_for(root)),
+                    phase: plan
+                        .root
+                        .as_deref()
+                        .zip(tracker.as_ref())
+                        .and_then(|(root, tracker)| tracker.read(cx).phase_for(root)),
                     linked_issue: stored.as_ref().and_then(|stored| stored.issue.clone()),
                     title: stored
                         .as_ref()
@@ -2532,7 +2681,7 @@ impl WorktreePanel {
         cx.notify();
     }
 
-    fn toggle_collapsed(&mut self, key: &ProjectGroupKey, cx: &mut Context<Self>) {
+    fn toggle_collapsed(&mut self, key: &GroupId, cx: &mut Context<Self>) {
         let view = cx.default_global::<PanelView>();
         match view.collapsed.iter().position(|held| held.matches(key)) {
             Some(index) => {
@@ -2603,14 +2752,14 @@ impl WorktreePanel {
         (!filter.is_empty()).then_some(filter)
     }
 
-    fn is_collapsed(&self, key: &ProjectGroupKey, cx: &App) -> bool {
+    fn is_collapsed(&self, key: &GroupId, cx: &App) -> bool {
         cx.try_global::<PanelView>()
             .is_some_and(|view| view.collapsed.iter().any(|held| held.matches(key)))
     }
 
     /// Whether this project's chevron should be drawn mid-turn, which is true
     /// only just after it was clicked.
-    fn is_turning(&self, key: &ProjectGroupKey, cx: &App) -> bool {
+    fn is_turning(&self, key: &GroupId, cx: &App) -> bool {
         cx.try_global::<PanelView>()
             .and_then(|view| view.turning.as_ref())
             .is_some_and(|(turning, at)| turning.matches(key) && at.elapsed() < CHEVRON_TURN)
@@ -2622,9 +2771,9 @@ impl WorktreePanel {
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let collapsed = self.is_collapsed(&row.key, cx);
-        let turning = self.is_turning(&row.key, cx);
-        let key = row.key.clone();
+        let key = GroupId::Project(row.key.clone());
+        let collapsed = self.is_collapsed(&key, cx);
+        let turning = self.is_turning(&key, cx);
         // Any workspace of this repository will do to create against: it only
         // needs the project, and every worktree of one repository shares it.
         let add = row
@@ -2710,6 +2859,34 @@ impl WorktreePanel {
                 ))
             })
             .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(&key, cx)))
+    }
+
+    /// The row a group of worktrees goes under when the panel is grouped by
+    /// anything but project: a name and a count, and nothing to do but fold.
+    fn render_heading(
+        &self,
+        section: &Section,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let collapsed = self.is_collapsed(&section.id, cx);
+        let turning = self.is_turning(&section.id, cx);
+        let id = section.id.clone();
+        ListItem::new(("heading", index))
+            .spacing(ListItemSpacing::Sparse)
+            .height(ROW_HEIGHT)
+            .start_slot(render_chevron(index, collapsed, turning, cx))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(Label::new(section.label.clone()).single_line().truncate())
+                    .child(
+                        Label::new(section.worktrees.len().to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_collapsed(&id, cx)))
     }
 
     /// The menu of a project row: the icons a project can be drawn with, the
@@ -2836,6 +3013,7 @@ impl WorktreePanel {
     fn render_worktree(
         &self,
         row: &WorktreeRow,
+        project: Option<&SharedString>,
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2899,7 +3077,7 @@ impl WorktreePanel {
             }
         });
 
-        worktree_card(row, index, sync_button, cx)
+        worktree_card(row, project, index, sync_button, cx)
             .ml_3()
             .mr_1p5()
             .when_some(row.root.clone(), |this, root| {
@@ -3036,8 +3214,12 @@ impl WorktreePanel {
 ///
 /// Shared by the panel and the worktree switcher so that both draw a worktree
 /// the same way. What a click does, and the right-click menu, are the caller's.
+/// `project` is named on the card when the card is not under its project's
+/// row: grouped any other way, which project a worktree is in is not said
+/// anywhere else.
 fn worktree_card(
     row: &WorktreeRow,
+    project: Option<&SharedString>,
     index: usize,
     sync_button: Option<AnyElement>,
     cx: &App,
@@ -3064,6 +3246,11 @@ fn worktree_card(
             });
             (name, subheading)
         }
+    };
+    let subheading = match (project, subheading) {
+        (Some(project), Some(subheading)) => Some(format!("{project} · {subheading}").into()),
+        (Some(project), None) => Some(project.clone()),
+        (None, subheading) => subheading,
     };
     let text_color = if is_open {
         Color::Default
@@ -3470,6 +3657,48 @@ fn edited_ago(elapsed: Duration) -> String {
     }
 }
 
+/// The button in the panel's header that chooses how its worktrees are
+/// grouped and sorted.
+fn render_arrangement_menu(current: Arrangement) -> impl IntoElement {
+    PopoverMenu::new("worktree-arrangement")
+        .trigger_with_tooltip(
+            IconButton::new("worktree-arrangement-trigger", IconName::Filter)
+                .icon_size(IconSize::Small)
+                .toggle_state(current != Arrangement::default()),
+            Tooltip::text("Group and Sort"),
+        )
+        .anchor(gpui::Anchor::TopRight)
+        .menu(move |window, cx| {
+            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                menu = menu.header("Group By");
+                for group_by in GroupBy::ALL {
+                    menu = menu.toggleable_entry(
+                        group_by.label(),
+                        current.group_by == group_by,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            set_arrangement(Arrangement { group_by, ..current }, cx);
+                        },
+                    );
+                }
+                menu = menu.separator().header("Sort By");
+                for sort_by in SortBy::ALL {
+                    menu = menu.toggleable_entry(
+                        sort_by.label(),
+                        current.sort_by == sort_by,
+                        IconPosition::End,
+                        None,
+                        move |_, cx| {
+                            set_arrangement(Arrangement { sort_by, ..current }, cx);
+                        },
+                    );
+                }
+                menu
+            }))
+        })
+}
+
 /// The disclosure chevron, turning a quarter circle as the repository opens and
 /// closes.
 ///
@@ -3504,6 +3733,146 @@ fn render_chevron(index: usize, collapsed: bool, turning: bool, cx: &App) -> Any
             },
         )
         .into_any_element()
+}
+
+/// One group of worktrees as the panel draws it, under a project row or under
+/// a heading.
+struct Section<'a> {
+    id: GroupId,
+    /// The project this section is, when the panel is grouped by project.
+    project: Option<&'a RepositoryRow>,
+    label: SharedString,
+    /// Where the section goes among the others, before recency or name;
+    /// see [`group_of`].
+    rank: usize,
+    /// Each worktree with the project it belongs to.
+    worktrees: Vec<(&'a RepositoryRow, &'a WorktreeRow)>,
+}
+
+/// The tree regrouped and reordered as `arrangement` says.
+///
+/// Groups with an order of their own — agent status by how much it wants
+/// you, phases in the order work goes through them, issue states by how far
+/// along they are — keep it whatever the sort. Projects and Linear projects
+/// have none, and follow the sort.
+fn arrange(tree: &[RepositoryRow], arrangement: Arrangement) -> Vec<Section<'_>> {
+    let Arrangement { group_by, sort_by } = arrangement;
+    let mut sections: Vec<Section<'_>> = Vec::new();
+    if group_by == GroupBy::Project {
+        sections.extend(tree.iter().map(|row| Section {
+            id: GroupId::Project(row.key.clone()),
+            project: Some(row),
+            label: row.name.clone(),
+            rank: 0,
+            worktrees: row.worktrees.iter().map(|worktree| (row, worktree)).collect(),
+        }));
+    } else {
+        for row in tree {
+            for worktree in &row.worktrees {
+                let (rank, label) = group_of(group_by, worktree);
+                match sections.iter_mut().find(|section| section.label == label) {
+                    Some(section) => section.worktrees.push((row, worktree)),
+                    None => sections.push(Section {
+                        id: GroupId::Heading(group_by, label.clone()),
+                        project: None,
+                        label,
+                        rank,
+                        worktrees: vec![(row, worktree)],
+                    }),
+                }
+            }
+        }
+    }
+
+    // Stable sorts throughout, so that whatever recency does not decide stays
+    // in the tree's own order: projects by name, and a project's own checkout
+    // ahead of its other worktrees.
+    if sort_by != SortBy::Name {
+        for section in &mut sections {
+            section
+                .worktrees
+                .sort_by_key(|(_, worktree)| std::cmp::Reverse(sort_by.recency(worktree)));
+        }
+    }
+    let by_recency = sort_by != SortBy::Name
+        && matches!(group_by, GroupBy::Project | GroupBy::LinearProject);
+    let latest = |section: &Section| {
+        section
+            .worktrees
+            .iter()
+            .filter_map(|(_, worktree)| sort_by.recency(worktree))
+            .max()
+    };
+    sections.sort_by(|a, b| {
+        a.rank.cmp(&b.rank).then_with(|| {
+            if by_recency {
+                latest(b).cmp(&latest(a))
+            } else if group_by == GroupBy::LinearProject {
+                a.label.cmp(&b.label)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    });
+    sections
+}
+
+/// The heading a worktree goes under, and where that heading ranks among the
+/// others; see [`arrange`].
+fn group_of(group_by: GroupBy, worktree: &WorktreeRow) -> (usize, SharedString) {
+    let no_agent = || (usize::MAX, SharedString::new_static("No Agent"));
+    match group_by {
+        GroupBy::Project => (0, SharedString::default()),
+        GroupBy::AgentState => match worktree.agents.state() {
+            Some(AgentState::NeedsInput) => (0, "Needs Input".into()),
+            Some(AgentState::Working) => (1, "Working".into()),
+            Some(AgentState::Idle) => (2, "Idle".into()),
+            None => no_agent(),
+        },
+        GroupBy::AgentPhase => match worktree.phase {
+            Some(phase) => (
+                Phase::ALL
+                    .iter()
+                    .position(|candidate| *candidate == phase)
+                    .unwrap_or(Phase::ALL.len()),
+                phase.label().into(),
+            ),
+            // An agent whose transcript has not said what it is doing yet.
+            None if !worktree.agents.is_empty() => (Phase::ALL.len(), "Unknown Phase".into()),
+            None => no_agent(),
+        },
+        GroupBy::LinearProject => match worktree
+            .issue
+            .as_ref()
+            .and_then(|issue| issue.project.as_ref())
+        {
+            Some(project) => (0, project.name.clone()),
+            None => (1, "No Linear Project".into()),
+        },
+        GroupBy::IssueState => {
+            // Furthest from done first, after what is being worked on now:
+            // the panel is about work in progress.
+            const ORDER: [StateType; 7] = [
+                StateType::Started,
+                StateType::Unstarted,
+                StateType::Triage,
+                StateType::Backlog,
+                StateType::Completed,
+                StateType::Canceled,
+                StateType::Other,
+            ];
+            match &worktree.issue {
+                Some(issue) => (
+                    ORDER
+                        .iter()
+                        .position(|kind| *kind == issue.state.kind)
+                        .unwrap_or(ORDER.len()),
+                    issue.state.kind.label().into(),
+                ),
+                None => (usize::MAX, "No Issue".into()),
+            }
+        }
+    }
 }
 
 /// The path the repository's worktree names are relative to: its own checkout.
@@ -5493,6 +5862,8 @@ impl Render for WorktreePanel {
         }
         let mut worktree_index = 0;
         let scroll = cx.default_global::<PanelView>().scroll.clone();
+        let arrangement = arrangement(cx);
+        let sections = arrange(&tree, arrangement);
 
         v_flex()
             .key_context("WorktreePanel")
@@ -5522,6 +5893,7 @@ impl Render for WorktreePanel {
                             .min_w_0()
                             .child(self.filter.render(window, cx)),
                     )
+                    .child(render_arrangement_menu(arrangement))
                     .child(
                         IconButton::new("add-project", IconName::FolderAdd)
                             .icon_size(IconSize::Small)
@@ -5547,44 +5919,55 @@ impl Render for WorktreePanel {
                             ),
                         )
                     })
-                    .children(tree.iter().enumerate().map(|(index, row)| {
-                        let project_matches = filter
-                            .as_ref()
-                            .is_none_or(|filter| matches_filter(&row.name, filter));
-                        // While filtering, a project is shown open whatever its
+                    .children(sections.iter().enumerate().map(|(index, section)| {
+                        let section_matches = filter.as_ref().is_none_or(|filter| {
+                            section.project.is_some() && matches_filter(&section.label, filter)
+                        });
+                        // While filtering, a group is shown open whatever its
                         // collapsed state: hiding a match behind a chevron makes the
                         // filter say a thing exists and then refuse to show it.
-                        let collapsed = filter.is_none() && self.is_collapsed(&row.key, cx);
+                        let collapsed = filter.is_none() && self.is_collapsed(&section.id, cx);
                         let worktrees: Vec<_> = if collapsed {
                             Vec::new()
                         } else {
-                            row.worktrees
+                            section
+                                .worktrees
                                 .iter()
-                                .filter(|worktree| match &filter {
-                                    // A project whose own name matches keeps all of
-                                    // its worktrees: you asked for the project.
+                                .filter(|(project, worktree)| match &filter {
+                                    // A worktree whose project's name matches is
+                                    // kept: you asked for the project.
                                     Some(filter) => {
-                                        project_matches || matches_filter(&worktree.name, filter)
+                                        matches_filter(&project.name, filter)
+                                            || matches_filter(&worktree.name, filter)
                                     }
                                     None => true,
                                 })
-                                .map(|worktree| {
-                                    let element = self.render_worktree(worktree, worktree_index, cx);
+                                .map(|(project, worktree)| {
+                                    // Under its project's own row the project
+                                    // goes without saying.
+                                    let project =
+                                        section.project.is_none().then_some(&project.name);
+                                    let element =
+                                        self.render_worktree(worktree, project, worktree_index, cx);
                                     worktree_index += 1;
                                     element.into_any_element()
                                 })
                                 .collect()
                         };
-                        // A project with nothing left under it is only in the way,
+                        // A group with nothing left under it is only in the way,
                         // unless it is itself what was asked for.
-                        if !project_matches && worktrees.is_empty() && filter.is_some() {
+                        if !section_matches && worktrees.is_empty() && filter.is_some() {
                             return div().into_any_element();
                         }
+                        let header = match section.project {
+                            Some(row) => self.render_repository(row, index, cx).into_any_element(),
+                            None => self.render_heading(section, index, cx).into_any_element(),
+                        };
                         v_flex()
-                            // Worktree cards are spaced like project rows, so without
-                            // a gap the next project reads as one more worktree.
+                            // Worktree cards are spaced like group rows, so without
+                            // a gap the next group reads as one more worktree.
                             .when(index > 0, |this| this.mt_3())
-                            .child(self.render_repository(row, index, cx))
+                            .child(header)
                             .children(worktrees)
                             .into_any_element()
                     })),
@@ -7750,5 +8133,260 @@ pub(crate) mod tests {
         assert_eq!(plans[0].open, Some(1));
         assert_eq!(plans[1].root.as_deref(), Some(Path::new("/src/bench-fix")));
         assert_eq!(plans[1].open, Some(0));
+    }
+
+    fn a_worktree_row(key: &ProjectGroupKey, name: &str, is_main: bool) -> WorktreeRow {
+        WorktreeRow {
+            key: key.clone(),
+            workspace: None,
+            name: SharedString::from(name.to_string()),
+            root: Some(PathBuf::from(format!("/src/{name}"))),
+            switch_from: None,
+            repository: None,
+            is_main,
+            is_active: false,
+            pull_request: None,
+            agents: AgentSummary::default(),
+            models: Vec::new(),
+            processes: Vec::new(),
+            branch: None,
+            linked_issue: None,
+            issue: None,
+            title: None,
+            status: WorktreeStatus::default(),
+            last_active: None,
+            phase: None,
+        }
+    }
+
+    fn a_project(name: &str, worktrees: impl FnOnce(&ProjectGroupKey) -> Vec<WorktreeRow>) -> RepositoryRow {
+        let key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from(format!("/src/{name}"))]));
+        RepositoryRow {
+            name: SharedString::from(name.to_string()),
+            is_open: false,
+            repository: None,
+            worktrees: worktrees(&key),
+            key,
+        }
+    }
+
+    fn at(seconds: u64) -> Option<SystemTime> {
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+    }
+
+    fn labels(sections: &[Section]) -> Vec<String> {
+        sections.iter().map(|section| section.label.to_string()).collect()
+    }
+
+    fn names(section: &Section) -> Vec<String> {
+        section
+            .worktrees
+            .iter()
+            .map(|(_, worktree)| worktree.name.to_string())
+            .collect()
+    }
+
+    /// The default arrangement is the panel as it always was: projects by
+    /// name, each led by its own checkout.
+    #[test]
+    fn by_default_the_panel_is_projects_by_name() {
+        let tree = vec![
+            a_project("alpha", |key| {
+                let mut fix = a_worktree_row(key, "fix", false);
+                fix.last_active = at(50);
+                vec![a_worktree_row(key, "alpha", true), fix]
+            }),
+            a_project("beta", |key| vec![a_worktree_row(key, "beta", true)]),
+        ];
+
+        let sections = arrange(&tree, Arrangement::default());
+
+        assert_eq!(labels(&sections), ["alpha", "beta"]);
+        assert_eq!(names(&sections[0]), ["alpha", "fix"]);
+        assert!(sections.iter().all(|section| section.project.is_some()));
+    }
+
+    /// Sorting by agent activity puts the project and the worktree an agent
+    /// touched last first, and those with no agent after the rest.
+    #[test]
+    fn agent_activity_brings_the_busiest_forward() {
+        let tree = vec![
+            a_project("alpha", |key| {
+                let mut fix = a_worktree_row(key, "fix", false);
+                fix.last_active = at(10);
+                vec![a_worktree_row(key, "alpha", true), fix]
+            }),
+            a_project("beta", |key| {
+                let mut old = a_worktree_row(key, "old", false);
+                old.last_active = at(20);
+                let mut new = a_worktree_row(key, "new", false);
+                new.last_active = at(30);
+                vec![a_worktree_row(key, "beta", true), old, new]
+            }),
+            a_project("gamma", |key| vec![a_worktree_row(key, "gamma", true)]),
+        ];
+
+        let sections = arrange(
+            &tree,
+            Arrangement {
+                group_by: GroupBy::Project,
+                sort_by: SortBy::AgentActivity,
+            },
+        );
+
+        assert_eq!(labels(&sections), ["beta", "alpha", "gamma"]);
+        assert_eq!(names(&sections[0]), ["new", "old", "beta"]);
+    }
+
+    /// Recent work counts a file edited as well as an agent at work.
+    #[test]
+    fn recent_work_counts_edits_too() {
+        let tree = vec![
+            a_project("alpha", |key| {
+                let mut main = a_worktree_row(key, "alpha", true);
+                main.last_active = at(10);
+                vec![main]
+            }),
+            a_project("beta", |key| {
+                let mut main = a_worktree_row(key, "beta", true);
+                main.status.last_edit = at(20);
+                vec![main]
+            }),
+        ];
+
+        let arranged = |sort_by| {
+            labels(&arrange(
+                &tree,
+                Arrangement {
+                    group_by: GroupBy::Project,
+                    sort_by,
+                },
+            ))
+        };
+
+        assert_eq!(arranged(SortBy::RecentWork), ["beta", "alpha"]);
+        assert_eq!(arranged(SortBy::AgentActivity), ["alpha", "beta"]);
+    }
+
+    /// Grouped by agent status, what wants you most comes first and the
+    /// worktrees with no agent last, across projects.
+    #[test]
+    fn agent_status_groups_by_what_wants_you_most() {
+        let tree = vec![
+            a_project("alpha", |key| {
+                let mut working = a_worktree_row(key, "working", false);
+                working.agents.working = 1;
+                vec![a_worktree_row(key, "alpha", true), working]
+            }),
+            a_project("beta", |key| {
+                let mut asking = a_worktree_row(key, "asking", false);
+                asking.agents.needs_input = 1;
+                asking.agents.idle = 1;
+                let mut idle = a_worktree_row(key, "idle", false);
+                idle.agents.idle = 1;
+                vec![a_worktree_row(key, "beta", true), asking, idle]
+            }),
+        ];
+
+        let sections = arrange(
+            &tree,
+            Arrangement {
+                group_by: GroupBy::AgentState,
+                sort_by: SortBy::Name,
+            },
+        );
+
+        assert_eq!(labels(&sections), ["Needs Input", "Working", "Idle", "No Agent"]);
+        assert_eq!(names(&sections[3]), ["alpha", "beta"]);
+        assert!(sections.iter().all(|section| section.project.is_none()));
+    }
+
+    /// Phases go in the order work goes through them, and an agent that has
+    /// not said what it is doing is told apart from no agent at all.
+    #[test]
+    fn agent_phase_groups_in_the_order_work_goes() {
+        let tree = vec![a_project("alpha", |key| {
+            let mut testing = a_worktree_row(key, "testing", false);
+            testing.agents.working = 1;
+            testing.phase = Some(Phase::Testing);
+            let mut planning = a_worktree_row(key, "planning", false);
+            planning.agents.idle = 1;
+            planning.phase = Some(Phase::Planning);
+            let mut unknown = a_worktree_row(key, "unknown", false);
+            unknown.agents.working = 1;
+            vec![a_worktree_row(key, "alpha", true), testing, planning, unknown]
+        })];
+
+        let sections = arrange(
+            &tree,
+            Arrangement {
+                group_by: GroupBy::AgentPhase,
+                sort_by: SortBy::Name,
+            },
+        );
+
+        assert_eq!(
+            labels(&sections),
+            ["Planning", "Testing", "Unknown Phase", "No Agent"]
+        );
+    }
+
+    /// Linear projects are by name with the worktrees that have none last,
+    /// and issue statuses lead with what is in progress.
+    #[test]
+    fn linear_groupings_follow_the_issue() {
+        let with_issue = |key: &ProjectGroupKey, name: &str, project: Option<&str>, state: &str| {
+            let mut row = a_worktree_row(key, name, false);
+            let mut issue = (*an_issue("RB-1")).clone();
+            issue.project = project.map(|project| linear::Named {
+                id: project.to_string().into(),
+                name: project.to_string().into(),
+            });
+            issue.state.kind = match state {
+                "started" => StateType::Started,
+                _ => StateType::Unstarted,
+            };
+            row.issue = Some(Arc::new(issue));
+            row
+        };
+        let tree = vec![a_project("alpha", |key| {
+            vec![
+                a_worktree_row(key, "alpha", true),
+                with_issue(key, "todo", Some("Website"), "unstarted"),
+                with_issue(key, "doing", Some("Billing"), "started"),
+                with_issue(key, "loose", None, "started"),
+            ]
+        })];
+
+        let by = |group_by| {
+            labels(&arrange(
+                &tree,
+                Arrangement {
+                    group_by,
+                    sort_by: SortBy::Name,
+                },
+            ))
+        };
+
+        assert_eq!(
+            by(GroupBy::LinearProject),
+            ["Billing", "Website", "No Linear Project"]
+        );
+        assert_eq!(by(GroupBy::IssueState), ["In Progress", "Todo", "No Issue"]);
+    }
+
+    /// Collapsing a heading is kept apart from a project of the same name,
+    /// and from the same heading under another grouping.
+    #[test]
+    fn a_heading_is_its_own_group() {
+        let project = GroupId::Project(ProjectGroupKey::new(
+            None,
+            PathList::new(&[PathBuf::from("/src/Idle")]),
+        ));
+        let idle = GroupId::Heading(GroupBy::AgentState, "Idle".into());
+
+        assert!(idle.matches(&GroupId::Heading(GroupBy::AgentState, "Idle".into())));
+        assert!(!idle.matches(&GroupId::Heading(GroupBy::IssueState, "Idle".into())));
+        assert!(!idle.matches(&project));
     }
 }
