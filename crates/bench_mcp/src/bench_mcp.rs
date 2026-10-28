@@ -20,17 +20,21 @@ use context_server::types::{
 use editor::Editor;
 use futures::FutureExt as _;
 use futures::channel::oneshot;
-use gpui::{App, AsyncApp, Entity, Global, Task, TaskExt as _, WeakEntity, WindowHandle};
+use gpui::{
+    App, AppContext as _, AsyncApp, Entity, Global, PromptLevel, Task, TaskExt as _, WeakEntity,
+    WindowHandle, actions,
+};
 use html_preview::{
     BrowserView, ClickOutcome, ClickTarget, ConsoleEntry, HtmlPreviewView, TypeOutcome,
 };
 use language::{DiagnosticSeverity, OffsetRangeExt as _};
 use linear::{Issue, Linear};
 use project::Project;
+use remote::{Interactive, RemoteClient, RemoteConnectionOptions, mcp_forward};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
-use workspace::{MultiWorkspace, Workspace};
+use workspace::{MultiWorkspace, Toast, Workspace, notifications::NotificationId};
 use worktree_panel::{ProjectListing, WorktreePanel};
 
 /// How many characters of a selection are returned. A whole-file selection in
@@ -41,11 +45,35 @@ const MAX_SELECTION_CHARS: usize = 20_000;
 /// from. Each is a buffer Bench has to load.
 const MAX_DIAGNOSTIC_FILES: usize = 50;
 
+actions!(
+    bench,
+    [
+        /// Lets agents running on this project's remote host drive Bench, such
+        /// as opening a web app they serve in its browser.
+        InstallMcpOnHost,
+    ]
+);
+
 struct BenchMcpServer(#[allow(dead_code)] McpServer);
 
 impl Global for BenchMcpServer {}
 
 pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &InstallMcpOnHost, window, cx| {
+            let Some(client) = workspace.project().read(cx).remote_client() else {
+                toast(
+                    "Open a project on a remote host to let its agents drive Bench.".to_string(),
+                    workspace,
+                    cx,
+                );
+                return;
+            };
+            install_on_host(client, window, cx);
+        });
+    })
+    .detach();
+
     cx.spawn(async move |cx| {
         let mut server = McpServer::bind(paths::mcp_socket_path().clone(), cx).await?;
         server.handle_request::<InitializeRequest>(|params, cx| {
@@ -159,6 +187,11 @@ fn windows(cx: &App) -> Vec<WindowHandle<MultiWorkspace>> {
         .collect()
 }
 
+fn host_name(workspace: &Entity<Workspace>, cx: &App) -> Option<String> {
+    let remote_client = workspace.read(cx).project().read(cx).remote_client()?;
+    Some(remote_client.read(cx).connection_options().display_name())
+}
+
 fn workspace_roots(workspace: &Entity<Workspace>, cx: &App) -> Vec<PathBuf> {
     workspace
         .read(cx)
@@ -172,13 +205,25 @@ fn workspace_roots(workspace: &Entity<Workspace>, cx: &App) -> Vec<PathBuf> {
 /// The open workspace whose folder holds `directory`, preferring the deepest:
 /// a worktree under `~/bench` and a project nested in another both sit inside
 /// a folder that is open in a workspace of its own.
-fn workspace_for_directory(directory: &Path, cx: &App) -> Result<Entity<Workspace>> {
+///
+/// A client on a remote host only sees the projects on that host, since its
+/// paths mean nothing in the others.
+fn workspace_for_directory(
+    directory: &Path,
+    host: Option<&str>,
+    cx: &App,
+) -> Result<Entity<Workspace>> {
     let mut best: Option<(usize, Entity<Workspace>)> = None;
     for window in windows(cx) {
         let Ok(multi_workspace) = window.read(cx) else {
             continue;
         };
         for workspace in multi_workspace.workspaces() {
+            if let Some(host) = host
+                && host_name(workspace, cx).as_deref() != Some(host)
+            {
+                continue;
+            }
             for root in workspace_roots(workspace, cx) {
                 let depth = root.components().count();
                 if directory.starts_with(&root)
@@ -648,7 +693,8 @@ impl McpServerTool for GetActiveEditor {
     ) -> Result<ToolResponse<Self::Output>> {
         let directory = target_directory(input.worktree, &context)?;
         let output = cx.update(|cx| -> Result<ActiveEditorOutput> {
-            let workspace = workspace_for_directory(&directory, cx)?;
+            let workspace =
+                workspace_for_directory(&directory, context.client_host.as_deref(), cx)?;
             let editor = workspace
                 .read(cx)
                 .active_item_as::<Editor>(cx)
@@ -760,7 +806,8 @@ impl McpServerTool for GetOpenFiles {
     ) -> Result<ToolResponse<Self::Output>> {
         let directory = target_directory(input.worktree, &context)?;
         let files = cx.update(|cx| -> Result<Vec<OpenFileOutput>> {
-            let workspace = workspace_for_directory(&directory, cx)?;
+            let workspace =
+                workspace_for_directory(&directory, context.client_host.as_deref(), cx)?;
             let workspace = workspace.read(cx);
             let project = workspace.project().read(cx);
             let active_item = workspace.active_item(cx).map(|item| item.item_id());
@@ -858,7 +905,7 @@ impl McpServerTool for GetDiagnostics {
             _ => target_directory(input.worktree.clone(), &context)?,
         };
         let project = cx.update(|cx| {
-            workspace_for_directory(&directory, cx)
+            workspace_for_directory(&directory, context.client_host.as_deref(), cx)
                 .map(|workspace| workspace.read(cx).project().clone())
         })?;
 
@@ -943,7 +990,8 @@ impl McpServerTool for OpenHtmlFile {
             _ => target_directory(input.worktree.clone(), &context)?,
         };
         let (window, workspace, path) = cx.update(|cx| -> Result<_> {
-            let workspace = workspace_for_directory(&directory, cx)?;
+            let workspace =
+                workspace_for_directory(&directory, context.client_host.as_deref(), cx)?;
             let path = if path.is_relative() {
                 let roots = workspace_roots(&workspace, cx);
                 let root = containing_root(roots.iter().map(PathBuf::as_path), &directory)
@@ -1138,7 +1186,8 @@ fn find_browser_tab(
         return Ok(browser);
     }
     if let Some(directory) = &context.client_directory
-        && let Ok(workspace) = workspace_for_directory(directory, cx)
+        && let Ok(workspace) =
+            workspace_for_directory(directory, context.client_host.as_deref(), cx)
     {
         let active = workspace
             .read(cx)
@@ -1273,7 +1322,9 @@ impl McpServerTool for BrowserOpen {
                     .or_else(|| context.client_directory.clone());
                 let (window, workspace) = cx.update(|cx| -> Result<_> {
                     let workspace = match &directory {
-                        Some(directory) => workspace_for_directory(directory, cx)?,
+                        Some(directory) => {
+                            workspace_for_directory(directory, context.client_host.as_deref(), cx)?
+                        }
                         None => windows(cx)
                             .first()
                             .and_then(|window| window.read(cx).ok())
@@ -1849,4 +1900,124 @@ impl McpServerTool for BrowserConsoleLogs {
             last_id,
         })
     }
+}
+
+fn toast(message: String, workspace: &mut Workspace, cx: &mut gpui::Context<Workspace>) {
+    workspace.show_toast(
+        Toast::new(NotificationId::unique::<InstallMcpOnHost>(), message),
+        cx,
+    );
+}
+
+/// Forwards Bench's MCP socket to the host and registers the host's
+/// `remote_server` as an MCP server with the Claude Code there, after asking.
+fn install_on_host(
+    client: Entity<RemoteClient>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::Context<Workspace>,
+) {
+    let options = client.read(cx).connection_options();
+    let name = options.display_name();
+    let RemoteConnectionOptions::Ssh(ssh_options) = options else {
+        let message = format!("Bench's MCP server can only be installed on SSH hosts, not {name}.");
+        cx.defer_in(window, move |workspace, _, cx| {
+            toast(message, workspace, cx)
+        });
+        return;
+    };
+
+    let answer = window.prompt(
+        PromptLevel::Info,
+        &format!("Let agents on {name} drive Bench?"),
+        Some(
+            "Bench's MCP server is added to Claude Code on the host, and Bench's MCP socket is \
+             forwarded there whenever the host is connected. Any process of your user on the \
+             host can then open pages in Bench's browser and run scripts in them.",
+        ),
+        &["Install", "Cancel"],
+        cx,
+    );
+    cx.spawn_in(window, async move |workspace, cx| {
+        if answer.await? != 0 {
+            return anyhow::Ok(());
+        }
+        let outcome = register_on_host(&client, &ssh_options, &name, cx).await;
+        let message = match outcome {
+            Ok(()) => format!(
+                "Claude Code on {name} can now drive Bench. Start a new Claude session there \
+                 to pick up the `bench` MCP server."
+            ),
+            Err(error) => {
+                log::error!("installing Bench's MCP server on {name}: {error:#}");
+                format!("Could not install Bench's MCP server on {name}: {error:#}")
+            }
+        };
+        workspace.update(cx, |workspace, cx| toast(message, workspace, cx))
+    })
+    .detach_and_log_err(cx);
+}
+
+async fn register_on_host(
+    client: &Entity<RemoteClient>,
+    ssh_options: &remote::SshConnectionOptions,
+    name: &str,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Result<()> {
+    let server_path = client
+        .read_with(cx, |client, _| client.remote_server_path())
+        .context("could not tell where Bench's server is on the host")?;
+    let remote_socket = mcp_forward::remote_socket_path();
+
+    mcp_forward::enable(ssh_options)?;
+    client
+        .read_with(cx, |client, cx| {
+            client.forward_socket_to_host(
+                remote_socket.clone(),
+                paths::mcp_socket_path().clone(),
+                cx,
+            )
+        })
+        .await?;
+
+    let arguments = vec![
+        "-lc".to_owned(),
+        // `claude` is rarely on the PATH of a non-interactive shell: its own
+        // installer puts it in `~/.local/bin`.
+        r#"PATH="$HOME/.local/bin:$HOME/.claude/local:$PATH"
+claude mcp remove --scope user bench >/dev/null 2>&1
+exec claude mcp add --scope user bench -- "$@""#
+            .to_owned(),
+        "sh".to_owned(),
+        server_path.clone(),
+        "--mcp-bridge".to_owned(),
+        remote_socket.clone(),
+        "--mcp-host".to_owned(),
+        name.to_owned(),
+    ];
+    let template = client.read_with(cx, |client, _| {
+        client.build_command(
+            Some("sh".to_owned()),
+            &arguments,
+            &std::collections::HashMap::default(),
+            None,
+            None,
+            Interactive::No,
+        )
+    })?;
+    let mut command = util::command::new_command(template.program);
+    command
+        .args(template.args)
+        .envs(template.env)
+        .stdin(util::command::Stdio::null())
+        .kill_on_drop(true);
+    let output = cx
+        .background_spawn(async move { command.output().await })
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}. To add it yourself, run on the host: claude mcp add --scope user bench -- \
+         {server_path} --mcp-bridge {remote_socket} --mcp-host '{name}'",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }

@@ -1,5 +1,6 @@
 pub mod command;
 pub mod json_log;
+pub mod mcp_forward;
 pub mod protocol;
 pub mod proxy;
 pub mod remote_client;

@@ -1053,6 +1053,23 @@ impl RemoteClient {
         connection.build_forward_ports_command(forwards)
     }
 
+    pub fn forward_socket_to_host(
+        &self,
+        remote_socket: String,
+        local_socket: PathBuf,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        match self.remote_connection() {
+            Some(connection) => connection.forward_socket_to_host(remote_socket, local_socket, cx),
+            None => Task::ready(Err(anyhow!("no remote connection"))),
+        }
+    }
+
+    /// Where the remote server binary is on the host, as an absolute path.
+    pub fn remote_server_path(&self) -> Option<String> {
+        self.remote_connection()?.remote_server_path()
+    }
+
     pub fn upload_directory(
         &self,
         src_path: PathBuf,
@@ -1529,6 +1546,19 @@ pub trait RemoteConnection: Send + Sync {
         &self,
         forwards: Vec<(u16, String, u16)>,
     ) -> Result<CommandTemplate>;
+    /// Makes `remote_socket` on the host reach `local_socket` on this
+    /// machine, for as long as the connection lasts.
+    fn forward_socket_to_host(
+        &self,
+        _remote_socket: String,
+        _local_socket: PathBuf,
+        _cx: &App,
+    ) -> Task<Result<()>> {
+        Task::ready(Err(anyhow!("Not supported for this kind of connection")))
+    }
+    fn remote_server_path(&self) -> Option<String> {
+        None
+    }
     fn connection_options(&self) -> RemoteConnectionOptions;
     fn path_style(&self) -> PathStyle;
     /// The remote platform (OS and architecture), detected during connection setup.

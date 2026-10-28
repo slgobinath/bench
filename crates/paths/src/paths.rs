@@ -231,6 +231,13 @@ pub fn mcp_socket_path() -> &'static PathBuf {
     MCP_SOCKET_PATH.get_or_init(|| data_dir().join("mcp.sock"))
 }
 
+/// Returns the path to the file listing the remote hosts Bench's MCP socket is
+/// forwarded to.
+pub fn mcp_hosts_path() -> &'static PathBuf {
+    static MCP_HOSTS_PATH: OnceLock<PathBuf> = OnceLock::new();
+    MCP_HOSTS_PATH.get_or_init(|| data_dir().join("mcp_hosts.json"))
+}
+
 /// Returns the path to the logs directory.
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();

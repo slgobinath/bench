@@ -583,6 +583,24 @@ impl RemoteConnection for SshRemoteConnection {
         .map(Some)
     }
 
+    fn forward_socket_to_host(
+        &self,
+        remote_socket: String,
+        local_socket: PathBuf,
+        cx: &App,
+    ) -> Task<Result<()>> {
+        let commands = self
+            .socket
+            .forward_socket_commands(&remote_socket, &local_socket);
+        cx.background_spawn(run_forward_socket_commands(commands))
+    }
+
+    fn remote_server_path(&self) -> Option<String> {
+        let home_dir = self.ssh_home_dir.as_deref()?;
+        let relative = self.remote_binary_path.as_ref()?.display(PathStyle::Unix);
+        Some(format!("{}/{relative}", home_dir.trim_end_matches('/')))
+    }
+
     fn build_forward_ports_command(
         &self,
         forwards: Vec<(u16, String, u16)>,
@@ -1042,6 +1060,19 @@ impl SshRemoteConnection {
             ssh_default_system_shell,
             ssh_home_dir,
         };
+
+        if crate::mcp_forward::is_enabled(&this.socket.connection_options).unwrap_or_else(|error| {
+            log::error!("reading the hosts Bench's MCP socket is forwarded to: {error:#}");
+            false
+        }) {
+            let commands = this.socket.forward_socket_commands(
+                &crate::mcp_forward::remote_socket_path(),
+                paths::mcp_socket_path(),
+            );
+            if let Err(error) = run_forward_socket_commands(commands).await {
+                log::error!("forwarding Bench's MCP socket to the host: {error:#}");
+            }
+        }
 
         let (release_channel, version) =
             cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
@@ -1663,6 +1694,28 @@ impl SshSocket {
     // On Linux, this includes the ControlPath option to reuse the existing connection.
     // Note: The destination must be added separately after all options to ensure proper
     // SSH command structure: ssh [options] destination [command]
+    /// The commands that make `remote_socket` on the host reach
+    /// `local_socket`: clearing out a socket file left behind by a connection
+    /// that dropped, and asking the connection's master to forward it.
+    fn forward_socket_commands(
+        &self,
+        remote_socket: &str,
+        local_socket: &Path,
+    ) -> (util::command::Command, util::command::Command) {
+        let remove_stale = self.ssh_command(ShellKind::Posix, "rm", &["-f", remote_socket], false);
+        let mut forward = util::command::new_command("ssh");
+        forward
+            .args(self.ssh_command_options())
+            .args(["-O", "forward", "-R"])
+            .arg(format!("{remote_socket}:{}", local_socket.display()))
+            .arg(self.connection_options.ssh_destination())
+            .envs(&self.envs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        (remove_stale, forward)
+    }
+
     fn ssh_command_options(&self) -> Vec<String> {
         let arguments = self.connection_options.additional_args();
         #[cfg(not(windows))]
@@ -2205,6 +2258,25 @@ fn posix_working_dir_prefix(
         )?;
     };
     Ok(exec)
+}
+
+async fn run_forward_socket_commands(
+    (mut remove_stale, mut forward): (util::command::Command, util::command::Command),
+) -> Result<()> {
+    remove_stale
+        .output()
+        .await
+        .context("clearing the socket on the host")?;
+    let output = forward
+        .output()
+        .await
+        .context("asking ssh to forward the socket")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ssh could not forward the socket to the host: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
 }
 
 fn ssh_command_template(

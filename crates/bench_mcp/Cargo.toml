@@ -25,6 +25,7 @@ linear.workspace = true
 log.workspace = true
 paths.workspace = true
 project.workspace = true
+remote.workspace = true
 release_channel.workspace = true
 schemars.workspace = true
 serde.workspace = true

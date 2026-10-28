@@ -2186,6 +2186,7 @@ dependencies = [
  "paths",
  "project",
  "release_channel",
+ "remote",
  "schemars 1.0.4",
  "serde",
  "serde_json",

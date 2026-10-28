@@ -270,7 +270,10 @@ impl McpServer {
                         && let Some(params) = request.params
                     {
                         match serde_json::from_str::<ClientDirectoryParams>(params.get()) {
-                            Ok(params) => context.client_directory = Some(params.path),
+                            Ok(params) => {
+                                context.client_directory = Some(params.path);
+                                context.client_host = params.host;
+                            }
                             Err(error) => log::error!("invalid {CLIENT_DIRECTORY_METHOD}: {error}"),
                         }
                     }
@@ -500,6 +503,10 @@ pub const CLIENT_DIRECTORY_METHOD: &str = "zed/clientDirectory";
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientDirectoryParams {
     pub path: PathBuf,
+    /// The remote host the client is running on, when it is not on this
+    /// machine, named as Bench names its connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 }
 
 /// What a tool knows about the connection it was called on.
@@ -508,6 +515,9 @@ pub struct ToolContext {
     /// The directory the client said it is working in; see
     /// [`CLIENT_DIRECTORY_METHOD`].
     pub client_directory: Option<PathBuf>,
+    /// The remote host `client_directory` is on, or `None` when it is on this
+    /// machine.
+    pub client_host: Option<String>,
 }
 
 #[derive(Debug)]

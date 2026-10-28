@@ -24,6 +24,16 @@ struct Cli {
     #[cfg(unix)]
     #[arg(long, hide = true, value_name = "SOCKET")]
     terminal_host: Option<PathBuf>,
+    /// Relays MCP between stdio and Bench's MCP server, reached through this
+    /// Unix socket, which Bench forwards from the machine it runs on.
+    #[cfg(unix)]
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    mcp_bridge: Option<PathBuf>,
+    /// The name Bench knows this host by, which tells it which projects the
+    /// MCP client's directory is in.
+    #[cfg(unix)]
+    #[arg(long, hide = true, value_name = "HOST", requires = "mcp_bridge")]
+    mcp_host: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -38,10 +48,15 @@ fn main() -> anyhow::Result<()> {
             .is_some_and(|flag| flag == terminal_host::OPEN_FLAG)
         {
             let Some(session_id) = args.next().and_then(|id| id.into_string().ok()) else {
-                eprintln!("usage: remote_server {} <session> [program [args...]]", terminal_host::OPEN_FLAG);
+                eprintln!(
+                    "usage: remote_server {} <session> [program [args...]]",
+                    terminal_host::OPEN_FLAG
+                );
                 std::process::exit(1);
             };
-            let program = args.next().map(|program| program.to_string_lossy().into_owned());
+            let program = args
+                .next()
+                .map(|program| program.to_string_lossy().into_owned());
             let args = args.map(|arg| arg.to_string_lossy().into_owned());
             let executable = std::env::current_exe()?;
             let socket = remote_server::terminal_host_socket();
@@ -60,6 +75,11 @@ fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     if let Some(socket) = &cli.terminal_host {
         return terminal_host::run_daemon(socket);
+    }
+
+    #[cfg(unix)]
+    if let Some(socket) = &cli.mcp_bridge {
+        return mcp_bridge(socket, cli.mcp_host.as_deref());
     }
 
     if let Some(socket_path) = &cli.askpass {
@@ -102,4 +122,47 @@ fn main() -> anyhow::Result<()> {
             .ok();
         std::process::exit(1);
     }
+}
+
+/// Relays MCP messages between stdio and Bench's MCP socket, after telling
+/// Bench which directory on this host the MCP client was started in, which is
+/// what lets its tools default to the worktree the client is working in.
+#[cfg(unix)]
+fn mcp_bridge(socket: &std::path::Path, host: Option<&str>) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
+    let stream = UnixStream::connect(socket).with_context(|| {
+        format!(
+            "could not connect to {}: is Bench running and connected to this host?",
+            socket.display()
+        )
+    })?;
+
+    let directory = std::env::current_dir().context("reading the current directory")?;
+    let announcement = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "zed/clientDirectory",
+        "params": { "path": directory, "host": host },
+    });
+    let mut socket_writer = stream.try_clone()?;
+    writeln!(socket_writer, "{announcement}")?;
+
+    let input = std::thread::spawn(move || -> std::io::Result<()> {
+        std::io::copy(&mut std::io::stdin().lock(), &mut socket_writer)?;
+        socket_writer.shutdown(Shutdown::Write)
+    });
+
+    let mut socket_reader = stream;
+    std::io::copy(&mut socket_reader, &mut std::io::stdout().lock())
+        .context("relaying to stdout")?;
+
+    if input.is_finished() {
+        input
+            .join()
+            .map_err(|_| anyhow::anyhow!("the stdin relay panicked"))?
+            .context("relaying from stdin")?;
+    }
+    Ok(())
 }
