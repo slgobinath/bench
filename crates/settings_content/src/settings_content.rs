@@ -771,7 +771,7 @@ pub struct AgentTrackingSettingsContent {
     /// Default: true
     pub keep_awake: Option<bool>,
     /// The phase of work each Claude Code skill or slash command puts an agent
-    /// in on the agent board, by skill name, such as
+    /// in, by skill name, such as
     /// `{"my-plugin:spec": "planning"}`. Names may leave out the plugin
     /// prefix. These come before Bench's own guesses from the name.
     ///
@@ -779,7 +779,7 @@ pub struct AgentTrackingSettingsContent {
     pub skill_phases: Option<HashMap<String, AgentPhaseContent>>,
 }
 
-/// Bench: a column of the agent board.
+/// Bench: a phase of work an agent can be in.
 #[derive(
     Copy,
     Clone,

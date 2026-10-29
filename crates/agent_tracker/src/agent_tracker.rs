@@ -24,7 +24,7 @@
 //! # What it drives
 //!
 //! - The worktree panel's per-row count and status dot.
-//! - The agent board, which also shows what phase of the work each agent is
+//! - The worktree panel, which also shows what phase of the work each agent is
 //!   in, read from its transcript; see [`activity`].
 //! - A system notification when an agent stops to ask, or finishes.
 //! - The stay-awake assertion, so a long run does not end in a sleeping Mac;
@@ -794,7 +794,7 @@ impl AgentTracker {
     }
 
     /// Every agent Bench can see, with what is known about what it is doing,
-    /// for the agent board. Agents in terminals come first, in no particular
+    /// for the worktree panel. Agents in terminals come first, in no particular
     /// order; [`AgentEntry::id`] is what to sort or key them by.
     pub fn agents(&self) -> Vec<AgentEntry<'_>> {
         let attached = self.watched.iter().filter_map(|(terminal, watched)| {

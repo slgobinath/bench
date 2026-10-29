@@ -1,6 +1,6 @@
 //! What a Claude Code session is doing beyond "working": which phase of the
 //! work it is in, what it was asked, what it is touching, and what it has
-//! spent. This is what the agent board is drawn from.
+//! spent. This is what the worktree panel's agent phases are drawn from.
 //!
 //! # Where it comes from
 //!
@@ -60,7 +60,7 @@ const TEXT_KEPT: usize = 400;
 const CONTEXT_WINDOW: u64 = 200_000;
 const LONG_CONTEXT_WINDOW: u64 = 1_000_000;
 
-/// A column of the agent board.
+/// A phase of work an agent can be in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Phase {
     Planning,

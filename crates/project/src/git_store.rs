@@ -125,6 +125,72 @@ const MIN_PARKED_REPOSITORY_DEPTH: usize = 2;
 
 pub const MAX_CONCURRENT_OBJECT_READS: usize = 16;
 
+/// How many repositories may be running their status and branch commands at
+/// once, across every project in the application. With many repositories open
+/// a burst of file events would otherwise start git in all of them together.
+const MAX_CONCURRENT_POLLS: usize = 3;
+///
+/// Held by the application rather than as a `static` so that the tests, which
+/// run side by side in one process, don't wait on each other's permits.
+struct PollSlots(Arc<Semaphore>);
+
+impl Default for PollSlots {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_CONCURRENT_POLLS)))
+    }
+}
+
+impl gpui::Global for PollSlots {}
+
+/// The least time between two runs of a repository's file status commands
+/// that file events ask for. None under test, where the executor doesn't run
+/// timers on its own and a test expects a change to show up at once.
+const STATUS_POLL_COOLDOWN: Duration = if cfg!(any(test, feature = "test-support")) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(1)
+};
+
+/// The same for the full rescan that changes inside `.git` ask for, which also
+/// lists branches and worktrees.
+const SNAPSHOT_POLL_COOLDOWN: Duration = if cfg!(any(test, feature = "test-support")) {
+    Duration::ZERO
+} else {
+    Duration::from_secs(5)
+};
+
+/// Spaces out the git runs a repository makes because of file events, so that
+/// files which keep changing cannot keep git running without a break. The first
+/// event after a quiet spell runs at once, and the ones that arrive before the
+/// cooldown is over are folded into a single run at its end.
+#[derive(Default)]
+struct PollThrottle {
+    last_run: Option<Instant>,
+    waiting: Option<Task<()>>,
+}
+
+enum PollTiming {
+    Now,
+    /// A run is already waiting for the cooldown and will cover this event.
+    Folded,
+    After(Duration),
+}
+
+impl PollThrottle {
+    fn admit(&mut self, cooldown: Duration) -> PollTiming {
+        if self.waiting.is_some() {
+            return PollTiming::Folded;
+        }
+        if let Some(elapsed) = self.last_run.map(|last_run| last_run.elapsed())
+            && elapsed < cooldown
+        {
+            return PollTiming::After(cooldown - elapsed);
+        }
+        self.last_run = Some(Instant::now());
+        PollTiming::Now
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ParkedRepository {
     worktree_id: WorktreeId,
@@ -697,6 +763,9 @@ pub struct Repository {
     // For a local repository, holds paths that have had worktree events since the last status scan completed,
     // and that should be examined during the next status scan.
     paths_needing_status_update: Vec<Vec<RepoPath>>,
+    poll_slots: Arc<Semaphore>,
+    status_throttle: PollThrottle,
+    snapshot_throttle: PollThrottle,
     job_sender: mpsc::UnboundedSender<GitJob>,
     _worker_task: Task<()>,
     active_jobs: HashMap<JobId, JobInfo>,
@@ -2690,7 +2759,7 @@ impl GitStore {
                     } else {
                         existing.update(cx, |existing, cx| {
                             existing.snapshot.work_directory_abs_path = new_work_directory_abs_path;
-                            existing.schedule_scan(updates_tx.clone(), cx);
+                            existing.schedule_scan_throttled(updates_tx.clone(), cx);
                         });
                     }
                 } else {
@@ -6635,6 +6704,9 @@ impl Repository {
             commit_message_buffer: None,
             askpass_delegates: Default::default(),
             paths_needing_status_update: Default::default(),
+            poll_slots: cx.default_global::<PollSlots>().0.clone(),
+            status_throttle: Default::default(),
+            snapshot_throttle: Default::default(),
             latest_askpass_id: 0,
             job_sender: mpsc::unbounded().0,
             job_id: 0,
@@ -6684,6 +6756,9 @@ impl Repository {
             object_read_limiter,
             pending_ops: Default::default(),
             paths_needing_status_update: Default::default(),
+            poll_slots: cx.default_global::<PollSlots>().0.clone(),
+            status_throttle: Default::default(),
+            snapshot_throttle: Default::default(),
             job_sender,
             _worker_task: worker_task,
             repository_state,
@@ -10203,6 +10278,32 @@ impl Repository {
         self.pending_ops = updated;
     }
 
+    /// [`Self::schedule_scan`] for changes inside `.git`, which can come in
+    /// continuously while something is working in the repository. Scans that
+    /// somebody asked for, or that start a repository off, don't go through
+    /// here and are never held back.
+    fn schedule_scan_throttled(
+        &mut self,
+        updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.snapshot_throttle.admit(SNAPSHOT_POLL_COOLDOWN) {
+            PollTiming::Now => self.schedule_scan(updates_tx, cx),
+            PollTiming::Folded => {}
+            PollTiming::After(wait) => {
+                self.snapshot_throttle.waiting = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    this.update(cx, |this, cx| {
+                        this.snapshot_throttle.waiting = None;
+                        this.snapshot_throttle.last_run = Some(Instant::now());
+                        this.schedule_scan(updates_tx, cx);
+                    })
+                    .log_err();
+                }));
+            }
+        }
+    }
+
     fn schedule_scan(
         &mut self,
         updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
@@ -10542,6 +10643,28 @@ impl Repository {
             self.paths_needing_status_update.push(paths);
         }
 
+        match self.status_throttle.admit(STATUS_POLL_COOLDOWN) {
+            PollTiming::Now => self.refresh_statuses(updates_tx, cx),
+            PollTiming::Folded => {}
+            PollTiming::After(wait) => {
+                self.status_throttle.waiting = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    this.update(cx, |this, cx| {
+                        this.status_throttle.waiting = None;
+                        this.status_throttle.last_run = Some(Instant::now());
+                        this.refresh_statuses(updates_tx, cx);
+                    })
+                    .log_err();
+                }));
+            }
+        }
+    }
+
+    fn refresh_statuses(
+        &mut self,
+        updates_tx: Option<mpsc::UnboundedSender<DownstreamUpdate>>,
+        cx: &mut Context<Self>,
+    ) {
         let this = cx.weak_entity();
         let _ = self.send_keyed_job(
             "paths_changed",
@@ -10564,8 +10687,10 @@ impl Repository {
 
                 let has_head = prev_snapshot.head_commit.is_some();
 
+                let poll_slots = this.read_with(&cx, |this, _| this.poll_slots.clone())?;
                 let changed_path_statuses = cx
                     .background_spawn(async move {
+                        let _slot = poll_slots.acquire().await;
                         let changed_paths = GitStore::coalesce_repo_paths(
                             changed_paths
                                 .into_iter()
@@ -11484,6 +11609,26 @@ impl Repository {
 mod tests {
     use super::*;
     use crate::Project;
+
+    #[test]
+    fn poll_throttle_runs_first_event_at_once_and_spaces_the_rest() {
+        let cooldown = Duration::from_secs(60);
+        let mut throttle = PollThrottle::default();
+
+        assert!(matches!(throttle.admit(cooldown), PollTiming::Now));
+        let PollTiming::After(wait) = throttle.admit(cooldown) else {
+            panic!("an event inside the cooldown should wait for it");
+        };
+        assert!(wait <= cooldown);
+
+        throttle.waiting = Some(Task::ready(()));
+        assert!(matches!(throttle.admit(cooldown), PollTiming::Folded));
+
+        throttle.waiting = None;
+        throttle.last_run = Instant::now().checked_sub(cooldown * 2);
+        assert!(matches!(throttle.admit(cooldown), PollTiming::Now));
+    }
+
     use fs::{FakeBlobReadGate, FakeFs, Fs};
     use git::repository::{RepoPath, repo_path};
     use gpui::proptest::prelude::*;
@@ -12761,6 +12906,8 @@ async fn compute_snapshot(
     cx: &mut AsyncApp,
 ) -> RepositorySnapshot {
     log::debug!("starting compute snapshot");
+    let poll_slots = this.read_with(cx, |this, _| this.poll_slots.clone());
+    let _slot = poll_slots.acquire().await;
 
     let (id, work_directory_abs_path, prev_snapshot) = this.update(cx, |this, _| {
         this.paths_needing_status_update.clear();

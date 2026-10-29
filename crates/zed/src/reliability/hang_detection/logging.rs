@@ -42,12 +42,14 @@ impl Reporter {
         task_stats: &[gpui::ThreadTaskStatistics],
         action_stats: &gpui::ActionStatistics,
     ) -> ReportMade {
-        let mut reported_task_hangs = false;
-        reported_task_hangs |= self.report_hanging_foreground(&task_stats);
-        reported_task_hangs |= self.report_hanging_background(&task_stats);
+        let reported_foreground_hang = self.report_hanging_foreground(&task_stats);
+        // Logged, but not a reason to write a trace: with many projects open a
+        // background task over the threshold is routine, and a trace
+        // serializes every thread's timings.
+        self.report_hanging_background(&task_stats);
 
         self.report_hanging_actions(action_stats);
-        reported_task_hangs
+        reported_foreground_hang
     }
 
     fn hold_report(&self, issue: PerfIssue) -> bool {

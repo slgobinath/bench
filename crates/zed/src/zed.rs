@@ -798,8 +798,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             collab_ui::collab_panel::CollabPanel::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
         let worktree_panel = WorktreePanel::load(workspace_handle.clone(), cx.clone());
-        let agent_board_panel =
-            worktree_panel::agent_board::AgentBoardPanel::load(workspace_handle.clone(), cx.clone());
         let linear_panel = LinearPanel::load(workspace_handle.clone(), cx.clone());
         let database_panel = DatabasePanel::load(workspace_handle.clone(), cx.clone());
         let comments_panel =
@@ -829,7 +827,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             add_panel_when_ready(channels_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(debug_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(worktree_panel, workspace_handle.clone(), cx.clone()),
-            add_panel_when_ready(agent_board_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(linear_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(database_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(comments_panel, workspace_handle.clone(), cx.clone()),

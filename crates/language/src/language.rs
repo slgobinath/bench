@@ -169,7 +169,12 @@ where
 }
 
 static WASM_ENGINE: LazyLock<wasmtime::Engine> = LazyLock::new(|| {
-    wasmtime::Engine::new(&wasmtime::Config::new()).expect("Failed to create Wasmtime engine")
+    let mut config = wasmtime::Config::new();
+    // Wasmtime's Mach-port trap handler aborts the process on any fault that
+    // isn't a guest trap, hiding the real crash site from the crash report. All
+    // engines in the process have to agree on this.
+    config.macos_use_mach_ports(false);
+    wasmtime::Engine::new(&config).expect("Failed to create Wasmtime engine")
 });
 
 /// A shared grammar for plain text, exposed for reuse by downstream crates.

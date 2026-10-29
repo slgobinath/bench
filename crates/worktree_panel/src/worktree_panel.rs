@@ -23,7 +23,6 @@
 //! the only owner of the workspace and project list, and a second copy of it
 //! here would be a second thing to keep honest.
 
-pub mod agent_board;
 mod worktree_switcher;
 
 use std::collections::{HashMap, HashSet};
@@ -137,7 +136,6 @@ fn expand_path(path: &str, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub fn init(cx: &mut App) {
-    agent_board::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<WorktreePanel>(window, cx);
@@ -1089,17 +1087,24 @@ impl WorktreePanel {
                         Some(host) => cx.background_spawn(worktrees_on_host(host, root)).await,
                     };
                     cx.update(|cx| {
-                        record_scan(cx, |scans| {
-                            scans.discovered.insert(
-                                scan_key,
-                                Discovery::Found {
-                                    worktrees: found,
-                                    home,
-                                    checked: Some(Instant::now()),
-                                    _refresh: None,
-                                },
-                            );
-                        });
+                        let scans = cx.default_global::<ProjectScans>();
+                        let unchanged = matches!(
+                            scans.discovered.get(&scan_key),
+                            Some(Discovery::Found { worktrees, home: previous_home, .. })
+                                if *worktrees == found && *previous_home == home
+                        );
+                        scans.discovered.insert(
+                            scan_key,
+                            Discovery::Found {
+                                worktrees: found,
+                                home,
+                                checked: Some(Instant::now()),
+                                _refresh: None,
+                            },
+                        );
+                        if !unchanged {
+                            cx.refresh_windows();
+                        }
                     });
                 }
             });
@@ -1246,16 +1251,24 @@ impl WorktreePanel {
                         })
                         .await;
                     cx.update(|cx| {
-                        record_scan(cx, |scans| {
-                            scans.statuses.insert(
-                                root,
-                                StatusScan::Found {
-                                    status,
-                                    checked: Instant::now(),
-                                    _refresh: None,
-                                },
-                            );
-                        });
+                        let scans = cx.default_global::<ProjectScans>();
+                        let unchanged = matches!(
+                            scans.statuses.get(&root),
+                            Some(StatusScan::Found { status: previous, .. }) if *previous == status
+                        );
+                        scans.statuses.insert(
+                            root,
+                            StatusScan::Found {
+                                status,
+                                checked: Instant::now(),
+                                _refresh: None,
+                            },
+                        );
+                        // Most polls find what the last one did, and redrawing
+                        // every window for those is the panel's whole CPU cost.
+                        if !unchanged {
+                            cx.refresh_windows();
+                        }
                     });
                 }
             });
@@ -1400,45 +1413,6 @@ impl WorktreePanel {
             })
             .detach();
         });
-    }
-
-    /// Opens the worktree `directory` is in, when the window does not have it
-    /// open, and dispatches `then` in it once it is showing. Whether there
-    /// was one to open: a directory in no worktree the panel lists, or in one
-    /// already open, is left to the caller.
-    pub(crate) fn open_worktree_containing(
-        &mut self,
-        directory: &Path,
-        then: Box<dyn gpui::Action>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        // The longest root, so a directory in a worktree nested in its
-        // checkout opens the worktree.
-        let worktree = self
-            .tree(cx)
-            .into_iter()
-            .flat_map(|repository| repository.worktrees)
-            .filter(|worktree| {
-                worktree
-                    .root
-                    .as_ref()
-                    .is_some_and(|root| directory.starts_with(root))
-            })
-            .max_by_key(|worktree| {
-                worktree
-                    .root
-                    .as_ref()
-                    .map_or(0, |root| root.as_os_str().len())
-            });
-        let Some(worktree) = worktree.filter(|worktree| worktree.workspace.is_none()) else {
-            return false;
-        };
-        let Some(root) = worktree.root else {
-            return false;
-        };
-        self.open_worktree(worktree.key, root, worktree.name, Some(then), window, cx);
-        true
     }
 
     /// Adds a project to the window: asks for folders, then opens them.

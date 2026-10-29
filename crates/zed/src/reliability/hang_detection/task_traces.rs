@@ -8,6 +8,12 @@ use util::ResultExt;
 use crate::STARTUP_TIME;
 
 pub fn save_any(main_thread_id: ThreadId) -> Option<PathBuf> {
+    // The miniprofiler collects its own trace while it is open, and serializing
+    // every thread's timings to throw the result away is not free.
+    if profiler::trace_enabled() {
+        return None;
+    }
+
     cleanup_old_hang_traces();
     let thread_timings = gpui::profiler::get_all_timings(TasksIncluded::CompletedAndRunning);
 
@@ -22,26 +28,18 @@ pub fn save_any(main_thread_id: ThreadId) -> Option<PathBuf> {
         })
         .collect::<Vec<_>>();
 
-    let Some(timings) = serde_json::to_string(&thread_timings)
+    let timings = serde_json::to_string(&thread_timings)
         .context("hang timings serialization")
-        .log_err()
-    else {
-        return None;
-    };
+        .log_err()?;
 
-    if profiler::trace_enabled() {
-        None
-    } else {
-        cleanup_old_hang_traces();
-        let trace_path = paths::hang_traces_dir().join(&format!(
-            "hang-{}.miniprof.json",
-            chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-        ));
-        std::fs::write(&trace_path, timings)
-            .context("hang trace file writing")
-            .log_err();
-        Some(trace_path)
-    }
+    let trace_path = paths::hang_traces_dir().join(&format!(
+        "hang-{}.miniprof.json",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+    std::fs::write(&trace_path, timings)
+        .context("hang trace file writing")
+        .log_err();
+    Some(trace_path)
 }
 
 pub fn cleanup_old_hang_traces() {

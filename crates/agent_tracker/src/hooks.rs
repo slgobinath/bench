@@ -14,7 +14,7 @@
 //! hook's stdin, and the hook appends it to a file Bench reads on its sweep.
 //! Every event carries `session_id`, `cwd` and `hook_event_name`, which is all
 //! the state model needs, and a `Notification` says what the agent is asking.
-//! Everything else the agent board shows comes from the session's transcript
+//! Everything else the worktree panel shows comes from the session's transcript
 //! instead, which is written whether or not an organization allows user
 //! hooks; see [`crate::activity`].
 //!

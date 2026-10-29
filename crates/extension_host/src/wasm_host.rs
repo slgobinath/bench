@@ -560,6 +560,9 @@ fn wasm_engine(executor: &BackgroundExecutor) -> wasmtime::Engine {
         .get_or_init(|| {
             let mut config = wasmtime::Config::new();
             config.wasm_component_model(true);
+            // Must match the setting in `language`'s engine, which wasmtime
+            // checks.
+            config.macos_use_mach_ports(false);
             config
                 .enable_incremental_compilation(cache_store())
                 .unwrap();
