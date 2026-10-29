@@ -299,6 +299,9 @@ struct WorktreeRow {
     /// What the agent here that wants you most is doing; see
     /// [`AgentTracker::phase_for`].
     phase: Option<Phase>,
+    /// Where the user dragged the worktree to among its project's; see
+    /// [`worktree_metadata::WorktreeMetadata::order`].
+    order: Option<u32>,
 }
 
 /// What is known about one project's pull requests; see
@@ -464,16 +467,24 @@ enum SortBy {
     /// Most recently worked on first: an agent's activity or a file's edit,
     /// whichever is later.
     RecentWork,
+    /// The order the user dragged projects and worktrees into.
+    Manual,
 }
 
 impl SortBy {
-    const ALL: [SortBy; 3] = [SortBy::Name, SortBy::AgentActivity, SortBy::RecentWork];
+    const ALL: [SortBy; 4] = [
+        SortBy::Name,
+        SortBy::AgentActivity,
+        SortBy::RecentWork,
+        SortBy::Manual,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             SortBy::Name => "Name",
             SortBy::AgentActivity => "Recent Agent Activity",
             SortBy::RecentWork => "Recently Worked On",
+            SortBy::Manual => "Manual",
         }
     }
 
@@ -481,7 +492,7 @@ impl SortBy {
     /// for the order by name.
     fn recency(self, worktree: &WorktreeRow) -> Option<SystemTime> {
         match self {
-            SortBy::Name => None,
+            SortBy::Name | SortBy::Manual => None,
             SortBy::AgentActivity => worktree.last_active,
             SortBy::RecentWork => worktree.last_active.max(worktree.status.last_edit),
         }
@@ -513,6 +524,21 @@ fn arrangement(cx: &mut App) -> Arrangement {
         .unwrap_or_default();
     cx.set_global(arrangement);
     arrangement
+}
+
+/// Switches the panel to the order the user dragged things into, so that a
+/// drop is not undone by the sort being on.
+fn use_manual_order(cx: &mut App) {
+    let current = arrangement(cx);
+    if current.sort_by != SortBy::Manual {
+        set_arrangement(
+            Arrangement {
+                sort_by: SortBy::Manual,
+                ..current
+            },
+            cx,
+        );
+    }
 }
 
 fn set_arrangement(arrangement: Arrangement, cx: &mut App) {
@@ -772,11 +798,18 @@ impl WorktreePanel {
                 None => groups.push((key, vec![open])),
             }
         }
-        for key in multi_workspace.project_group_keys() {
-            if !groups.iter().any(|(held, _)| held.matches(&key)) {
-                groups.push((key, Vec::new()));
+        let project_order = multi_workspace.project_group_keys();
+        for key in &project_order {
+            if !groups.iter().any(|(held, _)| held.matches(key)) {
+                groups.push((key.clone(), Vec::new()));
             }
         }
+        groups.sort_by_key(|(key, _)| {
+            project_order
+                .iter()
+                .position(|ordered| ordered.matches(key))
+                .unwrap_or(usize::MAX)
+        });
 
         let mut rows: Vec<RepositoryRow> = groups
             .into_iter()
@@ -791,9 +824,8 @@ impl WorktreePanel {
 
         hide_worktrees_inside_other_checkouts(&mut rows);
 
-        // Ordered by name so a row does not move when an unrelated worktree is
-        // opened or closed.
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        // In the order the window keeps its projects in, which is the order
+        // they were dragged into; see [`arrange`] for the other sorts.
         rows
     }
 
@@ -938,6 +970,7 @@ impl WorktreePanel {
                         .zip(tracker.as_ref())
                         .and_then(|(root, tracker)| tracker.read(cx).phase_for(root)),
                     linked_issue: stored.as_ref().and_then(|stored| stored.issue.clone()),
+                    order: stored.as_ref().and_then(|stored| stored.order),
                     title: stored
                         .as_ref()
                         .and_then(|stored| stored.shown_title())
@@ -3014,6 +3047,7 @@ impl WorktreePanel {
         &self,
         row: &WorktreeRow,
         project: Option<&SharedString>,
+        siblings: Option<Arc<[PathBuf]>>,
         index: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3080,6 +3114,30 @@ impl WorktreePanel {
         worktree_card(row, project, index, sync_button, cx)
             .ml_3()
             .mr_1p5()
+            .when_some(
+                row.root.clone().filter(|_| !row.is_main).zip(siblings),
+                |this, (root, siblings)| {
+                    let dragged = DraggedWorktree {
+                        root: root.clone(),
+                        name: row.name.clone(),
+                        siblings,
+                    };
+                    let hovered = root.clone();
+                    this.on_drag(dragged, |dragged, _, _, cx| {
+                        cx.new(|_| DragPreview(dragged.name.clone()))
+                    })
+                    .drag_over::<DraggedWorktree>(move |style, dragged, _, cx| {
+                        if dragged.siblings.contains(&hovered) {
+                            style.border_color(cx.theme().colors().border_focused)
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(move |this, dragged: &DraggedWorktree, _, cx| {
+                        this.move_worktree(dragged, &root, cx)
+                    }))
+                },
+            )
             .when_some(row.root.clone(), |this, root| {
                 let issue = row.issue.as_ref().map(|issue| issue.identifier.clone());
                 this.on_mouse_down(
@@ -3110,6 +3168,61 @@ impl WorktreePanel {
 }
 
 impl WorktreePanel {
+    /// Moves a dragged project to the place of the one it was dropped on.
+    fn move_project(
+        &mut self,
+        dragged: &DraggedProject,
+        target: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(from) = dragged.order.iter().position(|key| key.matches(&dragged.key)) else {
+            return;
+        };
+        let Some(to) = dragged.order.iter().position(|key| key.matches(target)) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let mut order = dragged.order.to_vec();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        if let Some(multi_workspace) = self.multi_workspace.upgrade() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.reorder_project_groups(&order, cx)
+            });
+        }
+        use_manual_order(cx);
+    }
+
+    /// Moves a dragged worktree to the place of the one it was dropped on,
+    /// and stores the project's whole order: the order on screen may have come
+    /// from a sort, and the moved worktree has to stay where it was dropped
+    /// when the sort is left.
+    fn move_worktree(&mut self, dragged: &DraggedWorktree, target: &Path, cx: &mut Context<Self>) {
+        let Some(from) = dragged.siblings.iter().position(|root| *root == dragged.root) else {
+            return;
+        };
+        let Some(to) = dragged.siblings.iter().position(|root| root == target) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        let mut order = dragged.siblings.to_vec();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        WorktreeMetadataStore::global(cx).update(cx, |store, cx| {
+            for (position, root) in order.iter().enumerate() {
+                let position = u32::try_from(position).unwrap_or(u32::MAX);
+                if store.get(root, cx).order != Some(position) {
+                    store.update(root, |metadata| metadata.order = Some(position), cx);
+                }
+            }
+        });
+        use_manual_order(cx);
+    }
+
     /// Pulls the commits the worktree's branch is behind by, then pushes the
     /// ones it is ahead by. Pulling only fast-forwards: a branch that has
     /// gone its own way needs a merge or a rebase, and which is not for a
@@ -3217,6 +3330,42 @@ impl WorktreePanel {
 /// `project` is named on the card when the card is not under its project's
 /// row: grouped any other way, which project a worktree is in is not said
 /// anywhere else.
+/// A project row being dragged to another place in the panel.
+struct DraggedProject {
+    key: ProjectGroupKey,
+    name: SharedString,
+    /// Every project in the order the panel shows them, which is the order the
+    /// drop is applied to: the window's own order may differ from what the
+    /// sort has put on screen.
+    order: Arc<[ProjectGroupKey]>,
+}
+
+/// A worktree card being dragged to another place in its project.
+struct DraggedWorktree {
+    root: PathBuf,
+    name: SharedString,
+    /// The roots of the project's worktrees as the panel shows them, the
+    /// repository's own checkout left out: it stays first.
+    siblings: Arc<[PathBuf]>,
+}
+
+/// What follows the pointer while something is dragged.
+struct DragPreview(SharedString);
+
+impl Render for DragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.elevated_surface_background)
+            .child(Label::new(self.0.clone()).single_line())
+    }
+}
+
 fn worktree_card(
     row: &WorktreeRow,
     project: Option<&SharedString>,
@@ -3757,9 +3906,15 @@ struct Section<'a> {
 /// have none, and follow the sort.
 fn arrange(tree: &[RepositoryRow], arrangement: Arrangement) -> Vec<Section<'_>> {
     let Arrangement { group_by, sort_by } = arrangement;
+    let mut ordered: Vec<&RepositoryRow> = tree.iter().collect();
+    // By name so a row does not move when an unrelated worktree is opened or
+    // closed. Stable, so that projects of the same name keep their order.
+    if sort_by != SortBy::Manual {
+        ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    }
     let mut sections: Vec<Section<'_>> = Vec::new();
     if group_by == GroupBy::Project {
-        sections.extend(tree.iter().map(|row| Section {
+        sections.extend(ordered.iter().copied().map(|row| Section {
             id: GroupId::Project(row.key.clone()),
             project: Some(row),
             label: row.name.clone(),
@@ -3767,7 +3922,7 @@ fn arrange(tree: &[RepositoryRow], arrangement: Arrangement) -> Vec<Section<'_>>
             worktrees: row.worktrees.iter().map(|worktree| (row, worktree)).collect(),
         }));
     } else {
-        for row in tree {
+        for row in ordered.iter().copied() {
             for worktree in &row.worktrees {
                 let (rank, label) = group_of(group_by, worktree);
                 match sections.iter_mut().find(|section| section.label == label) {
@@ -3787,14 +3942,24 @@ fn arrange(tree: &[RepositoryRow], arrangement: Arrangement) -> Vec<Section<'_>>
     // Stable sorts throughout, so that whatever recency does not decide stays
     // in the tree's own order: projects by name, and a project's own checkout
     // ahead of its other worktrees.
-    if sort_by != SortBy::Name {
-        for section in &mut sections {
-            section
-                .worktrees
-                .sort_by_key(|(_, worktree)| std::cmp::Reverse(sort_by.recency(worktree)));
+    match sort_by {
+        SortBy::Name => {}
+        SortBy::Manual => {
+            for section in &mut sections {
+                section.worktrees.sort_by_key(|(_, worktree)| {
+                    (!worktree.is_main, worktree.order.unwrap_or(u32::MAX))
+                });
+            }
+        }
+        SortBy::AgentActivity | SortBy::RecentWork => {
+            for section in &mut sections {
+                section
+                    .worktrees
+                    .sort_by_key(|(_, worktree)| std::cmp::Reverse(sort_by.recency(worktree)));
+            }
         }
     }
-    let by_recency = sort_by != SortBy::Name
+    let by_recency = matches!(sort_by, SortBy::AgentActivity | SortBy::RecentWork)
         && matches!(group_by, GroupBy::Project | GroupBy::LinearProject);
     let latest = |section: &Section| {
         section
@@ -5864,6 +6029,10 @@ impl Render for WorktreePanel {
         let scroll = cx.default_global::<PanelView>().scroll.clone();
         let arrangement = arrangement(cx);
         let sections = arrange(&tree, arrangement);
+        let project_order: Arc<[ProjectGroupKey]> = sections
+            .iter()
+            .filter_map(|section| Some(section.project?.key.clone()))
+            .collect();
 
         v_flex()
             .key_context("WorktreePanel")
@@ -5920,6 +6089,14 @@ impl Render for WorktreePanel {
                         )
                     })
                     .children(sections.iter().enumerate().map(|(index, section)| {
+                        let siblings: Option<Arc<[PathBuf]>> = section.project.map(|_| {
+                            section
+                                .worktrees
+                                .iter()
+                                .filter(|(_, worktree)| !worktree.is_main)
+                                .filter_map(|(_, worktree)| worktree.root.clone())
+                                .collect()
+                        });
                         let section_matches = filter.as_ref().is_none_or(|filter| {
                             section.project.is_some() && matches_filter(&section.label, filter)
                         });
@@ -5947,8 +6124,13 @@ impl Render for WorktreePanel {
                                     // goes without saying.
                                     let project =
                                         section.project.is_none().then_some(&project.name);
-                                    let element =
-                                        self.render_worktree(worktree, project, worktree_index, cx);
+                                    let element = self.render_worktree(
+                                        worktree,
+                                        project,
+                                        siblings.clone(),
+                                        worktree_index,
+                                        cx,
+                                    );
                                     worktree_index += 1;
                                     element.into_any_element()
                                 })
@@ -5960,7 +6142,29 @@ impl Render for WorktreePanel {
                             return div().into_any_element();
                         }
                         let header = match section.project {
-                            Some(row) => self.render_repository(row, index, cx).into_any_element(),
+                            Some(row) => {
+                                let dragged = DraggedProject {
+                                    key: row.key.clone(),
+                                    name: row.name.clone(),
+                                    order: project_order.clone(),
+                                };
+                                let target = row.key.clone();
+                                div()
+                                    .id(("project", index))
+                                    .on_drag(dragged, |dragged, _, _, cx| {
+                                        cx.new(|_| DragPreview(dragged.name.clone()))
+                                    })
+                                    .drag_over::<DraggedProject>(|style, _, _, cx| {
+                                        style.bg(cx.theme().colors().drop_target_background)
+                                    })
+                                    .on_drop(cx.listener(
+                                        move |this, dragged: &DraggedProject, _, cx| {
+                                            this.move_project(dragged, &target, cx)
+                                        },
+                                    ))
+                                    .child(self.render_repository(row, index, cx))
+                                    .into_any_element()
+                            }
                             None => self.render_heading(section, index, cx).into_any_element(),
                         };
                         v_flex()
@@ -8156,6 +8360,7 @@ pub(crate) mod tests {
             status: WorktreeStatus::default(),
             last_active: None,
             phase: None,
+            order: None,
         }
     }
 
@@ -8204,6 +8409,39 @@ pub(crate) mod tests {
         assert_eq!(labels(&sections), ["alpha", "beta"]);
         assert_eq!(names(&sections[0]), ["alpha", "fix"]);
         assert!(sections.iter().all(|section| section.project.is_some()));
+    }
+
+    /// Manual order keeps the tree's own order of projects instead of sorting
+    /// them by name, and puts a project's dragged worktrees where they were
+    /// put, its own checkout still first.
+    #[test]
+    fn manual_order_follows_the_tree_and_the_stored_positions() {
+        let tree = vec![
+            a_project("beta", |key| {
+                let mut second = a_worktree_row(key, "second", false);
+                second.order = Some(1);
+                let mut first = a_worktree_row(key, "first", false);
+                first.order = Some(0);
+                vec![
+                    second,
+                    a_worktree_row(key, "unplaced", false),
+                    first,
+                    a_worktree_row(key, "beta", true),
+                ]
+            }),
+            a_project("alpha", |key| vec![a_worktree_row(key, "alpha", true)]),
+        ];
+
+        let sections = arrange(
+            &tree,
+            Arrangement {
+                sort_by: SortBy::Manual,
+                ..Arrangement::default()
+            },
+        );
+
+        assert_eq!(labels(&sections), ["beta", "alpha"]);
+        assert_eq!(names(&sections[0]), ["beta", "first", "second", "unplaced"]);
     }
 
     /// Sorting by agent activity puts the project and the worktree an agent

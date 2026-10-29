@@ -95,6 +95,11 @@ pub struct WorktreeMetadata {
     /// and a project without one offers no issues, only a name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_team: Option<LinearTeam>,
+    /// Where the worktree sits among its project's other worktrees when the
+    /// panel is in manual order. `None` is "after every worktree that has
+    /// one".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<u32>,
 }
 
 /// A Linear team, as much of it as is needed to filter issues by it and to

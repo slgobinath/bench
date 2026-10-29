@@ -941,6 +941,30 @@ impl MultiWorkspace {
         true
     }
 
+    /// Puts the project groups in the order of `keys`. Groups it does not
+    /// name keep their relative order after the ones it does.
+    pub fn reorder_project_groups(&mut self, keys: &[ProjectGroupKey], cx: &mut Context<Self>) {
+        let mut remaining = std::mem::take(&mut self.project_groups);
+        let mut ordered = Vec::with_capacity(remaining.len());
+        for key in keys {
+            if let Some(index) = remaining.iter().position(|group| group.key == *key) {
+                ordered.push(remaining.remove(index));
+            }
+        }
+        ordered.append(&mut remaining);
+        let unchanged = ordered
+            .iter()
+            .map(|group| &group.key)
+            .eq(self.project_groups.iter().map(|group| &group.key));
+        self.project_groups = ordered;
+        if unchanged {
+            return;
+        }
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+    }
+
     pub fn workspaces_for_project_group(
         &self,
         key: &ProjectGroupKey,
