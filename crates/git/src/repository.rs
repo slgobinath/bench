@@ -2545,12 +2545,20 @@ impl GitRepository for RealGitRepository {
         self.executor
             .spawn(async move {
                 let git_binary = git_binary?;
-                let mut args: Vec<String> =
-                    vec!["diff".into(), "--numstat".into(), "--no-renames".into()];
-                match diff {
-                    DiffStatType::HeadToIndex => args.extend(["--cached".into(), "HEAD".into()]),
-                    DiffStatType::HeadToWorktree => args.push("HEAD".into()),
-                    DiffStatType::IndexToWorktree => {}
+                // Plumbing rather than `git diff`: the porcelain refreshes the
+                // index and writes it back even under `--no-optional-locks`, and
+                // that write is a change inside `.git` which schedules another
+                // rescan, which runs this again.
+                let mut args: Vec<String> = match diff {
+                    DiffStatType::HeadToIndex => {
+                        vec!["diff-index".into(), "--cached".into()]
+                    }
+                    DiffStatType::HeadToWorktree => vec!["diff-index".into()],
+                    DiffStatType::IndexToWorktree => vec!["diff-files".into()],
+                };
+                args.extend(["--numstat".into(), "--no-renames".into()]);
+                if !matches!(diff, DiffStatType::IndexToWorktree) {
+                    args.push("HEAD".into());
                 }
                 if !path_prefixes.is_empty() {
                     args.push("--".into());
@@ -4477,6 +4485,65 @@ mod tests {
         assert_same_path(
             original_repo_path_from_common_dir(&repository.common_dir).unwrap(),
             repo_dir.path(),
+        );
+    }
+
+    #[gpui::test]
+    async fn test_diff_stat_counts_lines_without_rewriting_the_index(cx: &mut TestAppContext) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        git_init_repo(repo_dir.path());
+        fs::write(repo_dir.path().join("changed.txt"), "one\ntwo\n").unwrap();
+        fs::write(repo_dir.path().join("touched.txt"), "same\n").unwrap();
+        git_command(repo_dir.path(), ["add", "."]);
+        git_command(repo_dir.path(), ["commit", "-m", "base"]);
+
+        fs::write(repo_dir.path().join("changed.txt"), "one\nthree\nfour\n").unwrap();
+        git_command(repo_dir.path(), ["add", "changed.txt"]);
+        fs::write(
+            repo_dir.path().join("changed.txt"),
+            "one\nthree\nfour\nfive\n",
+        )
+        .unwrap();
+        // Same content, different stat: what makes `git diff` rewrite the index.
+        fs::File::options()
+            .write(true)
+            .open(repo_dir.path().join("touched.txt"))
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000))
+            .unwrap();
+
+        let repository = RealGitRepository::new(
+            &repo_dir.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .unwrap();
+        let index_path = repo_dir.path().join(".git/index");
+        let index_modified = fs::metadata(&index_path).unwrap().modified().unwrap();
+
+        for (label, diff, added, deleted) in [
+            ("head to index", DiffStatType::HeadToIndex, 2, 1),
+            ("index to worktree", DiffStatType::IndexToWorktree, 1, 0),
+            ("head to worktree", DiffStatType::HeadToWorktree, 3, 1),
+        ] {
+            let stat = repository.diff_stat(diff, &[]).await.unwrap();
+            assert_eq!(
+                stat.entries.as_ref(),
+                [(
+                    RepoPath::new("changed.txt").unwrap(),
+                    crate::status::DiffStat { added, deleted }
+                )],
+                "{label}"
+            );
+        }
+        assert_eq!(
+            fs::metadata(&index_path).unwrap().modified().unwrap(),
+            index_modified,
+            "a rewritten index is a change inside .git, which schedules another rescan"
         );
     }
 

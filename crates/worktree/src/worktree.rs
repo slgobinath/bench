@@ -25,10 +25,10 @@ use futures::{
 use futures_lite::future::yield_now;
 use fuzzy::CharBag;
 use git::{
-    BISECT_LOG, COMMIT_MESSAGE, DOT_GIT, FETCH_HEAD, FSMONITOR_DAEMON, GC_PID, GITIGNORE,
-    HOOKS_DIR, INFO_DIR, LFS_DIR, LOGS_DIR, LOGS_REF_STASH, OBJECTS_DIR, ORIG_HEAD,
+    BISECT_LOG, COMMIT_MESSAGE, DOT_GIT, FETCH_HEAD, FSMONITOR_DAEMON, GC_PID, GITIGNORE, HEAD,
+    HOOKS_DIR, INDEX, INFO_DIR, LFS_DIR, LOGS_DIR, LOGS_REF_STASH, OBJECTS_DIR, ORIG_HEAD,
     REBASE_APPLY_DIR, REBASE_MERGE_DIR, REFS_DIR, REFTABLE_DIR, REPO_EXCLUDE, SEQUENCER_DIR,
-    status::GitSummary,
+    WORKTREES_DIR, status::GitSummary,
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
@@ -3724,6 +3724,43 @@ async fn watch_dir_tree(root_abs_path: PathBuf, fs: &dyn Fs, watcher: &dyn Watch
     }
 }
 
+/// The git directory of the one checkout a change inside `dot_git_abs_path`
+/// concerns, when it concerns only one: the index, or anything a linked
+/// worktree keeps under `worktrees/<name>/` other than its `HEAD`, which
+/// `git worktree list` shows to every checkout. Without this, a write to one
+/// linked worktree's index would rescan every checkout sharing the
+/// repository. A linked worktree's directory appearing or going away is a
+/// worktree added or removed, which every checkout lists, but its merely
+/// changing is a file inside it being replaced.
+fn owning_git_dir(
+    dot_git_abs_path: &Path,
+    path_in_git_dir: &Path,
+    kind: Option<PathEventKind>,
+) -> Option<PathBuf> {
+    let mut components = path_in_git_dir
+        .components()
+        .map(|component| component.as_os_str());
+    match (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) {
+        (Some(file), None, _, _) if file == INDEX => Some(dot_git_abs_path.to_path_buf()),
+        (Some(worktrees), Some(name), None, _)
+            if worktrees == WORKTREES_DIR && matches!(kind, Some(PathEventKind::Changed)) =>
+        {
+            Some(dot_git_abs_path.join(worktrees).join(name))
+        }
+        (Some(worktrees), Some(name), Some(file), rest)
+            if worktrees == WORKTREES_DIR && !(file == HEAD && rest.is_none()) =>
+        {
+            Some(dot_git_abs_path.join(worktrees).join(name))
+        }
+        _ => None,
+    }
+}
+
 async fn is_dot_git(path: &Path, fs: &dyn Fs) -> bool {
     if let Some(file_name) = path.file_name()
         && file_name == DOT_GIT
@@ -4893,6 +4930,7 @@ impl BackgroundScanner {
         ];
 
         let mut dot_git_abs_paths = Vec::new();
+        let mut owned_git_dirs = Vec::new();
         let mut work_dirs_needing_exclude_update = Vec::new();
 
         {
@@ -4973,7 +5011,21 @@ impl BackgroundScanner {
                         continue;
                     }
 
-                    if !dot_git_abs_paths.contains(&dot_git_abs_path) {
+                    if let Some(git_dir) =
+                        owning_git_dir(&dot_git_abs_path, &path_in_git_dir, event.kind)
+                    {
+                        if !owned_git_dirs.contains(&git_dir) {
+                            log::debug!(
+                                "detected update within the git directory {git_dir:?}: {abs_path:?}"
+                            );
+                            owned_git_dirs.push(git_dir);
+                        }
+                        // Replacing the file also touches `.git` itself, and that
+                        // bare event would otherwise rescan every checkout.
+                        if !dot_git_dirs_with_ignored_events.contains(&dot_git_abs_path) {
+                            dot_git_dirs_with_ignored_events.push(dot_git_abs_path.clone());
+                        }
+                    } else if !dot_git_abs_paths.contains(&dot_git_abs_path) {
                         log::debug!(
                             "detected update within git repo at {dot_git_abs_path:?}: {abs_path:?}"
                         );
@@ -5147,7 +5199,7 @@ impl BackgroundScanner {
             }
         }
 
-        if relative_paths.is_empty() && dot_git_abs_paths.is_empty() {
+        if relative_paths.is_empty() && dot_git_abs_paths.is_empty() && owned_git_dirs.is_empty() {
             return;
         }
 
@@ -5191,8 +5243,9 @@ impl BackgroundScanner {
         )
         .await;
 
-        let affected_repo_roots = if !dot_git_abs_paths.is_empty() {
-            self.update_git_repositories(dot_git_abs_paths).await
+        let affected_repo_roots = if !dot_git_abs_paths.is_empty() || !owned_git_dirs.is_empty() {
+            self.update_git_repositories(dot_git_abs_paths, owned_git_dirs)
+                .await
         } else {
             Vec::new()
         };
@@ -6170,11 +6223,35 @@ impl BackgroundScanner {
         state.snapshot.entries_by_id.edit(entries_by_id_edits, ());
     }
 
-    async fn update_git_repositories(&self, dot_git_paths: Vec<PathBuf>) -> Vec<Arc<Path>> {
-        log::trace!("reloading repositories: {dot_git_paths:?}");
+    async fn update_git_repositories(
+        &self,
+        dot_git_paths: Vec<PathBuf>,
+        owned_git_dirs: Vec<PathBuf>,
+    ) -> Vec<Arc<Path>> {
+        log::trace!("reloading repositories: {dot_git_paths:?}, {owned_git_dirs:?}");
         let mut state = self.state.lock().await;
         let scan_id = state.snapshot.scan_id;
         let mut affected_repo_roots = Vec::new();
+        for git_dir in owned_git_dirs {
+            let git_dir = SanitizedPath::new(&git_dir);
+            let owner_ids = state
+                .snapshot
+                .git_repositories
+                .iter()
+                .filter(|(_, repo)| {
+                    SanitizedPath::new(repo.repository_dir_abs_path.as_ref()) == git_dir
+                })
+                .map(|(&work_directory_id, _)| work_directory_id)
+                .collect::<Vec<_>>();
+            for work_directory_id in owner_ids {
+                state
+                    .snapshot
+                    .git_repositories
+                    .update(&work_directory_id, |entry| {
+                        entry.git_dir_scan_id = scan_id;
+                    });
+            }
+        }
         for dot_git_dir in dot_git_paths {
             // Several repositories can share a git directory: a linked worktree's
             // commondir is the main checkout's `.git`, so a ref update there must
@@ -7429,10 +7506,10 @@ mod tests {
     use super::{
         BackgroundScanner, BackgroundScannerPhase, BackgroundScannerState, IgnoreStack,
         NullWatcher, RemovedEntries, STREAM_BLOCK_BYTES, ScanRequest, UpdateIgnoreStatusJob,
-        Worktree, stream_utf8_into_rope,
+        Worktree, owning_git_dir, stream_utf8_into_rope,
     };
     use collections::{HashMap, HashSet};
-    use fs::{FakeFs, Fs, RemoveOptions, RenameOptions};
+    use fs::{FakeFs, Fs, PathEventKind, RemoveOptions, RenameOptions};
     use futures::{FutureExt as _, channel::mpsc};
     use gpui::TestAppContext;
     use serde_json::json;
@@ -7450,6 +7527,42 @@ mod tests {
             .await
             .unwrap()
             .map(|(rope, line_ending)| (rope.to_string(), line_ending))
+    }
+
+    #[test]
+    fn test_owning_git_dir() {
+        let dot_git = Path::new("/repo/.git");
+        let owner = |path: &str, kind| owning_git_dir(dot_git, Path::new(path), kind);
+        let changed = Some(PathEventKind::Changed);
+
+        assert_eq!(owner("index", changed), Some(dot_git.to_path_buf()));
+        assert_eq!(
+            owner("worktrees/feature/index", changed),
+            Some(dot_git.join("worktrees/feature"))
+        );
+        assert_eq!(
+            owner("worktrees/feature/logs/HEAD", changed),
+            Some(dot_git.join("worktrees/feature"))
+        );
+        assert_eq!(
+            owner("worktrees/feature", changed),
+            Some(dot_git.join("worktrees/feature"))
+        );
+
+        // Seen by every checkout through `git worktree list`.
+        assert_eq!(owner("worktrees/feature/HEAD", changed), None);
+        assert_eq!(
+            owner("worktrees/feature", Some(PathEventKind::Created)),
+            None
+        );
+        assert_eq!(
+            owner("worktrees/feature", Some(PathEventKind::Removed)),
+            None
+        );
+        assert_eq!(owner("worktrees", changed), None);
+        assert_eq!(owner("HEAD", changed), None);
+        assert_eq!(owner("refs/heads/main", changed), None);
+        assert_eq!(owner("packed-refs", changed), None);
     }
 
     #[test]

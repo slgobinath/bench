@@ -5254,6 +5254,103 @@ async fn test_shared_common_dir_event_updates_all_repositories(
 }
 
 #[gpui::test]
+async fn test_checkout_specific_common_dir_events_update_only_their_repository(
+    executor: BackgroundExecutor,
+    cx: &mut TestAppContext,
+) {
+    // Every checkout writes its own index, and `git diff` rewrites it even under
+    // `--no-optional-locks`. Rescanning every checkout that shares the common
+    // directory on each such write lets checkouts keep rescanning each other.
+    init_test(cx);
+
+    use git::repository::Worktree as GitWorktree;
+
+    let fs = FakeFs::new(executor.clone());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "main_repo": {
+                ".git": {},
+                "file.txt": "content",
+            },
+        }),
+    )
+    .await;
+    fs.add_linked_worktree_for_repo(
+        Path::new(path!("/project/main_repo/.git")),
+        false,
+        GitWorktree {
+            path: PathBuf::from(path!("/project/linked")),
+            ref_name: Some("refs/heads/feature".into()),
+            sha: "abc123".into(),
+            is_main: false,
+            is_bare: false,
+        },
+    )
+    .await;
+
+    let tree = Worktree::local(
+        path!("/project").as_ref(),
+        true,
+        fs.clone(),
+        Arc::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    tree.update(cx, |tree, _| tree.as_local().unwrap().scan_complete())
+        .await;
+    cx.run_until_parked();
+
+    let mut updated_work_dirs_after = |path: &str, kind: PathEventKind| {
+        let mut events = cx.events(&tree);
+        fs.emit_fs_event(path, Some(kind));
+        executor.run_until_parked();
+        let mut updated_work_dirs = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let Event::UpdatedGitRepositories(updates) = event {
+                updated_work_dirs.extend(
+                    updates
+                        .iter()
+                        .filter_map(|update| update.new_work_directory_abs_path.clone()),
+                );
+            }
+        }
+        updated_work_dirs.sort();
+        updated_work_dirs
+    };
+    let linked: Arc<Path> = Arc::from(Path::new(path!("/project/linked")));
+    let main_repo: Arc<Path> = Arc::from(Path::new(path!("/project/main_repo")));
+
+    assert_eq!(
+        updated_work_dirs_after(
+            path!("/project/main_repo/.git/worktrees/feature/index"),
+            PathEventKind::Changed
+        ),
+        std::slice::from_ref(&linked),
+        "a linked worktree's index belongs to that worktree alone"
+    );
+    assert_eq!(
+        updated_work_dirs_after(
+            path!("/project/main_repo/.git/index"),
+            PathEventKind::Changed
+        ),
+        std::slice::from_ref(&main_repo),
+        "the main checkout's index belongs to the main checkout alone"
+    );
+    assert_eq!(
+        updated_work_dirs_after(
+            path!("/project/main_repo/.git/worktrees/feature/HEAD"),
+            PathEventKind::Changed
+        ),
+        [linked, main_repo],
+        "a linked worktree's HEAD shows in every checkout's worktree list"
+    );
+}
+
+#[gpui::test]
 async fn test_noisy_dot_git_events_do_not_emit_git_repo_update(
     executor: BackgroundExecutor,
     cx: &mut TestAppContext,

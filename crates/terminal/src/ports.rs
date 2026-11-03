@@ -2,9 +2,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use anyhow::{Context as _, Result};
+use parking_lot::Mutex;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+/// Kept between scans so that a process's command line, which is read once
+/// with `UpdateKind::OnlyIfNotSet`, isn't fetched again for every process on
+/// the machine each time; sysinfo tells a reused pid apart by its start time.
+static PROCESSES: LazyLock<Mutex<System>> = LazyLock::new(|| Mutex::new(System::new()));
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ListeningPort {
@@ -89,7 +96,7 @@ fn processes_under(shells: &[(u32, PathBuf)]) -> HashMap<u32, PathBuf> {
     if shells.is_empty() {
         return HashMap::new();
     }
-    let mut system = System::new();
+    let mut system = PROCESSES.lock();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
