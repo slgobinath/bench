@@ -3,19 +3,20 @@
 
 # Bench
 
-**An agentic IDE, built by an IntelliJ fan, for working across many repositories and many worktrees at once.**
+**An agentic IDE for working across many repositories and many worktrees at once.**
 
 ![Bench: the worktree panel on the left, the New Worktree dialog linking a Linear issue, and the project tree on the right](branding/screenshot.png)
 
 Bench is where the agents do the typing and you do the steering. Each task gets its own git worktree, each worktree gets its own agent running in a terminal, and the editor is the bench they all sit on. You pick up a Linear issue, Bench makes a worktree for it, starts Claude Code in it, and tells you when the agent needs you.
 
-It is a fork of [Zed](https://github.com/zed-industries/zed), so it is fast and native. It borrows what I miss from IntelliJ: a project tree that stays put, a tinted title bar per project, tabs for everything, and a sidebar that answers "what am I working on?" at a glance.
+It is a native desktop app written in Rust, with a GPU-rendered interface, so it stays responsive with a dozen projects open. It was built by an IntelliJ fan and keeps what that world gets right: a project tree that stays put, a tinted title bar per project, tabs for everything, and a sidebar that answers "what am I working on?" at a glance.
 
 ## Worktrees first
 
 Most IDEs treat a worktree as something you open once in a while. Bench treats it as the unit of work.
 
 - **The worktree panel** lists every project you have added and every worktree of each, whether it is open or not. Click one to switch to it, click **+** to create one, hover to delete one. Every worktree lives in one predictable place, `~/bench/<project>/<name>`, and its name is also its branch.
+- **Group, sort and reorder.** Group the panel by agent status, phase of work, or Linear status, and sort it to match. Or drag projects and worktrees into your own order.
 - **Multi-repo projects.** A workspace repository can keep other repositories under something like `repos/`, driven by a manifest. Bench understands this layout. The nested repositories stay visible to the editor, git and language servers, but their worktrees do not clutter the panel. Only your project's own worktrees are listed.
 - **Every row tells you what is going on.** Each worktree shows its linked Linear issue and status, whether its pull request is open, merged or closed, and a dot for the agents running in it: working, idle, or waiting for you.
 - **Keep `main` in step with its upstream.** When the repository's own checkout has commits to push or pull, its card shows a sync button. It pulls (fast-forward only) and then pushes, and shows git's reason if it cannot.
@@ -30,7 +31,25 @@ Bench runs your agents where they already live, in the terminal. It does not rep
 - **Terminals survive restarts.** A background terminal host owns every shell. Quitting, crashing or updating Bench leaves your agents running, and each terminal reattaches to the same screen and scrollback when Bench comes back.
 - **Bench knows what your agents are doing.** Any terminal running `claude`, `codex`, `gemini` or `aider` is tracked. Bench sends a system notification when an agent stops to ask you something or finishes a turn, and keeps your Mac awake while one is working. Run `agents: install claude hooks` so Claude Code reports its status exactly rather than having Bench infer it from terminal output.
 - **Send code to the agent.** Press `cmd->` to send the selection to the Claude Code running in the current worktree. You can also send a file from its tab or the project panel, a commit from the history, a diagnostic straight from the error popover, or a Linear issue's link from its tab or the Issues panel. If no agent is running, Bench starts one. It pastes a mention into the composer and never submits for you.
+- **Paste images into the terminal.** A screenshot on the clipboard goes straight to the agent, including in terminals on SSH hosts.
+
 ![Send to Agent in the editor's context menu, with the mention README.md:10 landing in Claude Code's composer below](branding/send-to-agent.png)
+
+## Agents that drive Bench
+
+Bench runs an MCP server, `bench_mcp`, so the agents in your terminals can use the editor they are sitting in. They can list your projects, create a worktree, read the open files and the active editor, read diagnostics, and open an HTML file. Agents running on SSH hosts can reach it too: run `bench: install mcp on host` once for each host.
+
+## A browser in a tab
+
+Bench has a built-in browser tab, and the same MCP server lets an agent use it: open a page, navigate, read a snapshot of the page, click, type, press keys, evaluate script, read the console log and take a screenshot. An agent can check its own frontend work without leaving the worktree. Pages served from an SSH host are forwarded to your Mac automatically.
+
+## Remote projects over SSH
+
+Keep the project, its worktrees and its shells on another machine and work on it from Bench.
+
+- **Remote terminals persist.** They live in a terminal host on the remote machine, and Bench reconnects with backoff when the connection drops, so work survives your Mac sleeping.
+- **The worktree panel knows remote hosts**, including their worktrees after a restart, and creates and deletes worktrees there.
+- **Pull requests and Claude plan usage** show for remote projects as well. The host needs no GitHub CLI of its own.
 
 ## Linear, built in
 
@@ -50,6 +69,7 @@ Paste a personal API key once. Bench keeps it in your system keychain, and `LINE
 
 - **Pull Requests tab** in the git panel, backed by the GitHub CLI you are already signed in to. Bench holds no token of its own.
 - **Changed files beside the diff.** The multi-file diff views list the changed files alongside the diff, as a flat list or a tree, and you can click one to jump to it.
+- **Light on git.** Bench spaces out the git commands that file changes trigger and limits how many repositories run them at once, so a dozen busy worktrees do not keep your fans spinning.
 
 ## Language support
 
@@ -60,34 +80,36 @@ Paste a personal API key once. Bench keeps it in your system keychain, and `LINE
 
 Bench is single-player, and its collaborators are agents. The collaboration panel button, the sign-in button, the inline assistant, the edit predictions button and the branch name in the title bar (a worktree is already named after its branch) are hidden by default. Menus have a little more room to breathe.
 
-## Shortcuts that differ from Zed
+## Navigation shortcuts
 
-On macOS, Bench moves navigation history to the keys browsers and Xcode use, so you can follow a reference with Cmd+Click and go back without lifting your hand off Cmd.
+On macOS, Bench puts navigation history on the keys browsers and Xcode use, so you can follow a reference with Cmd+Click and go back without lifting your hand off Cmd.
 
-| Action | Bench | Zed |
-|---|---|---|
-| Go back | `cmd-[` | `ctrl--` |
-| Go forward | `cmd-]` | `ctrl-_` |
-| Outdent | `ctrl-[` | `cmd-[` |
-| Indent | `ctrl-]` | `cmd-]` |
-| Search in project | `cmd-alt-f` | `cmd-shift-f` |
-| Text finder | `cmd-shift-f` | `cmd-alt-f` |
+| Action | Key |
+|---|---|
+| Go back | `cmd-[` |
+| Go forward | `cmd-]` |
+| Outdent | `ctrl-[` |
+| Indent | `ctrl-]` |
+| Search in project | `cmd-alt-f` |
+| Text finder | `cmd-shift-f` |
 
 ## Getting started
 
 Bench is developed on macOS. To build it and install it into `/Applications`:
 
 ```sh
-script/with-bench-branding script/bundle-mac -d -i
+script/with-bench-branding script/bundle-mac -i
 ```
 
-Drop `-d` for a release build. Bench installs next to Zed rather than over it, and keeps its settings in `~/.config/bench`.
+That is an optimized build, and the one to use day to day. Add `-d` for a debug build only when you are debugging Bench itself: it is many times slower and uses far more memory. Bench keeps its settings in `~/.config/bench`.
 
 Then:
 
 1. Add a project from the worktree panel (the folder icon at the top).
 2. Open the Linear panel in the right dock and paste an API key from Linear's *Settings → Security & access*.
 3. Press **+** on a project, link an issue, and start working.
+
+To work on a project on an SSH host, install Bench's server there once with `script/install-remote-server <host>`.
 
 Useful settings:
 
@@ -104,10 +126,10 @@ Useful settings:
 }
 ```
 
-## Staying close to Zed
+## Developing Bench
 
-Bench tracks upstream Zed closely and keeps its changes easy to merge. New features live in crates of their own where possible, and the Bench name and icon live in `branding/bench.patch`, which is applied only at build time, so merges from upstream never conflict with them. For building on other platforms, see Zed's own guides for [macOS](./docs/src/development/macos.md), [Linux](./docs/src/development/linux.md) and [Windows](./docs/src/development/windows.md).
+Build and debugging guides for [macOS](./docs/src/development/macos.md), [Linux](./docs/src/development/linux.md) and [FreeBSD](./docs/src/development/freebsd.md) are in `docs/src/development`, along with notes on [debugging crashes](./docs/src/development/debugging-crashes.md). The Bench name and icon live in `branding/bench.patch`, which `script/with-bench-branding` applies for the length of a build.
 
 ## License
 
-Bench is based on [Zed](https://github.com/zed-industries/zed) by Zed Industries, Inc. and, like Zed, is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked. See the license files in this repository.
+Bench is licensed under GPL-3.0-or-later, with Apache-2.0 components where marked. See [LICENSE-GPL](./LICENSE-GPL) and [LICENSE-APACHE](./LICENSE-APACHE). Much of the code was written by Zed Industries, Inc., and its copyright notices stay in the files.

@@ -16,12 +16,12 @@ use gpui::{
     WeakEntity, Window, actions, anchored, deferred, px, relative,
 };
 use language::{Buffer, BufferEvent};
-use project::{DisableAiSettings, Project, ProjectPath};
+use project::{DisableAiSettings, Project, ProjectEntryId, ProjectPath};
 use regex::Regex;
 use theme::{Appearance, ThemeScope};
 use ui::{ContextMenu, appearance_toggle, prelude::*};
 use util::ResultExt as _;
-use workspace::item::Item;
+use workspace::item::{Item, ProjectItem};
 use workspace::notifications::NotifyResultExt as _;
 use workspace::{Pane, Workspace};
 use zed_actions::claude::{
@@ -56,6 +56,7 @@ actions!(
 
 pub fn init(cx: &mut App) {
     browser::init(cx);
+    workspace::register_project_item::<HtmlPreviewView>(cx);
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace
             .register_action(|workspace, _: &OpenPreview, window, cx| {
@@ -88,6 +89,52 @@ pub fn is_html_file(path: &Path) -> bool {
         })
 }
 
+/// Whether a file is a PDF, which the web view shows with the system's viewer.
+pub fn is_pdf_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+}
+
+/// A PDF file in the project, opened in a [`HtmlPreviewView`].
+pub struct PdfFile {
+    project_path: ProjectPath,
+    entry_id: Option<ProjectEntryId>,
+}
+
+impl project::ProjectItem for PdfFile {
+    fn try_open(
+        project: &Entity<Project>,
+        path: &ProjectPath,
+        cx: &mut App,
+    ) -> Option<Task<Result<Entity<Self>>>> {
+        if !is_pdf_file(path.path.as_std_path()) {
+            return None;
+        }
+        let entry_id = project
+            .read(cx)
+            .entry_for_path(path, cx)
+            .map(|entry| entry.id);
+        let pdf = cx.new(|_| Self {
+            project_path: path.clone(),
+            entry_id,
+        });
+        Some(Task::ready(Ok(pdf)))
+    }
+
+    fn entry_id(&self, _: &App) -> Option<ProjectEntryId> {
+        self.entry_id
+    }
+
+    fn project_path(&self, _: &App) -> Option<ProjectPath> {
+        Some(self.project_path.clone())
+    }
+
+    fn is_dirty(&self) -> bool {
+        false
+    }
+}
+
 fn active_html_path(workspace: &Workspace, cx: &App) -> Option<ProjectPath> {
     let project_path = workspace.active_item(cx)?.project_path(cx)?;
     is_html_file(project_path.path.as_std_path()).then_some(project_path)
@@ -104,6 +151,8 @@ pub struct HtmlPreviewView {
     /// The file's buffer, which reports when the file changes and which page
     /// selections are matched against to find the lines they come from.
     buffer: Option<Entity<Buffer>>,
+    /// Set when the tab shows a PDF, which has no buffer to watch.
+    pdf: Option<Entity<PdfFile>>,
     /// What is selected in the page, as the page last reported it.
     selection: String,
     /// Where the page is in the window, as last laid out.
@@ -141,17 +190,20 @@ impl HtmlPreviewView {
             return Ok(preview);
         }
 
-        let project = workspace.project().read(cx);
-        let root = project
-            .worktree_for_id(project_path.worktree_id, cx)
-            .context("the file's worktree is no longer open")?
-            .read(cx)
-            .abs_path()
-            .to_path_buf();
-        let workspace_entity = cx.entity();
         let project = workspace.project().clone();
-        let preview =
-            cx.new(|cx| Self::new(workspace_entity, project, project_path, root, window, cx));
+        let root = worktree_root(&project, &project_path, cx)?;
+        let workspace_entity = cx.entity().downgrade();
+        let preview = cx.new(|cx| {
+            Self::new(
+                workspace_entity,
+                project,
+                project_path,
+                Ok(root),
+                None,
+                window,
+                cx,
+            )
+        });
         pane.update(cx, |pane, cx| {
             pane.add_item(Box::new(preview.clone()), true, focus, None, window, cx)
         });
@@ -159,28 +211,34 @@ impl HtmlPreviewView {
     }
 
     fn new(
-        workspace: Entity<Workspace>,
+        workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
         project_path: ProjectPath,
-        root: PathBuf,
+        root: Result<PathBuf>,
+        pdf: Option<Entity<PdfFile>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let abs_path = root.join(project_path.path.as_std_path());
         let fs = project.read(cx).fs().clone();
 
         let (events_sender, mut events) = mpsc::unbounded();
-        let source = PageSource::Worktree {
-            url: page_url(&project_path.path),
-            root,
-            fs,
-        };
-        let (web_view, load_error) = match WebView::new(source, events_sender, window, cx) {
-            Ok(web_view) => (Some(web_view), None),
-            Err(error) => {
-                log::error!("opening HTML preview: {error:#}");
-                (None, Some(format!("{error:#}").into()))
+        let (abs_path, web_view, load_error) = match root {
+            Ok(root) => {
+                let abs_path = root.join(project_path.path.as_std_path());
+                let source = PageSource::Worktree {
+                    url: page_url(&project_path.path),
+                    root,
+                    fs,
+                };
+                match WebView::new(source, events_sender, window, cx) {
+                    Ok(web_view) => (abs_path, Some(web_view), None),
+                    Err(error) => {
+                        log::error!("opening HTML preview: {error:#}");
+                        (abs_path, None, Some(format!("{error:#}").into()))
+                    }
+                }
             }
+            Err(error) => (PathBuf::new(), None, Some(format!("{error:#}").into())),
         };
 
         let handle_events = cx.spawn_in(window, async move |this, cx| {
@@ -194,10 +252,15 @@ impl HtmlPreviewView {
             }
         });
 
-        let open_buffer = project.update(cx, |project, cx| {
-            project.open_buffer(project_path.clone(), cx)
+        let open_buffer = pdf.is_none().then(|| {
+            project.update(cx, |project, cx| {
+                project.open_buffer(project_path.clone(), cx)
+            })
         });
         let watch_buffer = cx.spawn_in(window, async move |this, cx| {
+            let Some(open_buffer) = open_buffer else {
+                return;
+            };
             let Some(buffer) = open_buffer.await.log_err() else {
                 return;
             };
@@ -216,7 +279,7 @@ impl HtmlPreviewView {
         });
 
         let focus_handle = cx.focus_handle();
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.on_focus(&focus_handle, window, |this, _, _| {
                 if let Some(web_view) = &this.web_view {
                     web_view.focus();
@@ -227,9 +290,6 @@ impl HtmlPreviewView {
                     web_view.focus_parent();
                 }
             }),
-            // Zooming happens in the workspace, and the preview has to be drawn
-            // again to hide or show its page.
-            cx.observe(&workspace, |_, _, cx| cx.notify()),
             cx.on_release(|this, cx| {
                 if let Some(web_view) = this.web_view.take() {
                     web_view.release(cx);
@@ -237,14 +297,21 @@ impl HtmlPreviewView {
             }),
         ];
 
+        if let Some(workspace) = workspace.upgrade() {
+            // Zooming happens in the workspace, and the preview has to be drawn
+            // again to hide or show its page.
+            subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
+        }
+
         Self {
             focus_handle,
-            workspace: workspace.downgrade(),
+            workspace,
             project_path,
             abs_path,
             web_view,
             load_error,
             buffer: None,
+            pdf,
             selection: String::new(),
             page_bounds: Cell::new(Bounds::default()),
             context_menu: None,
@@ -451,6 +518,20 @@ impl HtmlPreviewView {
 /// turn, with its words allowed any whitespace between them, since the page
 /// joins and wraps lines. Lines that markup splits up, such as a word in bold,
 /// are skipped; the range runs from the first line found to the last.
+fn worktree_root(
+    project: &Entity<Project>,
+    project_path: &ProjectPath,
+    cx: &App,
+) -> Result<PathBuf> {
+    Ok(project
+        .read(cx)
+        .worktree_for_id(project_path.worktree_id, cx)
+        .context("the file's worktree is no longer open")?
+        .read(cx)
+        .abs_path()
+        .to_path_buf())
+}
+
 fn source_lines_for_selection(source: &str, selection: &str) -> Option<RangeInclusive<u32>> {
     let body_start = Regex::new(r"(?i)<body[\s>]")
         .ok()
@@ -698,8 +779,37 @@ impl Focusable for HtmlPreviewView {
 
 impl EventEmitter<()> for HtmlPreviewView {}
 
+impl ProjectItem for HtmlPreviewView {
+    type Item = PdfFile;
+
+    fn for_project_item(
+        project: Entity<Project>,
+        pane: Option<&Pane>,
+        item: Entity<Self::Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let project_path = item.read(cx).project_path.clone();
+        let root = worktree_root(&project, &project_path, cx);
+        let workspace = pane
+            .map(|pane| pane.workspace().clone())
+            .unwrap_or_else(WeakEntity::new_invalid);
+        Self::new(workspace, project, project_path, root, Some(item), window, cx)
+    }
+}
+
 impl Item for HtmlPreviewView {
     type Event = ();
+
+    fn for_each_project_item(
+        &self,
+        cx: &App,
+        f: &mut dyn FnMut(gpui::EntityId, &dyn project::ProjectItem),
+    ) {
+        if let Some(pdf) = &self.pdf {
+            f(pdf.entity_id(), pdf.read(cx));
+        }
+    }
 
     fn tab_icon(&self, _: &Window, cx: &App) -> Option<Icon> {
         FileIcons::get_icon(self.project_path.path.as_std_path(), cx)

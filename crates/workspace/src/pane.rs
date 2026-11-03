@@ -543,6 +543,10 @@ enum PinOperation {
 }
 
 impl Pane {
+    pub fn workspace(&self) -> &WeakEntity<Workspace> {
+        &self.workspace
+    }
+
     pub fn new(
         workspace: WeakEntity<Workspace>,
         project: Entity<Project>,
