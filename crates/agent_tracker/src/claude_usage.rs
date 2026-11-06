@@ -635,7 +635,9 @@ async fn run_on_host(
             if let Some(port) = options.port {
                 command.args(["-p", &port.to_string()]);
             }
-            command.args(options.ssh_destination_args()).arg(remote_command);
+            command
+                .args(options.ssh_destination_args())
+                .arg(remote_command);
             command
         }
     };
