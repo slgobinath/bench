@@ -2672,7 +2672,10 @@ mod tests {
                     "-o",
                     "LogLevel=ERROR",
                     "-t",
-                    "user@host",
+                    "-l",
+                    "user",
+                    "--",
+                    "host",
                     &format!(
                         "cd \"$HOME\"/project && exec env 'TERM_PROGRAM=zed' {expected_binary} --terminal-open 'session id' /bin/bash -l"
                     ),
