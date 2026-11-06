@@ -29,6 +29,8 @@ pub mod test;
 pub mod time;
 
 use anyhow::Result;
+use futures::channel::oneshot;
+use futures::future::Shared;
 use itertools::Either;
 use regex::Regex;
 use std::path::PathBuf;
@@ -387,6 +389,22 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
                 possible_locations.join(", ")
             )
         })
+}
+
+static LOGIN_SHELL_ENVIRONMENT_LOADED: std::sync::OnceLock<Shared<oneshot::Receiver<()>>> =
+    std::sync::OnceLock::new();
+
+/// Registers the signal for the startup capture, so that readers of this
+/// process's environment can wait for it with [`login_shell_environment_loaded`].
+pub fn set_login_shell_environment_loaded(loaded: Shared<oneshot::Receiver<()>>) {
+    LOGIN_SHELL_ENVIRONMENT_LOADED.set(loaded).ok();
+}
+
+/// Resolves once the startup capture has finished, or immediately if there is none.
+pub async fn login_shell_environment_loaded() {
+    if let Some(loaded) = LOGIN_SHELL_ENVIRONMENT_LOADED.get() {
+        loaded.clone().await.ok();
+    }
 }
 
 #[cfg(unix)]
@@ -1045,6 +1063,20 @@ impl<O> From<anyhow::Result<O>> for ConnectionResult<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_login_shell_environment_loaded_waits_for_startup_capture() {
+        use futures::FutureExt as _;
+
+        let (loaded_tx, loaded_rx) = oneshot::channel();
+        set_login_shell_environment_loaded(loaded_rx.shared());
+
+        let mut waiting = Box::pin(login_shell_environment_loaded());
+        assert!((&mut waiting).now_or_never().is_none());
+
+        loaded_tx.send(()).ok();
+        assert!(waiting.now_or_never().is_some());
+    }
 
     #[test]
     fn test_fs_embed_iter_and_get() {

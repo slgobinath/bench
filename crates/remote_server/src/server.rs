@@ -736,6 +736,8 @@ pub fn execute_run(
     #[cfg(unix)]
     let shell_env_loaded_rx = {
         let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+        let shell_env_loaded_rx = shell_env_loaded_rx.shared();
+        util::set_login_shell_environment_loaded(shell_env_loaded_rx.clone());
         app.background_executor()
             .spawn(async {
                 util::load_login_shell_environment().await.log_err();
@@ -745,7 +747,7 @@ pub fn execute_run(
         Some(shell_env_loaded_rx)
     };
     #[cfg(windows)]
-    let shell_env_loaded_rx: Option<oneshot::Receiver<()>> = None;
+    let shell_env_loaded_rx: Option<futures::future::Shared<oneshot::Receiver<()>>> = None;
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
     let run = move |cx: &mut App| {

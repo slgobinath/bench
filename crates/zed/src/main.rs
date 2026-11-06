@@ -490,6 +490,8 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
+    let shell_env_loaded_rx = shell_env_loaded_rx.shared();
+    util::set_login_shell_environment_loaded(shell_env_loaded_rx.clone());
     if !stdout_is_a_pty() {
         app.background_executor()
             .spawn(async {

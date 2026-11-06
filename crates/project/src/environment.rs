@@ -355,6 +355,9 @@ async fn load_directory_shell_environment(
     // is genuinely per-directory — direnv — is applied below either way.
     let (shell_program, args) = shell.program_and_args();
     let mut envs = if matches!(shell, Shell::System) {
+        // The result is cached per directory, so reading this before the capture
+        // lands would leave language servers with the bare PATH for good.
+        util::login_shell_environment_loaded().await;
         std::env::vars().collect()
     } else {
         util::shell_env::capture(shell_program.clone(), args, abs_path)
