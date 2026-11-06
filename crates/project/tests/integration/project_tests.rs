@@ -22038,7 +22038,6 @@ async fn test_language_server_choices_follow_stopping_and_starting(cx: &mut gpui
             HashSet::from_iter([lsp::LanguageServerSelector::Name(
                 "the-rust-language-server".into(),
             )]),
-            true,
             cx,
         );
     });
