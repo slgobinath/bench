@@ -5399,7 +5399,7 @@ async fn worktrees_on_host(
             log::warn!(
                 "listing the worktrees of {} on {}: {error:#}",
                 root.display(),
-                options.ssh_destination()
+                options.connection_string()
             );
             (Vec::new(), None)
         }
@@ -5429,7 +5429,7 @@ async fn list_worktrees_over_ssh(
         command.args(["-p", &port.to_string()]);
     }
     let output = command
-        .arg(options.ssh_destination())
+        .args(options.ssh_destination_args())
         .arg(format!(
             "printf '%s\\n' \"$HOME\" && git -C {root} worktree list --porcelain"
         ))

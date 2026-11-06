@@ -576,7 +576,7 @@ impl RemoteConnection for SshRemoteConnection {
             self.ssh_path_style,
             self.ssh_shell_kind,
             self.socket.ssh_command_options(),
-            &self.socket.connection_options.ssh_destination(),
+            self.socket.connection_options.ssh_destination_args(),
         )
         .map(Some)
     }
@@ -1712,7 +1712,7 @@ impl SshSocket {
             .args(self.ssh_command_options())
             .args(["-O", "forward", "-R"])
             .arg(format!("{remote_socket}:{}", local_socket.display()))
-            .arg(self.connection_options.ssh_destination())
+            .args(self.connection_options.ssh_destination_args())
             .envs(&self.envs)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -2055,7 +2055,7 @@ impl SshConnectionOptions {
     ///
     /// The username is passed via `-l` and the host after `--` so that neither is parsed as
     /// an option when it begins with `-`.
-    fn ssh_destination_args(&self) -> Vec<String> {
+    pub fn ssh_destination_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(username) = &self.username {
             args.push("-l".to_string());
@@ -2191,7 +2191,7 @@ fn build_remote_server_terminal_command_posix(
     ssh_path_style: PathStyle,
     ssh_shell_kind: ShellKind,
     mut ssh_options: Vec<String>,
-    ssh_destination: &str,
+    ssh_destination_args: Vec<String>,
 ) -> Result<CommandTemplate> {
     let mut exec = posix_working_dir_prefix(working_dir, ssh_path_style, ssh_shell_kind)?;
     write!(exec, "exec env ")?;
@@ -2222,7 +2222,7 @@ fn build_remote_server_terminal_command_posix(
         ssh_options,
         None,
         Interactive::Yes,
-        ssh_destination,
+        ssh_destination_args,
         exec,
         ssh_env,
     ))

@@ -21,11 +21,12 @@ pub fn remote_socket_path() -> String {
 }
 
 fn host_key(options: &SshConnectionOptions) -> String {
-    format!(
-        "{}:{}",
-        options.ssh_destination(),
-        options.port.unwrap_or(22)
-    )
+    let host = options.host.to_string();
+    let port = options.port.unwrap_or(22);
+    match &options.username {
+        Some(username) => format!("{username}@{host}:{port}"),
+        None => format!("{host}:{port}"),
+    }
 }
 
 fn read_hosts() -> Result<Vec<String>> {
