@@ -53,7 +53,7 @@ pub use activity::{
     Activity, FeedEntry, Phase, PhaseSource, PhaseSpan, Subagent, Todo, TodoStatus,
     TranscriptStats,
 };
-pub use claude_model::{ClaudeModel, ModelFamily};
+pub use claude_model::{ClaudeModel, ModelFamily, pasted_image_path};
 pub use ports_button::PortsButton;
 pub use terminal::ListeningPort;
 pub use claude_usage::{ClaudeUsage, ClaudeUsageButton, HostUsage};

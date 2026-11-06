@@ -17,6 +17,7 @@ doctest = false
 anyhow.workspace = true
 gpui.workspace = true
 util.workspace = true
+libc.workspace = true
 log.workspace = true
 paths.workspace = true
 project.workspace = true

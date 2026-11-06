@@ -1,3 +1,4 @@
+mod pasted_images;
 mod persistence;
 pub mod terminal_element;
 pub mod terminal_panel;
@@ -17,6 +18,7 @@ use gpui::{
     Subscription, Task, TaskExt, WeakEntity, actions, anchored, deferred, div,
 };
 use menu;
+use pasted_images::PastedImages;
 use persistence::TerminalDb;
 use project::{Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
@@ -199,6 +201,7 @@ pub struct TerminalView {
     workspace_id: Option<WorkspaceId>,
     show_breadcrumbs: bool,
     block_below_cursor: Option<Rc<BlockProperties>>,
+    pasted_images: PastedImages,
     scroll_top: Pixels,
     scroll_handle: TerminalScrollHandle,
     ime_state: Option<ImeState>,
@@ -354,6 +357,7 @@ impl TerminalView {
             workspace_id,
             show_breadcrumbs: TerminalSettings::get_global(cx).toolbar.breadcrumbs,
             block_below_cursor: None,
+            pasted_images: PastedImages::new(cx),
             scroll_top: Pixels::ZERO,
             scroll_handle,
             // A persistent terminal's session id has to reach the database
@@ -1088,6 +1092,7 @@ impl TerminalView {
         match clipboard.entries().first() {
             Some(ClipboardEntry::Image(image)) if !image.bytes.is_empty() => {
                 if self.terminal.read(cx).is_remote_terminal() {
+                    self.pasted_images.remember_remote_paste(image.clone());
                     self.paste_image_on_remote_host(image, window, cx);
                 } else {
                     self.forward_ctrl_v(cx);
@@ -1346,6 +1351,7 @@ fn subscribe_for_terminal_events(
 
             match event {
                 Event::Wakeup => {
+                    terminal_view.pasted_images.request_scan();
                     cx.notify();
                     window.invalidate_character_coordinates();
                     cx.emit(Event::Wakeup);
@@ -1574,6 +1580,7 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // TODO: this should be moved out of render
         self.scroll_handle.update(self.terminal.read(cx));
+        self.schedule_pasted_images_scan(cx);
 
         if let Some(new_display_offset) = self.scroll_handle.future_display_offset.take() {
             self.terminal.update(cx, |term, _| {
@@ -1693,6 +1700,7 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            .children(self.render_pasted_images(window, cx))
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()

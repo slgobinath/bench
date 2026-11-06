@@ -227,13 +227,7 @@ fn probe_in(
 /// The session's folder comes from where it was started, which is not
 /// necessarily where the process is now.
 fn session_transcript(claude: &Path, process_id: u32) -> Option<(PathBuf, SystemTime)> {
-    let record = std::fs::read_to_string(
-        claude
-            .join("sessions")
-            .join(format!("{process_id}.json")),
-    )
-    .ok()?;
-    let record: Value = serde_json::from_str(&record).ok()?;
+    let record = session_record(claude, process_id)?;
     let session_id = record.get("sessionId")?.as_str()?;
     let started_in = record.get("cwd")?.as_str()?;
     let path = claude
@@ -242,6 +236,61 @@ fn session_transcript(claude: &Path, process_id: u32) -> Option<(PathBuf, System
         .join(format!("{session_id}.jsonl"));
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
     Some((path, modified))
+}
+
+fn session_record(claude: &Path, process_id: u32) -> Option<Value> {
+    let path = claude.join("sessions").join(format!("{process_id}.json"));
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// The file Claude Code process `process_id` cached `[Image #number]` in.
+///
+/// Blocking, for a background thread: it lists directories.
+pub fn pasted_image_path(process_id: u32, number: u32) -> Option<PathBuf> {
+    let claude = paths::home_dir().join(".claude");
+    pasted_image_path_in(&claude, &claude_temp_directory()?, process_id, number)
+}
+
+/// Claude Code nests its temp files in a per-user folder. `CLAUDE_CODE_TMPDIR`
+/// names what that folder sits in, not the folder itself.
+fn claude_temp_directory() -> Option<PathBuf> {
+    let configured = std::env::var_os("CLAUDE_CODE_TMPDIR").map(PathBuf::from);
+    #[cfg(unix)]
+    {
+        // SAFETY: `getuid` has no preconditions and cannot fail.
+        let user_id = unsafe { libc::getuid() };
+        let base = configured.unwrap_or_else(|| PathBuf::from("/tmp"));
+        Some(base.join(format!("claude-{user_id}")))
+    }
+    #[cfg(not(unix))]
+    {
+        let base = configured.or_else(|| std::env::var_os("TEMP").map(PathBuf::from))?;
+        Some(base.join("claude"))
+    }
+}
+
+/// Images are cached as `<temp>/<project>/<session>/images/<number>.<format>`.
+/// The project folder comes from a working directory that may since have moved,
+/// so it is found through the session rather than rebuilt.
+fn pasted_image_path_in(
+    claude: &Path,
+    temp_directory: &Path,
+    process_id: u32,
+    number: u32,
+) -> Option<PathBuf> {
+    let record = session_record(claude, process_id)?;
+    let session_id = record.get("sessionId")?.as_str()?;
+    let images = std::fs::read_dir(temp_directory)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|project| project.path().join(session_id).join("images"))
+        .find(|images| images.is_dir())?;
+    let file_stem = number.to_string();
+    std::fs::read_dir(images)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.file_stem().is_some_and(|stem| *stem == *file_stem))
 }
 
 fn newest_transcript(projects: &Path, directory: &Path) -> Option<(PathBuf, SystemTime)> {
@@ -399,6 +448,32 @@ mod tests {
         assert_eq!(second.model, remembered.model, "taken from what was known");
 
         assert!(probe_in(&root, Path::new("/elsewhere"), None, None).is_none());
+        std::fs::remove_dir_all(&root).expect("cleaning up");
+    }
+
+    #[test]
+    fn pasted_images_are_found_through_the_session() {
+        let root = std::env::temp_dir().join(format!("bench-claude-images-{}", std::process::id()));
+        let claude = root.join("claude");
+        let temp_directory = root.join("temp");
+        std::fs::create_dir_all(claude.join("sessions")).expect("a directory");
+        std::fs::write(
+            claude.join("sessions").join("7.json"),
+            r#"{"sessionId":"the-session","cwd":"/work/tree"}"#,
+        )
+        .expect("a session record");
+        std::fs::create_dir_all(temp_directory.join("-other-project")).expect("a directory");
+        let images = temp_directory.join("-moved-project/the-session/images");
+        std::fs::create_dir_all(&images).expect("a directory");
+        std::fs::write(images.join("1.png"), "").expect("an image");
+        std::fs::write(images.join("12.webp"), "").expect("an image");
+
+        let find =
+            |process_id, number| pasted_image_path_in(&claude, &temp_directory, process_id, number);
+        assert_eq!(find(7, 1), Some(images.join("1.png")));
+        assert_eq!(find(7, 12), Some(images.join("12.webp")));
+        assert_eq!(find(7, 2), None);
+        assert_eq!(find(8, 1), None, "no such session");
         std::fs::remove_dir_all(&root).expect("cleaning up");
     }
 
