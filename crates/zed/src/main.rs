@@ -29,7 +29,8 @@ use futures::{FutureExt, StreamExt, channel::oneshot, future};
 use git::GitHostingProviderRegistry;
 use git_ui::clone::clone_and_open;
 use gpui::{
-    App, AppContext, Application, AsyncApp, QuitMode, Task, TaskExt, UpdateGlobal as _, block_on,
+    App, AppContext, Application, AsyncApp, Global, QuitMode, Task, TaskExt, UpdateGlobal as _,
+    block_on,
 };
 use gpui_platform;
 
@@ -219,7 +220,10 @@ fn main() {
             .is_some_and(|flag| flag == terminal_host::RECONNECT_FLAG)
         {
             let Some(program) = args.next() else {
-                eprintln!("usage: {} <program> [args...]", terminal_host::RECONNECT_FLAG);
+                eprintln!(
+                    "usage: {} <program> [args...]",
+                    terminal_host::RECONNECT_FLAG
+                );
                 process::exit(1);
             };
             let args = args.collect::<Vec<_>>();
@@ -389,17 +393,13 @@ fn main() {
     let installation_id = app
         .background_executor()
         .spawn(installation_id(KeyValueStore::from_app_db(&app_db)));
-    let session_id = Uuid::new_v4().to_string();
-    let session = app.background_executor().spawn(Session::new(
-        session_id.clone(),
-        KeyValueStore::from_app_db(&app_db),
-    ));
     let background_executor = app.background_executor();
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
     let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
-        || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+        || (*release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
+            && !is_installed_app_bundle(&args))
     {
         false
     } else {
@@ -423,6 +423,14 @@ fn main() {
         println!("zed is already running");
         return;
     }
+
+    // Created after the instance check: a duplicate launch must not replace the
+    // stored session id, or the next start can't find the session to restore.
+    let session_id = Uuid::new_v4().to_string();
+    let session = app.background_executor().spawn(Session::new(
+        session_id.clone(),
+        KeyValueStore::from_app_db(&app_db),
+    ));
 
     let should_install_crash_handler =
         client::telemetry::should_install_crash_handler(*release_channel::RELEASE_CHANNEL);
@@ -508,6 +516,9 @@ fn main() {
         if let Some(app_state) = AppState::try_global(cx) {
             cx.spawn({
                 async move |cx| {
+                    if workspace::activate_any_workspace_window(cx).is_some() {
+                        return;
+                    }
                     if let Err(e) = restore_or_create_workspace(app_state, cx).await {
                         fail_to_open_window_async(e, cx)
                     }
@@ -1467,7 +1478,26 @@ async fn installation_id(db: KeyValueStore) -> Result<IdType> {
     Ok(IdType::New(installation_id))
 }
 
+struct WorkspaceRestoreInProgress;
+
+impl Global for WorkspaceRestoreInProgress {}
+
 pub(crate) async fn restore_or_create_workspace(
+    app_state: Arc<AppState>,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    // A dock click while startup is still restoring reaches here too, and has no
+    // window to activate yet. Restoring again would open a second window.
+    if cx.update(|cx| cx.has_global::<WorkspaceRestoreInProgress>()) {
+        return Ok(());
+    }
+    cx.update(|cx| cx.set_global(WorkspaceRestoreInProgress));
+    let result = restore_or_create_workspace_inner(app_state, cx).await;
+    cx.update(|cx| cx.remove_global::<WorkspaceRestoreInProgress>());
+    result
+}
+
+async fn restore_or_create_workspace_inner(
     app_state: Arc<AppState>,
     cx: &mut AsyncApp,
 ) -> Result<()> {
@@ -1636,7 +1666,9 @@ async fn restorable_workspaces(
     app_state: &Arc<AppState>,
 ) -> Option<Vec<workspace::SerializedMultiWorkspace>> {
     let locations = restorable_workspace_locations(cx, app_state).await?;
-    Some(cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx)))
+    let windows = cx.update(|cx| workspace::read_serialized_multi_workspaces(locations, cx));
+    let merged = workspace::merge_into_single_window(windows, app_state.fs.clone(), cx).await;
+    Some(merged.into_iter().collect())
 }
 
 pub(crate) async fn restorable_workspace_locations(
@@ -1708,6 +1740,14 @@ pub(crate) async fn restorable_workspace_locations(
         }
         _ => None,
     }
+}
+
+/// Bench ships on the dev channel, so an installed bundle needs the single-instance
+/// check that dev builds run from `target/` skip so they can sit alongside it.
+fn is_installed_app_bundle(args: &Args) -> bool {
+    args.user_data_dir.is_none()
+        && std::env::current_exe()
+            .is_ok_and(|path| path.to_string_lossy().contains(".app/Contents/MacOS/"))
 }
 
 fn init_paths() -> HashMap<io::ErrorKind, Vec<&'static Path>> {

@@ -291,6 +291,88 @@ async fn test_move_active_project_group_actions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_new_window_starts_with_saved_project_groups(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    let project = Project::test(fs, ["/root_a".as_ref()], cx).await;
+
+    let saved_key = ProjectGroupKey::new(None, PathList::new(&["/saved"]));
+    let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    crate::persistence::write_single_window_state(
+        &kvp,
+        MultiWorkspaceState {
+            project_groups: vec![SerializedProjectGroup::from_group(&saved_key, true)],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    window
+        .read_with(cx, |mw, _cx| {
+            assert_eq!(mw.project_group_keys(), vec![saved_key.clone()]);
+        })
+        .unwrap();
+
+    window
+        .update(cx, |mw, _, cx| mw.flush_serialization(cx))
+        .unwrap()
+        .await;
+    let saved_groups = crate::persistence::read_single_window_state(&kvp).project_groups;
+    assert_eq!(
+        saved_groups
+            .into_iter()
+            .map(ProjectGroupKey::from)
+            .collect::<Vec<_>>(),
+        vec![saved_key],
+        "a window's first write must not drop the groups it started with",
+    );
+}
+
+#[gpui::test]
+async fn test_opening_a_project_in_a_new_window_reuses_the_existing_window(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+
+    let app_state = cx.update(AppState::test);
+    let fs = app_state.fs.as_fake();
+    fs.insert_tree(path!("/project_a"), json!({ "file.txt": "" }))
+        .await;
+    fs.insert_tree(path!("/project_b"), json!({ "file.txt": "" }))
+        .await;
+
+    let project = Project::test(app_state.fs.clone(), [path!("/project_a").as_ref()], cx).await;
+    let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    let opened = cx
+        .update(|cx| {
+            open_paths(
+                &[PathBuf::from(path!("/project_b"))],
+                app_state,
+                OpenOptions {
+                    open_mode: OpenMode::NewWindow,
+                    ..OpenOptions::default()
+                },
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(opened.window, window);
+    assert_eq!(cx.update(|cx| cx.windows().len()), 1);
+    window
+        .read_with(cx, |mw, _cx| {
+            assert_eq!(mw.project_group_keys().len(), 2);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut TestAppContext) {
     init_test(cx);
 

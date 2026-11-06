@@ -368,7 +368,7 @@ impl MultiWorkspace {
         workspace.update(cx, |workspace, cx| {
             workspace.set_multi_workspace(weak_self, active_workspace_id.clone(), cx);
         });
-        Self {
+        let mut this = Self {
             window_id: window.window_handle().window_id(),
             held: vec![HeldWorkspace {
                 workspace,
@@ -384,7 +384,20 @@ impl MultiWorkspace {
             _serialize_task: None,
             _subscriptions: vec![release_subscription, settings_subscription],
             previous_focus_handle: None,
+        };
+        // Seeded here rather than after the window has loaded: every state write
+        // from this window must carry the full list, however it was opened and
+        // even if its project never finishes connecting.
+        if this.keeps_single_window_state(cx) {
+            let kvp = db::kvp::KeyValueStore::global(cx);
+            let saved_groups = crate::persistence::read_single_window_state(&kvp)
+                .project_groups
+                .into_iter()
+                .map(|group| group.into_restored_state())
+                .collect();
+            this.restore_project_groups(saved_groups, cx);
         }
+        this
     }
 
     pub fn register_sidebar<T: Sidebar>(&mut self, sidebar: Entity<T>, cx: &mut Context<Self>) {
@@ -428,6 +441,12 @@ impl MultiWorkspace {
 
     pub fn multi_workspace_enabled(&self, cx: &App) -> bool {
         !DisableAiSettings::get_global(cx).disable_ai && AgentSettings::get_global(cx).enabled
+    }
+
+    /// Tests without a database of their own share one, where a saved project list
+    /// would leak into every other test.
+    fn keeps_single_window_state(&self, cx: &App) -> bool {
+        self.multi_workspace_enabled(cx) && cx.has_global::<db::AppDatabase>()
     }
 
     pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1509,8 +1528,12 @@ impl MultiWorkspace {
         };
         let window_id = self.window_id;
         let kvp = db::kvp::KeyValueStore::global(cx);
+        let single_window_state = self.keeps_single_window_state(cx).then(|| state.clone());
         async move {
             crate::persistence::write_multi_workspace_state(&kvp, window_id, state).await;
+            if let Some(state) = single_window_state {
+                crate::persistence::write_single_window_state(&kvp, state).await;
+            }
         }
     }
 

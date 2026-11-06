@@ -324,6 +324,84 @@ pub async fn write_multi_workspace_state(
     }
 }
 
+/// Window ids are reused between launches and a project list stored under one
+/// can't be found again once its window has no session rows, so the list that
+/// outlives any particular window is stored under this fixed key.
+const SINGLE_WINDOW_STATE_KEY: &str = "single_window";
+
+pub(crate) fn read_single_window_state(kvp: &KeyValueStore) -> model::MultiWorkspaceState {
+    kvp.scoped("multi_workspace_state")
+        .read(SINGLE_WINDOW_STATE_KEY)
+        .log_err()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) async fn write_single_window_state(
+    kvp: &KeyValueStore,
+    state: model::MultiWorkspaceState,
+) {
+    if let Ok(json_str) = serde_json::to_string(&state) {
+        kvp.scoped("multi_workspace_state")
+            .write(SINGLE_WINDOW_STATE_KEY.to_string(), json_str)
+            .await
+            .log_err();
+    }
+}
+
+/// Folds the windows of a past session into one, keeping every project group.
+///
+/// `windows` is ordered back to front. The frontmost window with a project wins,
+/// so a stray empty window can't take the place of real work.
+pub(crate) fn merge_serialized_windows(
+    windows: Vec<model::SerializedMultiWorkspace>,
+    saved_groups: Vec<model::SerializedProjectGroup>,
+) -> Option<model::SerializedMultiWorkspace> {
+    let primary_index = windows
+        .iter()
+        .rposition(|window| !window.active_workspace.paths.is_empty())
+        .or(windows.len().checked_sub(1))?;
+
+    let mut groups = saved_groups;
+    let mut add_group = |group: model::SerializedProjectGroup| {
+        let key = ProjectGroupKey::from(group.clone());
+        if !groups
+            .iter()
+            .any(|existing| ProjectGroupKey::from(existing.clone()) == key)
+        {
+            groups.push(group);
+        }
+    };
+
+    let mut primary = None;
+    for (index, window) in windows.into_iter().enumerate() {
+        // A window that never pinned a project has no groups, which leaves its
+        // active workspace as the only record of what it had open.
+        if index != primary_index
+            && window.state.project_groups.is_empty()
+            && !window.active_workspace.paths.is_empty()
+        {
+            let host = match &window.active_workspace.location {
+                model::SerializedWorkspaceLocation::Local => None,
+                model::SerializedWorkspaceLocation::Remote(options) => Some(options.clone()),
+            };
+            let key = ProjectGroupKey::new(host, window.active_workspace.paths.clone());
+            add_group(model::SerializedProjectGroup::from_group(&key, true));
+        }
+        for group in window.state.project_groups.iter().cloned() {
+            add_group(group);
+        }
+        if index == primary_index {
+            primary = Some(window);
+        }
+    }
+
+    let mut primary = primary?;
+    primary.state.project_groups = groups;
+    Some(primary)
+}
+
 pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
@@ -4713,6 +4791,90 @@ mod tests {
         let window_30 = by_window.get(&WindowId::from(30u64)).unwrap();
         assert_eq!(window_30.len(), 1);
         assert!(window_30.contains(&WorkspaceId(5)));
+    }
+
+    fn serialized_window(
+        workspace_id: i64,
+        active_path: Option<&str>,
+        group_paths: &[&str],
+    ) -> model::SerializedMultiWorkspace {
+        model::SerializedMultiWorkspace {
+            active_workspace: SessionWorkspace {
+                workspace_id: WorkspaceId(workspace_id),
+                location: SerializedWorkspaceLocation::Local,
+                paths: active_path.map_or_else(PathList::default, |path| PathList::new(&[path])),
+                window_id: None,
+            },
+            state: model::MultiWorkspaceState {
+                active_workspace_id: Some(WorkspaceId(workspace_id)),
+                project_groups: group_paths.iter().map(|path| local_group(path)).collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn local_group(path: &str) -> model::SerializedProjectGroup {
+        let key = ProjectGroupKey::new(None, PathList::new(&[path]));
+        model::SerializedProjectGroup::from_group(&key, true)
+    }
+
+    fn group_paths(window: &model::SerializedMultiWorkspace) -> Vec<String> {
+        window
+            .state
+            .project_groups
+            .iter()
+            .map(|group| group.path_list.paths.clone())
+            .collect()
+    }
+
+    #[test]
+    fn test_merge_keeps_every_group_from_every_window() {
+        let merged = merge_serialized_windows(
+            vec![
+                serialized_window(1, Some("/a"), &["/a", "/b"]),
+                serialized_window(2, Some("/c"), &["/b", "/c"]),
+            ],
+            vec![local_group("/saved"), local_group("/a")],
+        )
+        .unwrap();
+
+        assert_eq!(merged.active_workspace.workspace_id, WorkspaceId(2));
+        assert_eq!(group_paths(&merged), ["/saved", "/a", "/b", "/c"]);
+    }
+
+    #[test]
+    fn test_merge_prefers_a_project_over_a_frontmost_empty_window() {
+        let merged = merge_serialized_windows(
+            vec![
+                serialized_window(1, Some("/a"), &["/a", "/b"]),
+                serialized_window(2, None, &[]),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(merged.active_workspace.workspace_id, WorkspaceId(1));
+        assert_eq!(group_paths(&merged), ["/a", "/b"]);
+    }
+
+    #[test]
+    fn test_merge_keeps_the_project_of_a_window_without_groups() {
+        let merged = merge_serialized_windows(
+            vec![
+                serialized_window(1, Some("/lone"), &[]),
+                serialized_window(2, Some("/a"), &["/a"]),
+            ],
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(merged.active_workspace.workspace_id, WorkspaceId(2));
+        assert_eq!(group_paths(&merged), ["/lone", "/a"]);
+    }
+
+    #[test]
+    fn test_merge_of_no_windows_is_none() {
+        assert!(merge_serialized_windows(Vec::new(), vec![local_group("/a")]).is_none());
     }
 
     #[gpui::test]

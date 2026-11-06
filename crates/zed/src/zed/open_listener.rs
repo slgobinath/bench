@@ -1790,7 +1790,7 @@ mod tests {
             })
             .unwrap();
 
-        // Opening a file inside the existing worktree with -n creates a new window.
+        // Opening a file inside the existing worktree with -n stays in the only window.
         open_workspace_file(
             path!("/root/dir1/file1.txt"),
             workspace::OpenOptions {
@@ -1802,7 +1802,7 @@ mod tests {
         )
         .await;
 
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
@@ -1928,9 +1928,9 @@ mod tests {
         )
         .await;
 
-        assert_eq!(cx.windows().len(), 2);
-        let multi_workspace_2 = cx.windows()[1].downcast::<MultiWorkspace>().unwrap();
-        multi_workspace_2
+        assert_eq!(cx.windows().len(), 1);
+        let multi_workspace = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
+        multi_workspace
             .update(cx, |multi_workspace, _, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
                     let items = workspace.items(cx).collect::<Vec<_>>();
@@ -2152,170 +2152,6 @@ mod tests {
             }
             _ => panic!("Expected GitClone kind"),
         }
-    }
-
-    #[gpui::test]
-    async fn test_add_flag_prefers_focused_window(cx: &mut TestAppContext) {
-        let app_state = init_test(cx);
-
-        let root_dir = if cfg!(windows) { "C:\\root" } else { "/root" };
-        let file1_path = if cfg!(windows) {
-            "C:\\root\\file1.txt"
-        } else {
-            "/root/file1.txt"
-        };
-        let file2_path = if cfg!(windows) {
-            "C:\\root\\file2.txt"
-        } else {
-            "/root/file2.txt"
-        };
-
-        app_state.fs.create_dir(Path::new(root_dir)).await.unwrap();
-        app_state
-            .fs
-            .create_file(Path::new(file1_path), Default::default())
-            .await
-            .unwrap();
-        app_state
-            .fs
-            .save(
-                Path::new(file1_path),
-                &Rope::from("content1"),
-                LineEnding::Unix,
-            )
-            .await
-            .unwrap();
-        app_state
-            .fs
-            .create_file(Path::new(file2_path), Default::default())
-            .await
-            .unwrap();
-        app_state
-            .fs
-            .save(
-                Path::new(file2_path),
-                &Rope::from("content2"),
-                LineEnding::Unix,
-            )
-            .await
-            .unwrap();
-
-        // Open first workspace
-        let workspace_paths_1 = vec![file1_path.to_string()];
-        let _errored = cx
-            .spawn({
-                let app_state = app_state.clone();
-                |mut cx| async move {
-                    let response_sink = DiscardResponseSink;
-                    open_local_workspace(
-                        workspace_paths_1,
-                        Vec::new(),
-                        false,
-                        workspace::OpenOptions::default(),
-                        None,
-                        &response_sink,
-                        &app_state,
-                        &mut cx,
-                    )
-                    .await
-                }
-            })
-            .await;
-
-        assert_eq!(cx.windows().len(), 1);
-        let multi_workspace_1 = cx.windows()[0].downcast::<MultiWorkspace>().unwrap();
-
-        // Open second workspace in a new window
-        let workspace_paths_2 = vec![file2_path.to_string()];
-        let _errored = cx
-            .spawn({
-                let app_state = app_state.clone();
-                |mut cx| async move {
-                    let response_sink = DiscardResponseSink;
-                    open_local_workspace(
-                        workspace_paths_2,
-                        Vec::new(),
-                        false,
-                        workspace::OpenOptions {
-                            workspace_matching: workspace::WorkspaceMatching::None, // Force new window
-                            ..Default::default()
-                        },
-                        None,
-                        &response_sink,
-                        &app_state,
-                        &mut cx,
-                    )
-                    .await
-                }
-            })
-            .await;
-
-        assert_eq!(cx.windows().len(), 2);
-        let multi_workspace_2 = cx.windows()[1].downcast::<MultiWorkspace>().unwrap();
-
-        // Focus window2
-        multi_workspace_2
-            .update(cx, |_, window, _| {
-                window.activate_window();
-            })
-            .unwrap();
-
-        // Now use --add flag (open_behavior = OpenBehavior::Add) to add a new file
-        // It should open in the focused window (window2), not an arbitrary window
-        let new_file_path = if cfg!(windows) {
-            "C:\\root\\new_file.txt"
-        } else {
-            "/root/new_file.txt"
-        };
-        app_state
-            .fs
-            .create_file(Path::new(new_file_path), Default::default())
-            .await
-            .unwrap();
-
-        let workspace_paths_add = vec![new_file_path.to_string()];
-        let _errored = cx
-            .spawn({
-                let app_state = app_state.clone();
-                |mut cx| async move {
-                    let response_sink = DiscardResponseSink;
-                    open_local_workspace(
-                        workspace_paths_add,
-                        Vec::new(),
-                        false,
-                        workspace::OpenOptions {
-                            workspace_matching: workspace::WorkspaceMatching::MatchSubdirectory, // --add flag
-                            ..Default::default()
-                        },
-                        None,
-                        &response_sink,
-                        &app_state,
-                        &mut cx,
-                    )
-                    .await
-                }
-            })
-            .await;
-
-        // Should still have 2 windows (file added to existing focused window)
-        assert_eq!(cx.windows().len(), 2);
-
-        // Verify the file was added to window2 (the focused one)
-        multi_workspace_2
-            .update(cx, |workspace, _, cx| {
-                let items = workspace.workspace().read(cx).items(cx).collect::<Vec<_>>();
-                // Should have 2 items now (file2.txt and new_file.txt)
-                assert_eq!(items.len(), 2, "Focused window should have 2 items");
-            })
-            .unwrap();
-
-        // Verify window1 still has only 1 item
-        multi_workspace_1
-            .update(cx, |workspace, _, cx| {
-                let items = workspace.workspace().read(cx).items(cx).collect::<Vec<_>>();
-                assert_eq!(items.len(), 1, "Other window should still have 1 item");
-            })
-            .unwrap();
     }
 
     #[gpui::test]
@@ -2656,7 +2492,7 @@ mod tests {
 
         assert_eq!(status, 0);
         assert!(prompt_shown, "prompt should be shown");
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
 
         let settings_text = app_state
             .fs
@@ -2785,7 +2621,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_e2e_new_window_setting_opens_project_root_in_new_window(cx: &mut TestAppContext) {
+    async fn test_e2e_new_window_setting_opens_project_root_in_the_only_window(
+        cx: &mut TestAppContext,
+    ) {
         let app_state = init_test(cx);
 
         app_state
@@ -2832,7 +2670,7 @@ mod tests {
             !prompt_shown,
             "no prompt should be shown when setting already configured"
         );
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
@@ -2972,18 +2810,20 @@ mod tests {
             app_state,
             make_cli_open_request(
                 vec![path!("/project_b/file.txt").to_string()],
-                cli::OpenBehavior::AlwaysNew, // -n flag: force new window
+                cli::OpenBehavior::AlwaysNew, // -n flag
             ),
             None,
         );
 
         assert_eq!(status, 0);
         assert!(!prompt_shown, "no prompt should be shown with -n flag");
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]
-    async fn test_e2e_explicit_new_flag_with_file_url_opens_new_window(cx: &mut TestAppContext) {
+    async fn test_e2e_explicit_new_flag_with_file_url_stays_in_the_only_window(
+        cx: &mut TestAppContext,
+    ) {
         let app_state = init_test(cx);
 
         app_state
@@ -3008,7 +2848,7 @@ mod tests {
 
         assert_eq!(status, 0);
         assert!(!prompt_shown, "no prompt should be shown with -n flag");
-        assert_eq!(cx.windows().len(), 2);
+        assert_eq!(cx.windows().len(), 1);
     }
 
     #[gpui::test]

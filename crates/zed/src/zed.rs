@@ -24,6 +24,7 @@ use assets::Assets;
 use breadcrumbs::Breadcrumbs;
 use client::zed_urls;
 use collections::VecDeque;
+use database_explorer::DatabasePanel;
 use debugger_ui::debugger_panel::DebugPanel;
 use editor::{Editor, MultiBuffer};
 use extension_host::ExtensionStore;
@@ -51,6 +52,7 @@ use language::Capability;
 use language_onboarding::BasedPyrightBanner;
 use language_tools::lsp_button::{self, LspButton};
 use language_tools::lsp_log_view::LspLogToolbarItemView;
+use linear::LinearPanel;
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use migrate::{MigrationBanner, MigrationEvent, MigrationNotification, MigrationType};
 use migrator::migrate_keymap;
@@ -79,8 +81,6 @@ use settings::{
 };
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
-use database_explorer::DatabasePanel;
-use linear::LinearPanel;
 use worktree_panel::WorktreePanel;
 
 use std::{
@@ -521,11 +521,9 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
 
                 let active_workspace = this.workspace().clone();
                 let source_workspace = source_workspace.clone();
-                let left_workspace = std::mem::replace(
-                    &mut previous_workspace,
-                    active_workspace.downgrade(),
-                )
-                .upgrade();
+                let left_workspace =
+                    std::mem::replace(&mut previous_workspace, active_workspace.downgrade())
+                        .upgrade();
                 active_workspace.update(cx, |workspace, cx| {
                     if let Some(ref source) = source_workspace {
                         if let Some(panel) = workspace.panel::<agent_ui::AgentPanel>(cx) {
@@ -3372,7 +3370,7 @@ mod tests {
             })
             .unwrap();
 
-        // Opening with -n (reuse_worktrees: false) still creates a new window.
+        // Opening with -n (reuse_worktrees: false) stays in the only window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/e"))],
@@ -3387,7 +3385,7 @@ mod tests {
         .await
         .unwrap();
         cx.background_executor.run_until_parked();
-        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        assert_eq!(cx.read(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]
@@ -3429,7 +3427,7 @@ mod tests {
         .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
-        // Opening a file inside the existing worktree with -n creates a new window.
+        // Opening a file inside the existing worktree with -n stays in the only window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/dir/c"))],
@@ -3443,9 +3441,9 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
-        // Opening a path NOT in any existing worktree with -n creates a new window.
+        // Opening a path NOT in any existing worktree with -n stays in the only window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/b"))],
@@ -3459,7 +3457,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.update(|cx| cx.windows().len()), 3);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]
@@ -3512,7 +3510,7 @@ mod tests {
         .unwrap();
         assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
-        // Opening a directory already in a worktree with -n creates a new window.
+        // Opening a directory already in a worktree with -n stays in the only window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root/dir2"))],
@@ -3526,9 +3524,9 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.update(|cx| cx.windows().len()), 2);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
 
-        // Opening a directory NOT in any worktree with -n creates a new window.
+        // Opening a directory NOT in any worktree with -n stays in the only window.
         cx.update(|cx| {
             open_paths(
                 &[PathBuf::from(path!("/root"))],
@@ -3542,7 +3540,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(cx.update(|cx| cx.windows().len()), 3);
+        assert_eq!(cx.update(|cx| cx.windows().len()), 1);
     }
 
     #[gpui::test]
@@ -6261,6 +6259,7 @@ mod tests {
     ) -> Arc<AppState> {
         cx.update(move |cx| {
             env_logger::builder().is_test(true).try_init().ok();
+            cx.set_global(db::AppDatabase::test_new());
 
             let state = Arc::get_mut(&mut app_state).unwrap();
             state.build_window_options = build_window_options;
@@ -7305,9 +7304,7 @@ mod tests {
     /// another that already has its own workspace must not bring it back, and
     /// opening it must carry across the same way.
     #[gpui::test]
-    async fn test_panel_visibility_follows_the_window_across_worktrees(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_panel_visibility_follows_the_window_across_worktrees(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
         cx.update(init);
         app_state
@@ -7363,15 +7360,16 @@ mod tests {
             });
         }
 
-        let in_workspace = |workspace: &Entity<Workspace>,
-                            cx: &mut TestAppContext,
-                            f: &dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
-            window
-                .update(cx, |_, window, cx| {
-                    workspace.update(cx, |workspace, cx| f(workspace, window, cx))
-                })
-                .unwrap();
-        };
+        let in_workspace =
+            |workspace: &Entity<Workspace>,
+             cx: &mut TestAppContext,
+             f: &dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)| {
+                window
+                    .update(cx, |_, window, cx| {
+                        workspace.update(cx, |workspace, cx| f(workspace, window, cx))
+                    })
+                    .unwrap();
+            };
 
         // Opened in one worktree, it is open in the next.
         in_workspace(&workspace1, cx, &|workspace, window, cx| {
@@ -7593,22 +7591,16 @@ mod tests {
             .expect("failed to open second workspace into window A");
         cx.run_until_parked();
 
-        let workspace::OpenResult {
-            window: window_b, ..
-        } = cx
-            .update(|cx| {
-                Workspace::new_local(
-                    vec![dir3.into()],
-                    app_state.clone(),
-                    None,
-                    None,
-                    None,
-                    OpenMode::Activate,
-                    cx,
-                )
-            })
-            .await
-            .expect("failed to open third workspace");
+        // Opening a project can no longer create this window, but sessions saved
+        // by earlier versions can still contain one.
+        let project_b = project::Project::test(fs.clone(), [dir3.as_ref()], cx).await;
+        let window_b = cx.add_window({
+            let app_state = app_state.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(None, project_b, app_state, window, cx));
+                MultiWorkspace::new(workspace, window, cx)
+            }
+        });
 
         window_b
             .update(cx, |multi_workspace, _, cx| {
@@ -7629,7 +7621,12 @@ mod tests {
 
         cx.run_until_parked();
         flush_workspace_serialization(&window_a, cx).await;
-        flush_workspace_serialization(&window_b, cx).await;
+        let window_b_tasks = window_b
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.flush_all_serialization(window, cx)
+            })
+            .unwrap();
+        futures::future::join_all(window_b_tasks).await;
         cx.run_until_parked();
 
         // Verify all workspaces retained their session_ids.
@@ -7707,48 +7704,20 @@ mod tests {
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
                 .collect()
         });
-        assert_eq!(restored_windows.len(), 2,);
+        assert_eq!(restored_windows.len(), 1);
 
-        // Identify restored windows by their active workspace root paths.
-        let (restored_a, restored_b) = {
-            let (mut with_dir1, mut with_dir3) = (None, None);
-            for window in &restored_windows {
-                let active_paths = window
-                    .read_with(cx, |mw, cx| mw.workspace().read(cx).root_paths(cx))
-                    .unwrap();
-                if active_paths.iter().any(|p| p.as_ref() == Path::new(dir1)) {
-                    with_dir1 = Some(window);
-                } else {
-                    with_dir3 = Some(window);
+        // Both windows fold into one that lists every project, with only the
+        // active workspace loaded.
+        restored_windows[0]
+            .read_with(cx, |mw, _| {
+                let keys = mw.project_group_keys();
+                for dir in [dir1, dir2, dir3] {
+                    assert!(
+                        keys.contains(&ProjectGroupKey::new(None, PathList::new(&[dir]))),
+                        "{dir} should be restored; got {keys:?}"
+                    );
                 }
-            }
-            (
-                with_dir1.expect("expected a window with dir1 active"),
-                with_dir3.expect("expected a window with dir3 active"),
-            )
-        };
-
-        // Window A (dir1+dir2): 1 workspace restored, but 2 project group keys.
-        restored_a
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![
-                        ProjectGroupKey::new(None, PathList::new(&[dir2])),
-                        ProjectGroupKey::new(None, PathList::new(&[dir1])),
-                    ]
-                );
-                assert_eq!(mw.workspaces().count(), 1);
-            })
-            .unwrap();
-
-        // Window B (dir3): 1 workspace, 1 project group key.
-        restored_b
-            .read_with(cx, |mw, _| {
-                assert_eq!(
-                    mw.project_group_keys(),
-                    vec![ProjectGroupKey::new(None, PathList::new(&[dir3]))]
-                );
+                assert_eq!(keys.len(), 3);
                 assert_eq!(mw.workspaces().count(), 1);
             })
             .unwrap();
@@ -7955,11 +7924,10 @@ mod tests {
         .expect("failed to read session workspaces");
         assert_eq!(locations.len(), 2);
 
-        for window in [first_window, second_window] {
-            window
-                .update(cx, |_, window, _| window.remove_window())
-                .expect("workspace window was closed");
-        }
+        assert_eq!(first_window, second_window);
+        first_window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("workspace window was closed");
         cx.run_until_parked();
 
         cx.update(|cx| {
@@ -7975,7 +7943,7 @@ mod tests {
             .expect("failed to restore workspaces");
         cx.run_until_parked();
 
-        let mut restored_tabs = cx.read(|cx| {
+        let restored_tabs = cx.read(|cx| {
             cx.windows()
                 .into_iter()
                 .filter_map(|window| window.downcast::<MultiWorkspace>())
@@ -8006,20 +7974,13 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
-        restored_tabs.sort_by(|left, right| left.0.cmp(&right.0));
 
         assert_eq!(
             restored_tabs,
-            vec![
-                (
-                    first_dir,
-                    vec![rel_path("a.txt").into(), rel_path("b.txt").into()]
-                ),
-                (
-                    second_dir,
-                    vec![rel_path("c.txt").into(), rel_path("d.txt").into()]
-                ),
-            ]
+            vec![(
+                second_dir,
+                vec![rel_path("c.txt").into(), rel_path("d.txt").into()]
+            )]
         );
     }
 

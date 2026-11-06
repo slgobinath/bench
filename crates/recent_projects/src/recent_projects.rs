@@ -3011,7 +3011,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_open_local_project_new_window_creates_new_window(cx: &mut TestAppContext) {
+    async fn test_open_local_project_new_window_stays_in_the_only_window(cx: &mut TestAppContext) {
         let app_state = init_test(cx);
 
         // Disable system path prompts so the injected mock is used.
@@ -3078,12 +3078,10 @@ mod tests {
 
         cx.run_until_parked();
 
-        // Should have opened a new window.
         let final_window_count = cx.update(|cx| cx.windows().len());
         assert_eq!(
-            final_window_count,
-            initial_window_count + 1,
-            "open_local_project with create_new_window=true should open a new window"
+            final_window_count, initial_window_count,
+            "open_local_project with create_new_window=true should stay in the only window"
         );
     }
 

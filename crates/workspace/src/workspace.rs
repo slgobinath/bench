@@ -2268,10 +2268,7 @@ impl Workspace {
                 });
             }
 
-            let window_to_replace = match open_mode {
-                OpenMode::NewWindow => None,
-                _ => requesting_window,
-            };
+            let window_to_replace = requesting_window.or_else(|| cx.update(|cx| single_window(cx)));
 
             let (window, workspace): (WindowHandle<MultiWorkspace>, Entity<Workspace>) =
                 if let Some(window) = window_to_replace {
@@ -2300,14 +2297,11 @@ impl Workspace {
                             workspace
                         });
                         match open_mode {
-                            OpenMode::Activate => {
+                            OpenMode::Activate | OpenMode::NewWindow => {
                                 multi_workspace.activate(workspace.clone(), None, window, cx);
                             }
                             OpenMode::Add => {
                                 multi_workspace.add(workspace.clone(), &*window, cx);
-                            }
-                            OpenMode::NewWindow => {
-                                unreachable!()
                             }
                         }
                         workspace
@@ -10404,6 +10398,61 @@ pub async fn restore_multiworkspace(
     Ok(window_handle)
 }
 
+/// Resolves linked worktree paths to their main repo paths so stale keys from
+/// previous sessions get normalized and deduped.
+async fn resolve_project_groups(
+    project_groups: &[SerializedProjectGroup],
+    fs: &dyn fs::Fs,
+) -> Vec<SerializedProjectGroupState> {
+    let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
+    for serialized in project_groups.iter().cloned() {
+        let SerializedProjectGroupState { key, expanded } = serialized.into_restored_state();
+        if key.path_list().paths().is_empty() {
+            continue;
+        }
+        let mut resolved_paths = Vec::new();
+        for path in key.path_list().paths() {
+            if key.host().is_none()
+                && let Some(common_dir) = project::discover_root_repo_common_dir(path, fs).await
+                && !project::is_submodule_git_dir(&common_dir)
+            {
+                let main_path = project::repo_identity_path(&common_dir, PathStyle::local());
+                resolved_paths.push(main_path.to_path_buf());
+            } else {
+                resolved_paths.push(path.to_path_buf());
+            }
+        }
+        let resolved = ProjectGroupKey::new(key.host(), PathList::new(&resolved_paths));
+        if !resolved_groups.iter().any(|g| g.key == resolved) {
+            resolved_groups.push(SerializedProjectGroupState {
+                key: resolved,
+                expanded,
+            });
+        }
+    }
+    resolved_groups
+}
+
+/// Folds the windows of a past session into the one window Bench restores, and
+/// stores the combined project list before that window exists so that a failed
+/// or interrupted restore can't lose it.
+pub async fn merge_into_single_window(
+    windows: Vec<SerializedMultiWorkspace>,
+    fs: Arc<dyn fs::Fs>,
+    cx: &mut AsyncApp,
+) -> Option<SerializedMultiWorkspace> {
+    let kvp = cx.update(|cx| db::kvp::KeyValueStore::global(cx));
+    let saved_groups = persistence::read_single_window_state(&kvp).project_groups;
+    let mut merged = persistence::merge_serialized_windows(windows, saved_groups)?;
+    merged.state.project_groups = resolve_project_groups(&merged.state.project_groups, fs.as_ref())
+        .await
+        .iter()
+        .map(|group| SerializedProjectGroup::from_group(&group.key, group.expanded))
+        .collect();
+    persistence::write_single_window_state(&kvp, merged.state.clone()).await;
+    Some(merged)
+}
+
 pub async fn apply_restored_multiworkspace_state(
     window_handle: WindowHandle<MultiWorkspace>,
     state: &MultiWorkspaceState,
@@ -10418,39 +10467,11 @@ pub async fn apply_restored_multiworkspace_state(
     } = state;
 
     if !project_groups.is_empty() {
-        // Resolve linked worktree paths to their main repo paths so
-        // stale keys from previous sessions get normalized and deduped.
-        let mut resolved_groups: Vec<SerializedProjectGroupState> = Vec::new();
-        for serialized in project_groups.iter().cloned() {
-            let SerializedProjectGroupState { key, expanded } = serialized.into_restored_state();
-            if key.path_list().paths().is_empty() {
-                continue;
-            }
-            let mut resolved_paths = Vec::new();
-            for path in key.path_list().paths() {
-                if key.host().is_none()
-                    && let Some(common_dir) =
-                        project::discover_root_repo_common_dir(path, fs.as_ref()).await
-                    && !project::is_submodule_git_dir(&common_dir)
-                {
-                    let main_path = project::repo_identity_path(&common_dir, PathStyle::local());
-                    resolved_paths.push(main_path.to_path_buf());
-                } else {
-                    resolved_paths.push(path.to_path_buf());
-                }
-            }
-            let resolved = ProjectGroupKey::new(key.host(), PathList::new(&resolved_paths));
-            if !resolved_groups.iter().any(|g| g.key == resolved) {
-                resolved_groups.push(SerializedProjectGroupState {
-                    key: resolved,
-                    expanded,
-                });
-            }
-        }
-
+        let resolved_groups = resolve_project_groups(project_groups, fs.as_ref()).await;
         window_handle
             .update(cx, |multi_workspace, _window, cx| {
                 multi_workspace.restore_project_groups(resolved_groups, cx);
+                multi_workspace.serialize(cx);
             })
             .ok();
     }
@@ -10858,6 +10879,25 @@ pub async fn get_any_active_multi_workspace(
         .await?;
     }
     activate_any_workspace_window(&mut cx).context("could not open zed")
+}
+
+/// The window that new workspaces open in. Bench keeps every project in one
+/// window, so a new one is only created when none exists. Without multi-workspace
+/// support a window can't hold a second project, so it doesn't qualify.
+pub fn single_window(cx: &App) -> Option<WindowHandle<MultiWorkspace>> {
+    cx.active_window()
+        .and_then(|window| window.downcast::<MultiWorkspace>())
+        .into_iter()
+        .chain(
+            cx.windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>()),
+        )
+        .find(|window| {
+            window
+                .read(cx)
+                .is_ok_and(|multi_workspace| multi_workspace.multi_workspace_enabled(cx))
+        })
 }
 
 pub fn activate_any_workspace_window(cx: &mut AsyncApp) -> Option<WindowHandle<MultiWorkspace>> {
