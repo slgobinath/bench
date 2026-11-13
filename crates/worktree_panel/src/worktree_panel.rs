@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow};
-use git::repository::{CreateWorktreeTarget, GitRepository, Worktree as GitWorktree};
+use git::repository::{CreateWorktreeTarget, GitRepository, RepoPath, Worktree as GitWorktree};
 use agent_tracker::{
     AgentState, AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, Phase, agent_state_color,
 };
@@ -62,6 +62,7 @@ use ui_input::{ErasedEditor, InputField};
 use settings::Settings as _;
 use util::path_list::PathList;
 use util::paths::home_dir;
+use util::rel_path::RelPath;
 use util::shell::ShellKind;
 use util::ResultExt as _;
 use workspace::{
@@ -2359,8 +2360,9 @@ impl WorktreePanel {
             });
 
         cx.spawn_in(window, async move |this, cx| {
+            let git = which::which("git").ok();
             let nested = if remote_project.is_some() {
-                Vec::new()
+                NestedWorktrees::default()
             } else {
                 cx.background_spawn(nested_worktrees(fs.clone(), root.clone()))
                     .await
@@ -2373,24 +2375,43 @@ impl WorktreePanel {
             if let Some(branch) = &branch {
                 detail.push_str(&format!(" Its branch “{branch}” is deleted too."));
             }
-            if !nested.is_empty() {
+            if !nested.linked.is_empty() {
                 detail.push_str(&format!(
                     "\n\nThe repositories inside it are removed from their own repositories \
                      first: {}.",
                     nested
+                        .linked
                         .iter()
                         .map(|nested| nested.label(&root))
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
             }
+            let uncommitted = if remote_project.is_some() {
+                Some("Anything not committed in it is deleted too.".to_string())
+            } else {
+                cx.background_spawn(uncommitted_work(
+                    fs.clone(),
+                    git.clone(),
+                    root.clone(),
+                    nested.clone(),
+                ))
+                .await
+            };
             let (answer, answered) = futures::channel::oneshot::channel();
             let host = multi_workspace
                 .update(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
             cx.update(|window, cx| {
                 host.update(cx, |host, cx| {
                     host.toggle_modal(window, cx, |_, cx| {
-                        DeleteWorktree::new(name.clone(), detail, issue.clone(), answer, cx)
+                        DeleteWorktree::new(
+                            name.clone(),
+                            detail,
+                            uncommitted,
+                            issue.clone(),
+                            answer,
+                            cx,
+                        )
                     });
                 });
             })?;
@@ -2442,87 +2463,33 @@ impl WorktreePanel {
                 ),
             }
 
-            let git = which::which("git").ok();
-            let mut refused: Vec<(String, anyhow::Error)> = Vec::new();
-            let mut refused_nested = Vec::new();
-            for nested in &nested {
-                match remove_nested(&fs, git.as_deref(), nested, false).await {
-                    Ok(()) => {}
-                    Err(error) => {
-                        refused.push((nested.label(&root), error));
-                        refused_nested.push(nested.clone());
-                    }
+            // Forced, because the question above already named what this
+            // discards: without it git refuses over a single untracked file.
+            let removed = async {
+                for nested in &nested.linked {
+                    remove_nested(&fs, git.as_deref(), nested, true).await?;
                 }
-            }
-            // Only once everything inside it is gone: with a nested
-            // repository refused, the outer worktree still holds it, and
-            // nothing is deleted until the user says so.
-            let mut outer_removed = false;
-            if refused.is_empty() {
-                let removed = repository
+                repository
                     .update(cx, |repository, _| {
-                        repository.remove_worktree(root.clone(), false)
+                        repository.remove_worktree(root.clone(), true)
                     })
-                    .await?;
-                match removed {
-                    Ok(()) => outer_removed = true,
-                    Err(error) => refused.push((name.to_string(), error)),
-                }
+                    .await??;
+                anyhow::Ok(())
             }
-
-            if !refused.is_empty() {
-                for (what, error) in &refused {
-                    log::warn!("git refused to remove {what}: {error:#}");
-                }
-                let reasons = refused
-                    .iter()
-                    .map(|(what, error)| format!("• {what}: {}", git_reason(error)))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let forced = cx.update(|window, cx| {
-                    window.prompt(
-                        gpui::PromptLevel::Warning,
-                        &format!("Could not delete “{name}”."),
-                        Some(&format!(
-                            "{reasons}\n\nDeleting it anyway discards whatever is in it."
-                        )),
-                        &["Delete Anyway", "Cancel"],
+            .await;
+            // Shown, not only logged: a failure that only reached the log
+            // looks like the button doing nothing.
+            if let Err(error) = removed {
+                log::error!("deleting the worktree {}: {error:#}", root.display());
+                host.update(cx, |host, cx| {
+                    host.show_error(
+                        format!("Could not delete “{name}”: {}", git_reason(&error)),
                         cx,
-                    )
-                })?;
-                if forced.await? != 0 {
-                    this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
-                        .ok();
-                    return anyhow::Ok(());
-                }
-                let forced = async {
-                    for nested in &refused_nested {
-                        remove_nested(&fs, git.as_deref(), nested, true).await?;
-                    }
-                    if !outer_removed {
-                        repository
-                            .update(cx, |repository, _| {
-                                repository.remove_worktree(root.clone(), true)
-                            })
-                            .await??;
-                    }
-                    anyhow::Ok(())
-                }
-                .await;
-                // Shown, not only logged: after "Delete Anyway" a failure that
-                // only reached the log looks like the button doing nothing.
-                if let Err(error) = forced {
-                    log::error!("force-deleting the worktree {}: {error:#}", root.display());
-                    host.update(cx, |host, cx| {
-                        host.show_error(
-                            format!("Could not delete “{name}”: {}", git_reason(&error)),
-                            cx,
-                        );
-                    });
-                    this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
-                        .ok();
-                    return anyhow::Ok(());
-                }
+                    );
+                });
+                this.update(cx, |this, cx| this.rediscover(project.clone(), cx))
+                    .ok();
+                return anyhow::Ok(());
             }
 
             if let Some(branch) = branch {
@@ -4580,6 +4547,8 @@ impl Render for EditTitle {
 struct DeleteWorktree {
     name: SharedString,
     detail: String,
+    /// What deleting discards for good, from [`uncommitted_work`].
+    uncommitted: Option<String>,
     /// The worktree's issue, when it is one still open and there is a Linear
     /// to close it in.
     issue: Option<Arc<Issue>>,
@@ -4592,6 +4561,7 @@ impl DeleteWorktree {
     fn new(
         name: SharedString,
         detail: String,
+        uncommitted: Option<String>,
         issue: Option<Arc<Issue>>,
         answer: futures::channel::oneshot::Sender<bool>,
         cx: &mut Context<Self>,
@@ -4599,6 +4569,7 @@ impl DeleteWorktree {
         Self {
             name,
             detail,
+            uncommitted,
             issue,
             // Deleting the worktree is usually the end of the work, and an
             // issue left open after it is one nobody will come back to.
@@ -4648,6 +4619,11 @@ impl Render for DeleteWorktree {
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
+            .children(self.uncommitted.as_ref().map(|uncommitted| {
+                Label::new(uncommitted.clone())
+                    .size(LabelSize::Small)
+                    .color(Color::Warning)
+            }))
             .children(self.issue.as_ref().map(|issue| {
                 h_flex()
                     .gap_2()
@@ -5130,6 +5106,25 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
     ".gradle",
 ];
 
+/// What is checked out inside a worktree being deleted.
+#[derive(Clone, Debug, Default)]
+struct NestedWorktrees {
+    linked: Vec<NestedWorktree>,
+    /// Checkouts their repository no longer has, which git refuses to remove,
+    /// forced or not. They are only files in the outer worktree now, and go
+    /// with it.
+    orphaned: Vec<PathBuf>,
+}
+
+/// What a directory's `.git` file makes it.
+enum Checkout {
+    /// Not a linked worktree at all.
+    Unlinked,
+    /// A worktree of the repository whose `.git` directory this is.
+    Linked(PathBuf),
+    Orphaned,
+}
+
 /// The linked worktrees of other repositories inside `root`.
 ///
 /// A linked worktree is a directory whose `.git` is a file pointing at
@@ -5138,10 +5133,10 @@ const SKIPPED_DIRECTORIES: &[&str] = &[
 /// The search stops at each one it finds — what is inside a nested repository
 /// is that repository's business — and does not go deep, because a worktree
 /// can hold hundreds of thousands of files.
-async fn nested_worktrees(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<NestedWorktree> {
+async fn nested_worktrees(fs: Arc<dyn Fs>, root: PathBuf) -> NestedWorktrees {
     use futures::StreamExt as _;
 
-    let mut found = Vec::new();
+    let mut found = NestedWorktrees::default();
     let mut level = vec![root];
     for _ in 0..NESTED_DEPTH {
         let mut next = Vec::new();
@@ -5160,12 +5155,13 @@ async fn nested_worktrees(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<NestedWorktree>
                 if skipped || !fs.is_dir(&child).await {
                     continue;
                 }
-                match linked_worktree_common_dir(fs.as_ref(), &child).await {
-                    Some(common_dir) => found.push(NestedWorktree {
+                match linked_checkout(fs.as_ref(), &child).await {
+                    Checkout::Linked(common_dir) => found.linked.push(NestedWorktree {
                         path: child,
                         common_dir,
                     }),
-                    None => {
+                    Checkout::Orphaned => found.orphaned.push(child),
+                    Checkout::Unlinked => {
                         if !fs.is_dir(&child.join(".git")).await {
                             next.push(child);
                         }
@@ -5175,40 +5171,71 @@ async fn nested_worktrees(fs: Arc<dyn Fs>, root: PathBuf) -> Vec<NestedWorktree>
         }
         level = next;
     }
-    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found.linked.sort_by(|a, b| a.path.cmp(&b.path));
+    found.orphaned.sort();
     found
 }
 
-/// The repository `directory` is a linked worktree of, from its `.git` file:
-/// `gitdir: <repository>/.git/worktrees/<name>`, whose `commondir` names the
+/// What `directory` is, from its `.git` file: `gitdir:
+/// <repository>/.git/worktrees/<name>`, whose `commondir` names the
 /// repository's `.git`.
-async fn linked_worktree_common_dir(fs: &dyn Fs, directory: &Path) -> Option<PathBuf> {
-    let dot_git = fs.load(&directory.join(".git")).await.ok()?;
-    let gitdir = PathBuf::from(dot_git.strip_prefix("gitdir:")?.trim());
+async fn linked_checkout(fs: &dyn Fs, directory: &Path) -> Checkout {
+    let Ok(dot_git) = fs.load(&directory.join(".git")).await else {
+        return Checkout::Unlinked;
+    };
+    let Some(gitdir) = dot_git.strip_prefix("gitdir:") else {
+        return Checkout::Unlinked;
+    };
+    let gitdir = PathBuf::from(gitdir.trim());
     let gitdir = if gitdir.is_relative() {
         directory.join(gitdir)
     } else {
         gitdir
     };
     // A checkout whose git directory is gone — pruned, or removed by hand —
-    // is no longer a worktree of anything: git answers "is not a working
-    // tree" to removing it, forced or not. It is only files in the outer
-    // worktree now, and goes with it.
-    if !fs.is_dir(&gitdir).await {
-        return None;
+    // is no longer a worktree of anything. Neither is one whose git directory
+    // belongs to someone else: git reuses a pruned `<name>` for the next
+    // worktree, and leaves the old checkout's `.git` pointing at it.
+    if !fs.is_dir(&gitdir).await || !gitdir_belongs_to(fs, &gitdir, directory).await {
+        return Checkout::Orphaned;
     }
     match fs.load(&gitdir.join("commondir")).await {
         Ok(common_dir) => {
             let common_dir = PathBuf::from(common_dir.trim());
-            Some(if common_dir.is_relative() {
+            Checkout::Linked(if common_dir.is_relative() {
                 normalize(&gitdir.join(common_dir))
             } else {
                 common_dir
             })
         }
         // `<repository>/.git/worktrees/<name>` is two levels below it.
-        Err(_) => Some(gitdir.parent()?.parent()?.to_path_buf()),
+        Err(_) => match gitdir.parent().and_then(Path::parent) {
+            Some(common_dir) => Checkout::Linked(common_dir.to_path_buf()),
+            None => Checkout::Orphaned,
+        },
     }
+}
+
+/// Whether the `gitdir` file in a worktree's git directory, which names the
+/// checkout that owns it, names `directory`.
+async fn gitdir_belongs_to(fs: &dyn Fs, gitdir: &Path, directory: &Path) -> bool {
+    let Ok(owner) = fs.load(&gitdir.join("gitdir")).await else {
+        return false;
+    };
+    let owner = PathBuf::from(owner.trim());
+    let owner = if owner.is_relative() {
+        normalize(&gitdir.join(owner))
+    } else {
+        owner
+    };
+    let dot_git = directory.join(".git");
+    // Git writes the path it was given, which a symlink can make differ from
+    // the one found by walking down from the worktree.
+    owner == dot_git
+        || matches!(
+            (fs.canonicalize(&owner).await, fs.canonicalize(&dot_git).await),
+            (Ok(owner), Ok(dot_git)) if owner == dot_git
+        )
 }
 
 /// `a/b/../c` as `a/c`, without asking the filesystem: git writes
@@ -5237,6 +5264,100 @@ async fn remove_nested(
 ) -> anyhow::Result<()> {
     let repository = fs.open_repo(&nested.common_dir, git)?;
     repository.remove_worktree(nested.path.clone(), force).await
+}
+
+/// How many uncommitted files the question about deleting names before
+/// counting the rest: it is a dialog, not a report.
+const LISTED_UNCOMMITTED_FILES: usize = 20;
+
+/// The files in `checkout` git would refuse to delete without `--force`.
+async fn uncommitted_files(
+    fs: &Arc<dyn Fs>,
+    git: Option<&Path>,
+    checkout: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let repository = fs.open_repo(&checkout.join(".git"), git)?;
+    let status = repository
+        .status(&[RepoPath::from_rel_path(RelPath::empty())])
+        .await?;
+    Ok(status
+        .entries
+        .iter()
+        .filter(|(_, status)| !status.is_ignored())
+        .map(|(path, _)| checkout.join(path.as_std_path()))
+        .collect())
+}
+
+/// What deleting `root` throws away that no commit holds, for the question
+/// that asks: once it is answered nothing else stops the deletion. `None` when
+/// there is nothing to warn about.
+async fn uncommitted_work(
+    fs: Arc<dyn Fs>,
+    git: Option<PathBuf>,
+    root: PathBuf,
+    nested: NestedWorktrees,
+) -> Option<String> {
+    let mut files = Vec::new();
+    let mut unchecked: Vec<String> = nested
+        .orphaned
+        .iter()
+        .map(|path| {
+            path.strip_prefix(&root)
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        })
+        .collect();
+    match uncommitted_files(&fs, git.as_deref(), &root).await {
+        // To the outer repository the nested ones can be untracked files, but
+        // what matters is what is in them, which they answer for themselves.
+        Ok(outer) => files.extend(outer.into_iter().filter(|file| {
+            !nested
+                .linked
+                .iter()
+                .any(|nested| file.starts_with(&nested.path))
+                && !nested
+                    .orphaned
+                    .iter()
+                    .any(|orphaned| file.starts_with(orphaned))
+        })),
+        Err(error) => {
+            log::warn!("checking {} for changes: {error:#}", root.display());
+            unchecked.insert(0, "the worktree itself".to_string());
+        }
+    }
+    for nested in &nested.linked {
+        match uncommitted_files(&fs, git.as_deref(), &nested.path).await {
+            Ok(nested) => files.extend(nested),
+            Err(error) => {
+                log::warn!("checking {} for changes: {error:#}", nested.path.display());
+                unchecked.push(nested.label(&root));
+            }
+        }
+    }
+    files.sort();
+
+    let mut warning = Vec::new();
+    if !files.is_empty() {
+        warning.push("Not committed, and deleted with it:".to_string());
+        warning.extend(files.iter().take(LISTED_UNCOMMITTED_FILES).map(|file| {
+            file.strip_prefix(&root)
+                .unwrap_or(file)
+                .display()
+                .to_string()
+        }));
+        if files.len() > LISTED_UNCOMMITTED_FILES {
+            let rest = files.len() - LISTED_UNCOMMITTED_FILES;
+            warning.push(format!("…and {rest} more"));
+        }
+    }
+    if !unchecked.is_empty() {
+        warning.push(format!(
+            "Could not be checked for uncommitted files, and deleted with it: {}",
+            unchecked.join(", ")
+        ));
+    }
+    (!warning.is_empty()).then(|| warning.join("\n"))
 }
 
 /// Git's own reason for refusing, which is the part worth reading: the last
@@ -6729,9 +6850,24 @@ pub(crate) mod tests {
             json!({ ".git": "gitdir: /inner/.git/worktrees/gone", "file.txt": "hi" }),
         )
         .await;
+        // And one whose git directory was reused for another checkout, which
+        // git refuses just the same.
+        fs.insert_tree(
+            "/wt/fix/repos/reused",
+            json!({ ".git": "gitdir: /inner/.git/worktrees/fix-inner", "file.txt": "hi" }),
+        )
+        .await;
 
         let nested = nested_worktrees(fs.clone(), PathBuf::from("/wt/fix")).await;
+        assert_eq!(
+            nested.orphaned,
+            vec![
+                PathBuf::from("/wt/fix/repos/orphan"),
+                PathBuf::from("/wt/fix/repos/reused")
+            ]
+        );
         let found: Vec<(PathBuf, PathBuf)> = nested
+            .linked
             .into_iter()
             .map(|nested| (nested.path, nested.common_dir))
             .collect();
@@ -6815,33 +6951,124 @@ pub(crate) mod tests {
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
     }
 
-    /// A nested repository with changes is named in the warning, with git's
-    /// reason, and deleting anyway removes it too.
+    fn delete_question(
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut VisualTestContext,
+    ) -> Option<String> {
+        cx.run_until_parked();
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace
+                .workspace()
+                .read(cx)
+                .active_modal::<DeleteWorktree>(cx)
+                .expect("the question")
+                .read(cx)
+                .uncommitted
+                .clone()
+        })
+    }
+
+    /// What git would refuse over is named in the one question, and saying yes
+    /// to it is enough: git is not given the chance to refuse.
     #[gpui::test]
-    async fn a_nested_repository_with_changes_is_named_before_deleting(cx: &mut TestAppContext) {
+    async fn uncommitted_files_are_named_in_the_only_question(cx: &mut TestAppContext) {
         let (fs, multi_workspace, _fix, panel, mut cx) =
             worktree_with_a_nested_repository(cx).await;
+        fs.insert_file("/wt/fix/repos/inner/notes.md", b"mine".to_vec())
+            .await;
+        fs.insert_file("/wt/fix/plan.md", b"mine".to_vec()).await;
         fs.with_git_state(Path::new("/inner/.git"), false, |state| {
             state
                 .worktrees_requiring_force_delete
                 .insert(PathBuf::from("/wt/fix/repos/inner"));
         })
         .expect("the clone's repository");
+        fs.with_git_state(Path::new("/outer/.git"), false, |state| {
+            state
+                .worktrees_requiring_force_delete
+                .insert(PathBuf::from("/wt/fix"));
+        })
+        .expect("the outer repository");
 
         delete_fix(&panel, &mut cx);
+        let uncommitted = delete_question(&multi_workspace, &mut cx).expect("a warning");
+        assert!(uncommitted.contains("\nplan.md"), "{uncommitted}");
+        assert!(uncommitted.contains("\nrepos/inner/notes.md"), "{uncommitted}");
+        assert_eq!(
+            uncommitted.matches("repos/inner/notes.md").count(),
+            1,
+            "the outer repository does not name what the nested one does: {uncommitted}"
+        );
         confirm_delete(&mut cx);
         cx.run_until_parked();
 
-        let (title, detail) = cx.pending_prompt().expect("a warning");
-        assert_eq!(title, "Could not delete “fix”.");
-        assert!(detail.contains("• repos/inner: "), "{detail}");
-        assert!(detail.contains("contains modified or untracked files"), "{detail}");
-        cx.simulate_prompt_answer("Delete Anyway");
-        cx.run_until_parked();
-
+        assert!(!cx.has_pending_prompt(), "one question, already answered");
         assert!(!fs.is_dir(Path::new("/wt/fix")).await);
         assert!(!fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await);
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    /// A checkout whose git directory now belongs to another worktree cannot
+    /// be removed through git or checked for changes, and removing it must
+    /// not touch the worktree that took the directory over.
+    #[gpui::test]
+    async fn a_checkout_that_lost_its_git_directory_goes_with_the_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        fs.add_linked_worktree_for_repo(
+            Path::new("/inner/.git"),
+            false,
+            worktree("/wt/other/repos/inner", "reused", false),
+        )
+        .await;
+        fs.insert_tree(
+            "/wt/fix/repos/stale",
+            json!({ ".git": "gitdir: /inner/.git/worktrees/reused", "file.txt": "hi" }),
+        )
+        .await;
+
+        delete_fix(&panel, &mut cx);
+        let uncommitted = delete_question(&multi_workspace, &mut cx).expect("a warning");
+        assert!(
+            uncommitted.contains("Could not be checked for uncommitted files"),
+            "{uncommitted}"
+        );
+        assert!(uncommitted.contains("repos/stale"), "{uncommitted}");
+        confirm_delete(&mut cx);
+        cx.run_until_parked();
+
+        assert!(!cx.has_pending_prompt());
+        assert!(!fs.is_dir(Path::new("/wt/fix")).await);
+        assert!(
+            fs.is_dir(Path::new("/inner/.git/worktrees/reused")).await,
+            "the other worktree keeps its git directory"
+        );
+        assert_nothing_left_of_fix(&multi_workspace, &mut cx);
+    }
+
+    #[gpui::test]
+    async fn a_long_list_of_uncommitted_files_is_cut_short(cx: &mut TestAppContext) {
+        let (fs, multi_workspace, _fix, panel, mut cx) =
+            worktree_with_a_nested_repository(cx).await;
+        fs.set_head_and_index_for_repo(
+            Path::new("/wt/fix/.git"),
+            &[("file.txt", "hi".to_string())],
+        );
+        fs.set_head_and_index_for_repo(
+            Path::new("/wt/fix/repos/inner/.git"),
+            &[("file.txt", "hi".to_string())],
+        );
+        for index in 0..LISTED_UNCOMMITTED_FILES + 3 {
+            fs.insert_file(format!("/wt/fix/new-{index:02}.md"), b"mine".to_vec())
+                .await;
+        }
+
+        delete_fix(&panel, &mut cx);
+        let uncommitted = delete_question(&multi_workspace, &mut cx).expect("a warning");
+        assert_eq!(uncommitted.matches("new-").count(), LISTED_UNCOMMITTED_FILES);
+        assert!(uncommitted.ends_with("…and 3 more"), "{uncommitted}");
     }
 
     /// Whatever else shows the worktree goes with it: a workspace opened at
