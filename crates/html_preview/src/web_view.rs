@@ -1,5 +1,5 @@
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use fs::Fs;
@@ -51,16 +51,27 @@ const PAGE_SCRIPT: &str = r#"
 
 /// What a web view shows.
 pub(crate) enum PageSource {
-    /// A file from a worktree, served on [`SCHEME`] from `root`. Links that
-    /// leave the worktree open in the person's browser.
-    Worktree {
-        url: String,
-        root: PathBuf,
-        fs: Arc<dyn Fs>,
-    },
+    /// A file from a worktree, served on [`SCHEME`]. Links that leave the
+    /// worktree open in the person's browser.
+    Worktree { url: String, files: PageFiles },
     /// Pages from the web, in Bench's browser. `script` runs at the start of
     /// every page it loads, before the page's own scripts.
     Web { url: String, script: &'static str },
+}
+
+/// Where a worktree page's files are served from.
+#[derive(Clone)]
+pub(crate) enum PageFiles {
+    /// The disk, under the worktree's `root`.
+    Disk { root: PathBuf, fs: Arc<dyn Fs> },
+    /// Another machine, whose disk the web view can't read. Only the page
+    /// itself is served, as the project's buffer has it, so a page shows whole
+    /// only when it carries its styles, scripts and images inline.
+    Remote {
+        /// The page's path in its worktree.
+        page: PathBuf,
+        text: Arc<Mutex<String>>,
+    },
 }
 
 pub(crate) enum PageEvent {
@@ -298,11 +309,10 @@ fn content_type(path: &Path) -> &'static str {
 #[cfg(target_os = "macos")]
 mod platform {
     use std::cell::{Cell, RefCell};
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use anyhow::{Context as _, Result};
     use block2::RcBlock;
-    use fs::Fs;
     use futures::channel::{mpsc::UnboundedSender, oneshot};
     use gpui::{
         AnyWindowHandle, App, Bounds, DevicePixels, Pixels, Point, Size, Window,
@@ -325,8 +335,8 @@ mod platform {
     use wry::WebViewExtMacOS as _;
 
     use super::{
-        KeyStroke, PAGE_SCRIPT, PageEvent, PageMessage, PageSource, SCHEME, browser_loads,
-        content_type, opens_externally, resolve_request_path, script_function_body,
+        KeyStroke, PAGE_SCRIPT, PageEvent, PageFiles, PageMessage, PageSource, SCHEME,
+        browser_loads, content_type, opens_externally, resolve_request_path, script_function_body,
     };
 
     /// A WKWebView in a native surface of the window's composition, so that
@@ -363,18 +373,18 @@ mod platform {
                     }
                 });
             let builder = match source {
-                PageSource::Worktree { url, root, fs } => {
+                PageSource::Worktree { url, files } => {
                     let executor = cx.background_executor().clone();
                     builder
                         .with_url(url)
                         .with_asynchronous_custom_protocol(
                             SCHEME.to_string(),
                             move |_, request, responder| {
-                                let path = resolve_request_path(&root, request.uri().path());
-                                let fs = fs.clone();
+                                let request_path = request.uri().path().to_string();
+                                let files = files.clone();
                                 executor
                                     .spawn(async move {
-                                        responder.respond(serve(path, fs.as_ref()).await);
+                                        responder.respond(serve(&files, &request_path).await);
                                     })
                                     .detach();
                             },
@@ -848,15 +858,44 @@ mod platform {
         Ok(data.to_vec())
     }
 
-    async fn serve(path: Option<PathBuf>, fs: &dyn Fs) -> http::Response<Vec<u8>> {
-        let Some(path) = path else {
-            return response(StatusCode::FORBIDDEN, "text/plain", Vec::new());
-        };
-        match fs.load_bytes(&path).await {
-            Ok(body) => response(StatusCode::OK, content_type(&path), body),
-            Err(error) => {
-                log::debug!("HTML preview could not read {}: {error:#}", path.display());
-                response(StatusCode::NOT_FOUND, "text/plain", Vec::new())
+    async fn serve(files: &PageFiles, request_path: &str) -> http::Response<Vec<u8>> {
+        let forbidden = || response(StatusCode::FORBIDDEN, "text/plain", Vec::new());
+        let not_found = || response(StatusCode::NOT_FOUND, "text/plain", Vec::new());
+        match files {
+            PageFiles::Disk { root, fs } => {
+                let Some(path) = resolve_request_path(root, request_path) else {
+                    return forbidden();
+                };
+                match fs.load_bytes(&path).await {
+                    Ok(body) => response(StatusCode::OK, content_type(&path), body),
+                    Err(error) => {
+                        log::debug!("HTML preview could not read {}: {error:#}", path.display());
+                        not_found()
+                    }
+                }
+            }
+            PageFiles::Remote { page, text } => {
+                let Some(path) = resolve_request_path(Path::new(""), request_path) else {
+                    return forbidden();
+                };
+                if path != *page {
+                    log::debug!(
+                        "HTML preview does not serve {} from a remote worktree",
+                        path.display()
+                    );
+                    return not_found();
+                }
+                match text.lock() {
+                    Ok(text) => response(
+                        StatusCode::OK,
+                        content_type(page),
+                        text.clone().into_bytes(),
+                    ),
+                    Err(error) => {
+                        log::error!("reading a remote page's text: {error}");
+                        not_found()
+                    }
+                }
             }
         }
     }
@@ -1010,6 +1049,23 @@ mod tests {
         assert_eq!(
             resolve_request_path(root, "/docs/%2E%2E/%2E%2E/secret"),
             None
+        );
+    }
+
+    /// A remote page is matched by its path in the worktree, with no root.
+    #[test]
+    fn requests_resolve_to_worktree_paths_without_a_root() {
+        assert_eq!(
+            resolve_request_path(Path::new(""), "/.bench/home.html"),
+            Some(PathBuf::from(".bench/home.html"))
+        );
+        let page = RelPath::from_unix_str(".bench/home.html").unwrap();
+        assert_eq!(
+            resolve_request_path(
+                Path::new(""),
+                &page_url(page)["bench-preview://localhost".len()..]
+            ),
+            Some(page.as_std_path().to_path_buf())
         );
     }
 

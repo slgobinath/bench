@@ -4,6 +4,7 @@ mod web_view;
 use std::cell::Cell;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use file_icons::FileIcons;
@@ -28,7 +29,7 @@ use zed_actions::claude::{
     AddComment, AddCommentOn, CommentTarget, SendLines, SendSelection, SendText,
 };
 
-use crate::web_view::{PageEvent, PageSource, WebView, page_url};
+use crate::web_view::{PageEvent, PageFiles, PageSource, WebView, page_url};
 
 pub use browser::{
     BrowserView, ClickOutcome, ClickTarget, ConsoleEntry, OpenBrowser, Screenshot, TypeOutcome,
@@ -153,6 +154,8 @@ pub struct HtmlPreviewView {
     buffer: Option<Entity<Buffer>>,
     /// Set when the tab shows a PDF, which has no buffer to watch.
     pdf: Option<Entity<PdfFile>>,
+    /// The page's text, for a page on another machine; see [`PageFiles::Remote`].
+    remote_text: Option<Arc<Mutex<String>>>,
     /// What is selected in the page, as the page last reported it.
     selection: String,
     /// Where the page is in the window, as last laid out.
@@ -220,15 +223,23 @@ impl HtmlPreviewView {
         cx: &mut Context<Self>,
     ) -> Self {
         let fs = project.read(cx).fs().clone();
+        let remote_text = (!project.read(cx).is_local() && pdf.is_none())
+            .then(|| Arc::new(Mutex::new(String::new())));
 
         let (events_sender, mut events) = mpsc::unbounded();
         let (abs_path, web_view, load_error) = match root {
             Ok(root) => {
                 let abs_path = root.join(project_path.path.as_std_path());
+                let files = match &remote_text {
+                    Some(text) => PageFiles::Remote {
+                        page: project_path.path.as_std_path().to_path_buf(),
+                        text: text.clone(),
+                    },
+                    None => PageFiles::Disk { root, fs },
+                };
                 let source = PageSource::Worktree {
                     url: page_url(&project_path.path),
-                    root,
-                    fs,
+                    files,
                 };
                 match WebView::new(source, events_sender, window, cx) {
                     Ok(web_view) => (abs_path, Some(web_view), None),
@@ -265,13 +276,21 @@ impl HtmlPreviewView {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                let subscription =
-                    cx.subscribe_in(&buffer, window, |this, _, event: &BufferEvent, _, _| {
-                        match event {
-                            BufferEvent::Saved | BufferEvent::Reloaded => this.reload_page(),
-                            _ => {}
+                // The page was first served before the buffer had its text.
+                if this.take_remote_text(&buffer, cx) {
+                    this.reload_page();
+                }
+                let subscription = cx.subscribe_in(
+                    &buffer,
+                    window,
+                    |this, buffer, event: &BufferEvent, _, cx| match event {
+                        BufferEvent::Saved | BufferEvent::Reloaded => {
+                            this.take_remote_text(buffer, cx);
+                            this.reload_page();
                         }
-                    });
+                        _ => {}
+                    },
+                );
                 this._subscriptions.push(subscription);
                 this.buffer = Some(buffer);
             })
@@ -312,6 +331,7 @@ impl HtmlPreviewView {
             load_error,
             buffer: None,
             pdf,
+            remote_text,
             selection: String::new(),
             page_bounds: Cell::new(Bounds::default()),
             context_menu: None,
@@ -324,6 +344,19 @@ impl HtmlPreviewView {
 
     pub fn project_path(&self) -> &ProjectPath {
         &self.project_path
+    }
+
+    /// Gives a remote page the buffer's text, which is all the web view can
+    /// see of it. Whether the page is a remote one.
+    fn take_remote_text(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
+        let Some(remote_text) = &self.remote_text else {
+            return false;
+        };
+        match remote_text.lock() {
+            Ok(mut text) => *text = buffer.read(cx).text(),
+            Err(error) => log::error!("updating a remote page's text: {error}"),
+        }
+        true
     }
 
     fn handle_page_event(&mut self, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -794,7 +827,15 @@ impl ProjectItem for HtmlPreviewView {
         let workspace = pane
             .map(|pane| pane.workspace().clone())
             .unwrap_or_else(WeakEntity::new_invalid);
-        Self::new(workspace, project, project_path, root, Some(item), window, cx)
+        Self::new(
+            workspace,
+            project,
+            project_path,
+            root,
+            Some(item),
+            window,
+            cx,
+        )
     }
 }
 
