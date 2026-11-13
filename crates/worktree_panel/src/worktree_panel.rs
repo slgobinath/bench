@@ -30,44 +30,41 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context as _, Result, anyhow};
-use git::repository::{CreateWorktreeTarget, GitRepository, RepoPath, Worktree as GitWorktree};
 use agent_tracker::{
     AgentState, AgentSummary, AgentTracker, AgentsChanged, ClaudeModel, Phase, agent_state_color,
 };
+use anyhow::{Context as _, Result, anyhow};
+use git::repository::{CreateWorktreeTarget, GitRepository, RepoPath, Worktree as GitWorktree};
 use git_ui_core::pull_request_color::pull_request_color;
 use github_cli::{self, PullRequest, PullRequestState};
-use linear::{Issue, Linear, LinearEvent, StateType};
-use worktree_metadata::{
-    HUE_NAMES, HUES, LinearTeam, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
-};
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AsyncWindowContext, ClipboardItem, Context,
-    DismissEvent,
-    Entity,
-    EventEmitter, FocusHandle, Focusable, Global, ScrollHandle, Stateful, Task, Transformation, WeakEntity, Window,
-    actions, percentage, prelude::*, svg,
+    DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Global, ScrollHandle, Stateful,
+    Task, Transformation, WeakEntity, Window, actions, percentage, prelude::*, svg,
 };
+use linear::{Issue, Linear, LinearEvent, StateType};
 use project::{
     Fs, ProjectGroupKey, discover_root_repo_common_dir, git_store::Repository,
     git_store::linked_worktree_short_name, repo_identity_path_if_local,
 };
 use remote::{RemoteConnectionIdentity, RemoteConnectionOptions, SshConnectionOptions};
+use settings::Settings as _;
 use ui::{
     Checkbox, CommonAnimationExt as _, ContextMenu, Label, ListItem, ListItemSpacing, PopoverMenu,
-    TintColor,
-    Tooltip, prelude::*,
+    TintColor, Tooltip, prelude::*,
 };
 use ui_input::{ErasedEditor, InputField};
-use settings::Settings as _;
+use util::ResultExt as _;
 use util::path_list::PathList;
 use util::paths::home_dir;
 use util::rel_path::RelPath;
 use util::shell::ShellKind;
-use util::ResultExt as _;
 use workspace::{
     ModalView, MultiWorkspace, MultiWorkspaceEvent, OpenMode, RemovalIntent, Workspace,
     dock::{DockPosition, Panel, PanelEvent, PanelSizeState},
+};
+use worktree_metadata::{
+    HUE_NAMES, HUES, LinearTeam, LinkedIssue, MetadataChanged, WorktreeMetadataStore, hue_color,
 };
 
 actions!(
@@ -107,11 +104,17 @@ impl WorktreePanelSettings {
     /// worktree and exclude none: a worktree listed that should not have been
     /// is a nuisance, one hidden that should not have been looks lost.
     fn allows(&self, path: &Path, home: Option<&Path>) -> bool {
-        let inside =
-            |entry: &String| expand_path(entry, home).map(|root| path.starts_with(root));
+        let inside = |entry: &String| expand_path(entry, home).map(|root| path.starts_with(root));
         let included = self.include.is_empty()
-            || self.include.iter().any(|entry| inside(entry).unwrap_or(true));
-        included && !self.exclude.iter().any(|entry| inside(entry).unwrap_or(false))
+            || self
+                .include
+                .iter()
+                .any(|entry| inside(entry).unwrap_or(true));
+        included
+            && !self
+                .exclude
+                .iter()
+                .any(|entry| inside(entry).unwrap_or(false))
     }
 }
 
@@ -577,7 +580,9 @@ struct ProjectScans {
 /// What is known about one worktree's status; see
 /// [`WorktreePanel::scan_statuses`].
 enum StatusScan {
-    Pending { _scan: Task<()> },
+    Pending {
+        _scan: Task<()>,
+    },
     Found {
         status: WorktreeStatus,
         checked: Instant,
@@ -637,7 +642,11 @@ pub struct WorktreePanel {
     /// around it there competes with the rows for attention.
     filter: Arc<dyn ErasedEditor>,
     /// The menu of a worktree row, while it is open.
-    context_menu: Option<(Entity<ContextMenu>, gpui::Point<gpui::Pixels>, gpui::Subscription)>,
+    context_menu: Option<(
+        Entity<ContextMenu>,
+        gpui::Point<gpui::Pixels>,
+        gpui::Subscription,
+    )>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -937,9 +946,10 @@ impl WorktreePanel {
                     },
                     is_active: open.is_some_and(|open| &open.workspace == active),
                     workspace: open.map(|open| open.workspace.clone()),
-                    pull_request: plan.branch.as_ref().and_then(|branch| {
-                        pull_requests?.get(branch).copied()
-                    }),
+                    pull_request: plan
+                        .branch
+                        .as_ref()
+                        .and_then(|branch| pull_requests?.get(branch).copied()),
                     agents: plan
                         .root
                         .as_deref()
@@ -1304,9 +1314,7 @@ impl WorktreePanel {
             .worktree_paths(cx)
             .ordered_pairs()
             .next()
-            .and_then(|(main, own)| {
-                linked_worktree_short_name(main, own, project.path_style(cx))
-            })
+            .and_then(|(main, own)| linked_worktree_short_name(main, own, project.path_style(cx)))
             .unwrap_or_else(|| "main".into())
     }
 
@@ -1381,38 +1389,39 @@ impl WorktreePanel {
             let opened = multi_workspace.update(cx, |multi_workspace, cx| {
                 find_or_create_workspace_in_group(multi_workspace, root, key, window, cx)
             });
-            window.spawn(cx, async move |cx| {
-                let opened = opened.await;
-                remote_connection::dismiss_connection_modal(&leaving, cx);
-                if let Some(opening) = opening {
-                    opening.update(cx, |_, cx| cx.emit(DismissEvent));
-                }
-                match opened {
-                    Ok(workspace) => {
-                        let Some(action) = then else {
-                            return;
-                        };
-                        // After a frame, once the worktree's workspace is the
-                        // one drawn: its actions are only reachable from there.
-                        window_handle
-                            .update(cx, |_, window, _| {
-                                window.on_next_frame(move |window, cx| {
-                                    let focus_handle = workspace.read(cx).focus_handle(cx);
-                                    focus_handle.dispatch_action(&*action, window, cx);
-                                });
-                            })
-                            .log_err();
+            window
+                .spawn(cx, async move |cx| {
+                    let opened = opened.await;
+                    remote_connection::dismiss_connection_modal(&leaving, cx);
+                    if let Some(opening) = opening {
+                        opening.update(cx, |_, cx| cx.emit(DismissEvent));
                     }
-                    Err(error) => {
-                        log::error!("opening the worktree {name}: {error:#}");
-                        leaving.update(cx, |workspace, cx| {
-                            workspace
-                                .show_error(format!("Could not open “{name}”: {error:#}"), cx);
-                        });
+                    match opened {
+                        Ok(workspace) => {
+                            let Some(action) = then else {
+                                return;
+                            };
+                            // After a frame, once the worktree's workspace is the
+                            // one drawn: its actions are only reachable from there.
+                            window_handle
+                                .update(cx, |_, window, _| {
+                                    window.on_next_frame(move |window, cx| {
+                                        let focus_handle = workspace.read(cx).focus_handle(cx);
+                                        focus_handle.dispatch_action(&*action, window, cx);
+                                    });
+                                })
+                                .log_err();
+                        }
+                        Err(error) => {
+                            log::error!("opening the worktree {name}: {error:#}");
+                            leaving.update(cx, |workspace, cx| {
+                                workspace
+                                    .show_error(format!("Could not open “{name}”: {error:#}"), cx);
+                            });
+                        }
                     }
-                }
-            })
-            .detach();
+                })
+                .detach();
         });
     }
 
@@ -1608,26 +1617,33 @@ impl WorktreePanel {
             let host = from.clone();
             host.update(cx, |host, cx| {
                 host.toggle_modal(window, cx, move |window, cx| {
-                    NameWorktree::new(directory, team, issue, window, cx, move |name, description, issue, window, cx| {
-                        let from = from.clone();
-                        let repository = repository.clone();
-                        let key = key.clone();
-                        panel
-                            .update(cx, |panel, cx| {
-                                panel.create_worktree(
-                                    from,
-                                    repository,
-                                    key,
-                                    name,
-                                    description,
-                                    issue,
-                                    start_agent,
-                                    window,
-                                    cx,
-                                );
-                            })
-                            .ok();
-                    })
+                    NameWorktree::new(
+                        directory,
+                        team,
+                        issue,
+                        window,
+                        cx,
+                        move |name, description, issue, window, cx| {
+                            let from = from.clone();
+                            let repository = repository.clone();
+                            let key = key.clone();
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.create_worktree(
+                                        from,
+                                        repository,
+                                        key,
+                                        name,
+                                        description,
+                                        issue,
+                                        start_agent,
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        },
+                    )
                 });
             });
         });
@@ -1926,7 +1942,9 @@ impl WorktreePanel {
         cx.spawn(async move |_, cx| {
             if let Err(error) = created.await {
                 log::error!("{error:#}");
-                from.update(cx, |workspace, cx| workspace.show_error(format!("{error:#}"), cx));
+                from.update(cx, |workspace, cx| {
+                    workspace.show_error(format!("{error:#}"), cx)
+                });
             }
         })
         .detach();
@@ -2003,7 +2021,10 @@ impl WorktreePanel {
             .iter()
             .find_map(|worktree| worktree.workspace.clone().or(worktree.switch_from.clone()))
         else {
-            return Task::ready(Err(anyhow!("The project “{}” has no open workspace", row.name)));
+            return Task::ready(Err(anyhow!(
+                "The project “{}” has no open workspace",
+                row.name
+            )));
         };
         let existing_branch = if use_existing_branch {
             ExistingBranch::Use
@@ -2095,7 +2116,9 @@ impl WorktreePanel {
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
         let Some(fs) = self.fs(cx) else {
-            return Task::ready(Err(anyhow!("Bench has no file system to create worktrees with")));
+            return Task::ready(Err(anyhow!(
+                "Bench has no file system to create worktrees with"
+            )));
         };
         let Some(home) = worktrees_home(&from, cx) else {
             return Task::ready(Err(anyhow!(
@@ -2313,13 +2336,19 @@ impl WorktreePanel {
         let project = repository_anchor(&repository, cx);
         // Asked of the repository's git directory rather than of `repository`,
         // which can be the worktree's own checkout and so gone by then.
-        let common_dir = repository.read(cx).snapshot().common_dir_abs_path.to_path_buf();
+        let common_dir = repository
+            .read(cx)
+            .snapshot()
+            .common_dir_abs_path
+            .to_path_buf();
         let deleted = self
             .tree(cx)
             .into_iter()
             .flat_map(|row| row.worktrees)
             .find(|worktree| worktree.root.as_deref() == Some(root.as_path()));
-        let branch = deleted.as_ref().and_then(|worktree| worktree.branch.clone());
+        let branch = deleted
+            .as_ref()
+            .and_then(|worktree| worktree.branch.clone());
         // A worktree on a remote host is none of this machine's files: its
         // terminals are ended there, and its branch deleted through the
         // repository, since its git directory is not here to open. Asked
@@ -2334,7 +2363,10 @@ impl WorktreePanel {
                 multi_workspace
                     .workspaces()
                     .find(|workspace| {
-                        workspace.read(cx).project_group_key(cx).matches(&worktree.key)
+                        workspace
+                            .read(cx)
+                            .project_group_key(cx)
+                            .matches(&worktree.key)
                             && workspace_root(workspace, cx)
                                 .is_some_and(|workspace_root| !workspace_root.starts_with(&root))
                     })
@@ -2355,9 +2387,7 @@ impl WorktreePanel {
         let issue = deleted
             .and_then(|worktree| worktree.issue)
             .filter(|issue| !issue.state.kind.is_closed())
-            .filter(|_| {
-                Linear::global(cx).is_some_and(|linear| linear.read(cx).is_connected())
-            });
+            .filter(|_| Linear::global(cx).is_some_and(|linear| linear.read(cx).is_connected()));
 
         cx.spawn_in(window, async move |this, cx| {
             let git = which::which("git").ok();
@@ -2568,8 +2598,10 @@ impl WorktreePanel {
             menu.when_some(issue.clone(), |menu, identifier| {
                 let this = this.clone();
                 menu.entry(format!("Open {identifier}"), None, move |window, cx| {
-                    this.update(cx, |this, cx| this.open_issue(identifier.clone(), window, cx))
-                        .ok();
+                    this.update(cx, |this, cx| {
+                        this.open_issue(identifier.clone(), window, cx)
+                    })
+                    .ok();
                 })
             })
             .entry("Edit Title…", None, {
@@ -2771,11 +2803,7 @@ impl WorktreePanel {
                     // A project is a directory, or whatever the user said it
                     // is; a worktree is a branch. The rows are told apart by
                     // their icons before they are read.
-                    .child(
-                        Icon::new(icon)
-                            .size(IconSize::Small)
-                            .color(Color::Muted),
-                    ),
+                    .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted)),
             )
             .child(
                 Label::new(row.name.clone())
@@ -2934,11 +2962,7 @@ impl WorktreePanel {
                             h_flex()
                                 .w_full()
                                 .gap_2()
-                                .child(
-                                    Icon::new(icon)
-                                        .size(IconSize::Small)
-                                        .color(Color::Muted),
-                                )
+                                .child(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
                                 .child(Label::new(label))
                                 .when(icon == current, |this| {
                                     this.child(
@@ -3040,13 +3064,7 @@ impl WorktreePanel {
                     .tooltip(Tooltip::text(sync_description(ahead, behind)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.sync_worktree(
-                            root.clone(),
-                            ahead > 0,
-                            behind > 0,
-                            window,
-                            cx,
-                        );
+                        this.sync_worktree(root.clone(), ahead > 0, behind > 0, window, cx);
                     }))
                     .into_any_element()
             }
@@ -3074,9 +3092,11 @@ impl WorktreePanel {
                             style
                         }
                     })
-                    .on_drop(cx.listener(move |this, dragged: &DraggedWorktree, _, cx| {
-                        this.move_worktree(dragged, &root, cx)
-                    }))
+                    .on_drop(cx.listener(
+                        move |this, dragged: &DraggedWorktree, _, cx| {
+                            this.move_worktree(dragged, &root, cx)
+                        },
+                    ))
                 },
             )
             .when_some(row.root.clone(), |this, root| {
@@ -3116,7 +3136,11 @@ impl WorktreePanel {
         target: &ProjectGroupKey,
         cx: &mut Context<Self>,
     ) {
-        let Some(from) = dragged.order.iter().position(|key| key.matches(&dragged.key)) else {
+        let Some(from) = dragged
+            .order
+            .iter()
+            .position(|key| key.matches(&dragged.key))
+        else {
             return;
         };
         let Some(to) = dragged.order.iter().position(|key| key.matches(target)) else {
@@ -3141,7 +3165,11 @@ impl WorktreePanel {
     /// from a sort, and the moved worktree has to stay where it was dropped
     /// when the sort is left.
     fn move_worktree(&mut self, dragged: &DraggedWorktree, target: &Path, cx: &mut Context<Self>) {
-        let Some(from) = dragged.siblings.iter().position(|root| *root == dragged.root) else {
+        let Some(from) = dragged
+            .siblings
+            .iter()
+            .position(|root| *root == dragged.root)
+        else {
             return;
         };
         let Some(to) = dragged.siblings.iter().position(|root| root == target) else {
@@ -3176,7 +3204,10 @@ impl WorktreePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let started = cx.default_global::<ProjectScans>().syncing.insert(root.clone());
+        let started = cx
+            .default_global::<ProjectScans>()
+            .syncing
+            .insert(root.clone());
         if !started {
             return;
         }
@@ -3248,7 +3279,12 @@ impl WorktreePanel {
     /// Opens an issue's tab in the worktree the window is showing. Deferred
     /// for the reason given on [`Self::activate`]: focusing the tab walks the
     /// docks, and a click handler holds this panel's lease.
-    fn open_issue(&mut self, identifier: SharedString, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_issue(
+        &mut self,
+        identifier: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let multi_workspace = self.multi_workspace.clone();
         window.defer(cx, move |window, cx| {
             let Some(workspace) = multi_workspace
@@ -3348,6 +3384,7 @@ fn worktree_card(
         Color::Muted
     };
     let colors = cx.theme().colors();
+    let is_quiet = is_quiet(row, SystemTime::now());
 
     v_flex()
         .id(("worktree", index))
@@ -3365,7 +3402,10 @@ fn worktree_card(
             } else {
                 card.border_color(colors.border_variant)
                     .bg(colors.ghost_element_background)
-                    .hover(|card| card.bg(colors.ghost_element_hover))
+                    .when(is_quiet, |card| card.opacity(QUIET_OPACITY))
+                    // Brought back up under the pointer, so that the card
+                    // about to be clicked is the one that stands out.
+                    .hover(|card| card.bg(colors.ghost_element_hover).opacity(1.))
             }
         })
         .when_some(row_tooltip(row), |this, tooltip| {
@@ -3376,24 +3416,22 @@ fn worktree_card(
                 .w_full()
                 .min_w_0()
                 .gap_1p5()
-                .child(
-                    Icon::new(IconName::GitBranch)
-                        .size(IconSize::Small)
-                        .color(if row.is_active {
-                            // The worktree the window is showing. One
-                            // accented icon says which of them you are in
-                            // from across the tree.
-                            Color::Accent
-                        } else if is_open {
-                            Color::Muted
-                        } else {
-                            // A worktree that exists but is not open in
-                            // this window: the card is there to be
-                            // clicked, and should not read as one of the
-                            // window's own.
-                            Color::Ignored
-                        }),
-                )
+                .child(Icon::new(IconName::GitBranch).size(IconSize::Small).color(
+                    if row.is_active {
+                        // The worktree the window is showing. One
+                        // accented icon says which of them you are in
+                        // from across the tree.
+                        Color::Accent
+                    } else if is_open {
+                        Color::Muted
+                    } else {
+                        // A worktree that exists but is not open in
+                        // this window: the card is there to be
+                        // clicked, and should not read as one of the
+                        // window's own.
+                        Color::Ignored
+                    },
+                ))
                 .child(
                     h_flex()
                         .flex_1()
@@ -3447,9 +3485,11 @@ fn worktree_card(
                         .truncate()
                 })))
                 .children(render_changes(index, row.status.changes))
-                .children(row.status.ahead_behind.and_then(|(ahead, behind)| {
-                    render_ahead_behind(index, ahead, behind)
-                }))
+                .children(
+                    row.status
+                        .ahead_behind
+                        .and_then(|(ahead, behind)| render_ahead_behind(index, ahead, behind)),
+                )
                 .children(
                     row.pull_request
                         .map(|state| render_pull_request(state, index)),
@@ -3726,6 +3766,29 @@ fn sync_description(ahead: u32, behind: u32) -> String {
     }
 }
 
+/// How long a worktree can sit untouched, by you or its agent, before its card
+/// is dimmed. Long enough for lunch or a meeting, short enough that yesterday's
+/// worktrees have faded by morning.
+const QUIET_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
+
+const QUIET_OPACITY: f32 = 0.5;
+
+/// Whether a worktree's card is dimmed, so the ones being worked on stand out
+/// from the ones that are not. Never the one the window is showing, nor one
+/// whose agent is busy or waiting on you, however long since anything changed.
+fn is_quiet(row: &WorktreeRow, now: SystemTime) -> bool {
+    if row.is_active || row.agents.working + row.agents.needs_input > 0 {
+        return false;
+    }
+    // Unknown until git status has answered, and a card should not flicker
+    // dim and back while it does.
+    let Some(touched) = row.last_active.max(row.status.last_edit) else {
+        return false;
+    };
+    now.duration_since(touched)
+        .is_ok_and(|untouched| untouched >= QUIET_AFTER)
+}
+
 /// How long ago a worktree was last edited, as briefly as a card has room for.
 fn edited_ago(elapsed: Duration) -> String {
     const MINUTE: u64 = 60;
@@ -3768,7 +3831,13 @@ fn render_arrangement_menu(current: Arrangement) -> impl IntoElement {
                         IconPosition::End,
                         None,
                         move |_, cx| {
-                            set_arrangement(Arrangement { group_by, ..current }, cx);
+                            set_arrangement(
+                                Arrangement {
+                                    group_by,
+                                    ..current
+                                },
+                                cx,
+                            );
                         },
                     );
                 }
@@ -3855,12 +3924,18 @@ fn arrange(tree: &[RepositoryRow], arrangement: Arrangement) -> Vec<Section<'_>>
     }
     let mut sections: Vec<Section<'_>> = Vec::new();
     if group_by == GroupBy::Project {
-        sections.extend(ordered.iter().copied().map(|row| Section {
-            id: GroupId::Project(row.key.clone()),
-            project: Some(row),
-            label: row.name.clone(),
-            rank: 0,
-            worktrees: row.worktrees.iter().map(|worktree| (row, worktree)).collect(),
+        sections.extend(ordered.iter().copied().map(|row| {
+            Section {
+                id: GroupId::Project(row.key.clone()),
+                project: Some(row),
+                label: row.name.clone(),
+                rank: 0,
+                worktrees: row
+                    .worktrees
+                    .iter()
+                    .map(|worktree| (row, worktree))
+                    .collect(),
+            }
         }));
     } else {
         for row in ordered.iter().copied() {
@@ -4229,14 +4304,12 @@ impl NameWorktree {
                 cx.background_executor().timer(ISSUE_SEARCH_DEBOUNCE).await;
             }
             let Ok(found) = this.update(cx, |this, cx| {
-                this.issue_search
-                    .as_ref()
-                    .map(|search| {
-                        search
-                            .linear
-                            .read(cx)
-                            .search(&query, Some(&search.team), cx)
-                    })
+                this.issue_search.as_ref().map(|search| {
+                    search
+                        .linear
+                        .read(cx)
+                        .search(&query, Some(&search.team), cx)
+                })
             }) else {
                 return;
             };
@@ -4636,10 +4709,12 @@ impl Render for DeleteWorktree {
                                 ToggleState::Unselected
                             },
                         )
-                        .on_click(cx.listener(|this, state: &ToggleState, _, cx| {
-                            this.close_issue = state.selected();
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this, state: &ToggleState, _, cx| {
+                                this.close_issue = state.selected();
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         Label::new(format!("Close {} in Linear", issue.identifier))
@@ -4659,12 +4734,9 @@ impl Render for DeleteWorktree {
                 h_flex()
                     .justify_end()
                     .gap_1()
-                    .child(
-                        Button::new("cancel-delete", "Cancel")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.cancel(&menu::Cancel, window, cx)
-                            })),
-                    )
+                    .child(Button::new("cancel-delete", "Cancel").on_click(
+                        cx.listener(|this, _, window, cx| this.cancel(&menu::Cancel, window, cx)),
+                    ))
                     .child(
                         Button::new("confirm-delete", "Delete")
                             .style(ButtonStyle::Tinted(TintColor::Error))
@@ -5426,7 +5498,10 @@ fn clear_deleted(
         .filter(|key| is_inside(key, root))
         .collect();
     for key in groups {
-        log::info!("removing the project made of the deleted {}", root.display());
+        log::info!(
+            "removing the project made of the deleted {}",
+            root.display()
+        );
         multi_workspace
             .remove_project_group(&key, window, cx)
             .detach_and_log_err(cx);
@@ -5441,7 +5516,8 @@ fn workspaces_inside(
     multi_workspace
         .workspaces()
         .filter(|workspace| {
-            workspace_root(workspace, cx).is_some_and(|workspace_root| workspace_root.starts_with(root))
+            workspace_root(workspace, cx)
+                .is_some_and(|workspace_root| workspace_root.starts_with(root))
         })
         .cloned()
         .collect()
@@ -5629,7 +5705,9 @@ async fn remote_new_branch_base(
 ) -> Option<String> {
     for include_remote_name in [true, false] {
         let branch = repository
-            .update(cx, |repository, _| repository.default_branch(include_remote_name))
+            .update(cx, |repository, _| {
+                repository.default_branch(include_remote_name)
+            })
             .await
             .ok()?
             .log_err()
@@ -6013,7 +6091,13 @@ fn workspace_repository(open: &OpenWorktree, cx: &App) -> Option<Entity<Reposito
 /// has nowhere to explain itself, and the git panel's Pull Requests tab is
 /// where the reason is shown; here it is logged and the icons stay plain.
 async fn pull_requests_by_branch(root: PathBuf) -> HashMap<SharedString, PullRequestState> {
-    match github_cli::pull_requests(github_cli::Repository::Local(&root), None, github_cli::DEFAULT_LIMIT).await {
+    match github_cli::pull_requests(
+        github_cli::Repository::Local(&root),
+        None,
+        github_cli::DEFAULT_LIMIT,
+    )
+    .await
+    {
         Ok(pull_requests) => by_branch(pull_requests),
         Err(unavailable) => {
             log::debug!(
@@ -6055,7 +6139,10 @@ fn by_branch(pull_requests: Vec<PullRequest>) -> HashMap<SharedString, PullReque
 fn worktree_branch(worktree: &GitWorktree) -> Option<SharedString> {
     let ref_name = worktree.ref_name.as_ref()?;
     Some(SharedString::from(
-        ref_name.strip_prefix("refs/heads/").unwrap_or(ref_name).to_string(),
+        ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(ref_name)
+            .to_string(),
     ))
 }
 
@@ -6077,7 +6164,9 @@ impl Render for WorktreePanel {
         // The scans run git and `gh` in the worktree's directory on this
         // machine, which a project on a remote host does not have.
         let local_rows = || tree.iter().filter(|row| row.key.host().is_none());
-        let roots: Vec<PathBuf> = local_rows().filter_map(|row| project_root(&row.key)).collect();
+        let roots: Vec<PathBuf> = local_rows()
+            .filter_map(|row| project_root(&row.key))
+            .collect();
         self.scan_pull_requests(&roots, cx);
         let worktree_roots: Vec<(PathBuf, bool)> = local_rows()
             .flat_map(|row| row.worktrees.iter())
@@ -6092,7 +6181,12 @@ impl Render for WorktreePanel {
             .iter()
             .flat_map(|row| row.worktrees.iter())
             .filter(|worktree| worktree.title.is_none())
-            .filter_map(|worktree| Some((worktree.root.clone()?, worktree.issue.as_ref()?.title.clone())))
+            .filter_map(|worktree| {
+                Some((
+                    worktree.root.clone()?,
+                    worktree.issue.as_ref()?.title.clone(),
+                ))
+            })
             .collect();
         if !untitled.is_empty() {
             cx.defer(move |cx| {
@@ -6411,9 +6505,9 @@ impl Panel for WorktreePanel {
 pub(crate) mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
-    use serde_json::json;
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
+    use serde_json::json;
     use settings::SettingsStore;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -6616,7 +6710,9 @@ pub(crate) mod tests {
         multi_workspace: &Entity<MultiWorkspace>,
         cx: &mut VisualTestContext,
     ) -> Entity<Workspace> {
-        fs.create_dir("/opened".as_ref()).await.expect("worktree dir");
+        fs.create_dir("/opened".as_ref())
+            .await
+            .expect("worktree dir");
         fs.insert_file("/opened/file.txt", b"hi".to_vec()).await;
         let project = Project::test(fs.clone(), ["/opened".as_ref()], cx).await;
 
@@ -6813,12 +6909,14 @@ pub(crate) mod tests {
         cx.run_until_parked();
     }
 
-    fn assert_nothing_left_of_fix(multi_workspace: &Entity<MultiWorkspace>, cx: &mut VisualTestContext) {
+    fn assert_nothing_left_of_fix(
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut VisualTestContext,
+    ) {
         multi_workspace.read_with(cx, |multi_workspace, cx| {
             for workspace in multi_workspace.workspaces() {
                 assert!(
-                    !workspace_root(workspace, cx)
-                        .is_some_and(|root| root.starts_with("/wt/fix")),
+                    !workspace_root(workspace, cx).is_some_and(|root| root.starts_with("/wt/fix")),
                     "no workspace still shows the deleted folder"
                 );
             }
@@ -6873,7 +6971,10 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             found,
-            vec![(PathBuf::from("/wt/fix/repos/inner"), PathBuf::from("/inner/.git"))]
+            vec![(
+                PathBuf::from("/wt/fix/repos/inner"),
+                PathBuf::from("/inner/.git")
+            )]
         );
     }
 
@@ -6902,15 +7003,26 @@ pub(crate) mod tests {
                 .clone()
         });
         assert!(detail.contains("repos/inner"), "{detail}");
-        assert!(detail.contains("Its branch “fix” is deleted too."), "{detail}");
+        assert!(
+            detail.contains("Its branch “fix” is deleted too."),
+            "{detail}"
+        );
         confirm_delete(&mut cx);
         cx.run_until_parked();
 
-        assert!(!cx.has_pending_prompt(), "nothing refused, so nothing more to ask");
+        assert!(
+            !cx.has_pending_prompt(),
+            "nothing refused, so nothing more to ask"
+        );
         let branches = fs
-            .with_git_state(Path::new("/outer/.git"), false, |state| state.branches.clone())
+            .with_git_state(Path::new("/outer/.git"), false, |state| {
+                state.branches.clone()
+            })
             .expect("the outer repository");
-        assert!(!branches.contains("fix"), "the branch goes with the worktree");
+        assert!(
+            !branches.contains("fix"),
+            "the branch goes with the worktree"
+        );
         cx.update(|_, cx| {
             let store = WorktreeMetadataStore::global(cx);
             assert_eq!(
@@ -6921,7 +7033,8 @@ pub(crate) mod tests {
         });
         assert!(!fs.is_dir(Path::new("/wt/fix")).await);
         assert!(
-            !fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await,
+            !fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner"))
+                .await,
             "the clone's repository no longer holds the nested worktree"
         );
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
@@ -6945,9 +7058,14 @@ pub(crate) mod tests {
         assert!(!cx.has_pending_prompt(), "nothing more to ask");
         assert!(!fs.is_dir(Path::new("/wt/fix")).await);
         let branches = fs
-            .with_git_state(Path::new("/outer/.git"), false, |state| state.branches.clone())
+            .with_git_state(Path::new("/outer/.git"), false, |state| {
+                state.branches.clone()
+            })
             .expect("the outer repository");
-        assert!(!branches.contains("fix"), "the branch goes with the worktree");
+        assert!(
+            !branches.contains("fix"),
+            "the branch goes with the worktree"
+        );
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
     }
 
@@ -6993,7 +7111,10 @@ pub(crate) mod tests {
         delete_fix(&panel, &mut cx);
         let uncommitted = delete_question(&multi_workspace, &mut cx).expect("a warning");
         assert!(uncommitted.contains("\nplan.md"), "{uncommitted}");
-        assert!(uncommitted.contains("\nrepos/inner/notes.md"), "{uncommitted}");
+        assert!(
+            uncommitted.contains("\nrepos/inner/notes.md"),
+            "{uncommitted}"
+        );
         assert_eq!(
             uncommitted.matches("repos/inner/notes.md").count(),
             1,
@@ -7004,7 +7125,10 @@ pub(crate) mod tests {
 
         assert!(!cx.has_pending_prompt(), "one question, already answered");
         assert!(!fs.is_dir(Path::new("/wt/fix")).await);
-        assert!(!fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner")).await);
+        assert!(
+            !fs.is_dir(Path::new("/inner/.git/worktrees/fix-inner"))
+                .await
+        );
         assert_nothing_left_of_fix(&multi_workspace, &mut cx);
     }
 
@@ -7067,7 +7191,10 @@ pub(crate) mod tests {
 
         delete_fix(&panel, &mut cx);
         let uncommitted = delete_question(&multi_workspace, &mut cx).expect("a warning");
-        assert_eq!(uncommitted.matches("new-").count(), LISTED_UNCOMMITTED_FILES);
+        assert_eq!(
+            uncommitted.matches("new-").count(),
+            LISTED_UNCOMMITTED_FILES
+        );
         assert!(uncommitted.ends_with("…and 3 more"), "{uncommitted}");
     }
 
@@ -7140,7 +7267,14 @@ pub(crate) mod tests {
 
         let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
         panels[0].update_in(&mut cx, |panel, window, cx| {
-            panel.open_worktree(key, PathBuf::from("/wt/fix"), "fix".into(), None, window, cx);
+            panel.open_worktree(
+                key,
+                PathBuf::from("/wt/fix"),
+                "fix".into(),
+                None,
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
 
@@ -7282,7 +7416,11 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         let filter_focused = cx.update(|window, cx| {
-            panels[0].read(cx).filter.focus_handle(cx).is_focused(window)
+            panels[0]
+                .read(cx)
+                .filter
+                .focus_handle(cx)
+                .is_focused(window)
         });
         assert!(filter_focused, "the filter has focus");
         cx.simulate_input("new");
@@ -7308,9 +7446,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
         let repository = project.read_with(&mut cx, |project, cx| {
-            project
-                .active_repository(cx)
-                .expect("the outer repository")
+            project.active_repository(cx).expect("the outer repository")
         });
 
         panels[0].update_in(&mut cx, |panel, window, cx| {
@@ -7334,7 +7470,10 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         let (path, _) = new_worktree(&key, home_dir(), "rb-174");
-        assert!(fs.is_dir(&path).await, "the worktree was made on the branch");
+        assert!(
+            fs.is_dir(&path).await,
+            "the worktree was made on the branch"
+        );
     }
 
     /// A new worktree's branch starts from the default branch as the remote
@@ -7347,7 +7486,9 @@ pub(crate) mod tests {
         fs.with_git_state(Path::new("/outer/.git"), false, |state| {
             state.current_branch_name = Some("rb-157".into());
             state.refs.insert("HEAD".into(), "feature-tip".into());
-            state.refs.insert("origin/main".into(), "latest-main".into());
+            state
+                .refs
+                .insert("origin/main".into(), "latest-main".into());
         })
         .expect("the outer repository");
         let project = Project::test(fs.clone(), ["/outer".as_ref()], &mut cx).await;
@@ -7357,9 +7498,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
         let repository = project.read_with(&mut cx, |project, cx| {
-            project
-                .active_repository(cx)
-                .expect("the outer repository")
+            project.active_repository(cx).expect("the outer repository")
         });
 
         panels[0].update_in(&mut cx, |panel, window, cx| {
@@ -7389,9 +7528,7 @@ pub(crate) mod tests {
     /// which outlives the branch name's copy of its identifier, and gets the
     /// colour its project's other worktrees are not using.
     #[gpui::test]
-    async fn a_new_worktree_remembers_its_issue_and_gets_its_own_colour(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_new_worktree_remembers_its_issue_and_gets_its_own_colour(cx: &mut TestAppContext) {
         let (fs, multi_workspace, workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
         fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
             .await;
@@ -7402,9 +7539,7 @@ pub(crate) mod tests {
         cx.run_until_parked();
         let key = outer.read_with(&mut cx, |workspace, cx| workspace.project_group_key(cx));
         let repository = project.read_with(&mut cx, |project, cx| {
-            project
-                .active_repository(cx)
-                .expect("the outer repository")
+            project.active_repository(cx).expect("the outer repository")
         });
 
         panels[0].update_in(&mut cx, |panel, window, cx| {
@@ -7437,7 +7572,10 @@ pub(crate) mod tests {
             })
         );
         let hue = metadata.hue.expect("a colour chosen when it was made");
-        assert_ne!(hue, sibling_hue, "not the colour the project's main checkout has");
+        assert_ne!(
+            hue, sibling_hue,
+            "not the colour the project's main checkout has"
+        );
 
         let linked = panels[0].read_with(&mut cx, |panel, cx| {
             panel
@@ -7639,7 +7777,10 @@ pub(crate) mod tests {
         // The panel has drawn once already, which is what seeds the shared
         // width from whatever the first worktree was wearing.
         let seeded = cx.update(|_window, cx| shared_width(cx));
-        assert!(seeded.is_some(), "the first draw sets the width the rest take");
+        assert!(
+            seeded.is_some(),
+            "the first draw sets the width the rest take"
+        );
 
         // As if the user had dragged another worktree's panel wider.
         let wider = PanelSizeState {
@@ -7686,7 +7827,8 @@ pub(crate) mod tests {
         cx.run_until_parked();
 
         assert_eq!(
-            cx.update(|_window, cx| shared_width(cx)).and_then(|width| width.size),
+            cx.update(|_window, cx| shared_width(cx))
+                .and_then(|width| width.size),
             Some(px(360.)),
             "the width the drag ended at is the one every worktree takes"
         );
@@ -7731,7 +7873,10 @@ pub(crate) mod tests {
             matches_filter("fix-inefficient-job-log-insertion", "fjli"),
             "letters in order, anywhere"
         );
-        assert!(matches_filter("anything", ""), "an empty filter is no filter");
+        assert!(
+            matches_filter("anything", ""),
+            "an empty filter is no filter"
+        );
 
         assert!(!matches_filter("data-hub", "hd"), "order matters");
         assert!(!matches_filter("data-hub", "datax"));
@@ -7880,9 +8025,7 @@ pub(crate) mod tests {
     /// A repository with no linked worktrees has a checkout of its own all
     /// the same, which is where the project's icon is kept.
     #[gpui::test]
-    async fn a_repository_without_linked_worktrees_has_its_own_checkout(
-        cx: &mut TestAppContext,
-    ) {
+    async fn a_repository_without_linked_worktrees_has_its_own_checkout(cx: &mut TestAppContext) {
         let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
         fs.insert_tree("/solo", json!({ ".git": {}, "file.txt": "hi" }))
             .await;
@@ -7950,6 +8093,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_worktree_left_alone_for_hours_is_dimmed() {
+        const HOUR: u64 = 3600;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(100 * HOUR);
+        let key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/src/bench")]));
+        let mut row = a_worktree_row(&key, "fix", false);
+
+        assert!(!is_quiet(&row, now), "nothing known yet");
+
+        row.status.last_edit = at(90 * HOUR);
+        assert!(is_quiet(&row, now));
+
+        row.status.last_edit = at(99 * HOUR);
+        assert!(!is_quiet(&row, now), "edited an hour ago");
+
+        row.status.last_edit = at(90 * HOUR);
+        row.last_active = at(99 * HOUR);
+        assert!(!is_quiet(&row, now), "its agent did something an hour ago");
+
+        row.last_active = None;
+        row.agents.needs_input = 1;
+        assert!(!is_quiet(&row, now), "its agent is waiting on you");
+
+        row.agents.needs_input = 0;
+        row.is_active = true;
+        assert!(!is_quiet(&row, now), "the window is showing it");
+    }
+
+    #[test]
     fn a_renamed_files_old_path_is_not_a_changed_file() {
         let status =
             b"## main...origin/main [ahead 2]\0 M src/main.rs\0R  new.rs\0old.rs\0?? notes/\0";
@@ -7985,7 +8156,11 @@ pub(crate) mod tests {
                 "RB-152",
                 "connect-location-details",
             ),
-            ("rb-134-new-rentbee-website-v1", "RB-134", "new-rentbee-website-v1"),
+            (
+                "rb-134-new-rentbee-website-v1",
+                "RB-134",
+                "new-rentbee-website-v1",
+            ),
             ("RB-146", "RB-146", "RB-146"),
             ("fix-login", "RB-146", "fix-login"),
             // Only where an identifier starts: not inside another word.
@@ -8005,9 +8180,7 @@ pub(crate) mod tests {
     /// worktrees, not rows of their own — unless the window has one open.
     /// Worktrees a repository keeps inside its own checkout are still listed.
     #[gpui::test]
-    async fn worktrees_inside_another_projects_worktree_are_not_listed(
-        cx: &mut TestAppContext,
-    ) {
+    async fn worktrees_inside_another_projects_worktree_are_not_listed(cx: &mut TestAppContext) {
         let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
         fs.insert_tree(
             "/outer",
@@ -8090,9 +8263,7 @@ pub(crate) mod tests {
     /// list too. The settings keep them out, but never the repository's own
     /// checkout or a worktree the window has open.
     #[gpui::test]
-    async fn worktrees_outside_the_allowed_directories_are_not_listed(
-        cx: &mut TestAppContext,
-    ) {
+    async fn worktrees_outside_the_allowed_directories_are_not_listed(cx: &mut TestAppContext) {
         let (fs, multi_workspace, _workspaces, panels, mut cx) = worktree_panels(cx, 0).await;
         fs.insert_tree("/outer", json!({ ".git": {}, "file.txt": "hi" }))
             .await;
@@ -8152,7 +8323,10 @@ pub(crate) mod tests {
         };
         let remote_home = Path::new("/home/user");
         assert!(settings.allows(Path::new("/home/user/bench/project/fix"), Some(remote_home)));
-        assert!(!settings.allows(Path::new("/Users/user/bench/project/fix"), Some(remote_home)));
+        assert!(!settings.allows(
+            Path::new("/Users/user/bench/project/fix"),
+            Some(remote_home)
+        ));
         assert!(!settings.allows(Path::new("/home/user/bench/skipped/fix"), Some(remote_home)));
         assert!(
             settings.allows(Path::new("/home/user/bench/skipped/fix"), None),
@@ -8565,8 +8739,14 @@ pub(crate) mod tests {
         }
     }
 
-    fn a_project(name: &str, worktrees: impl FnOnce(&ProjectGroupKey) -> Vec<WorktreeRow>) -> RepositoryRow {
-        let key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from(format!("/src/{name}"))]));
+    fn a_project(
+        name: &str,
+        worktrees: impl FnOnce(&ProjectGroupKey) -> Vec<WorktreeRow>,
+    ) -> RepositoryRow {
+        let key = ProjectGroupKey::new(
+            None,
+            PathList::new(&[PathBuf::from(format!("/src/{name}"))]),
+        );
         RepositoryRow {
             name: SharedString::from(name.to_string()),
             is_open: false,
@@ -8581,7 +8761,10 @@ pub(crate) mod tests {
     }
 
     fn labels(sections: &[Section]) -> Vec<String> {
-        sections.iter().map(|section| section.label.to_string()).collect()
+        sections
+            .iter()
+            .map(|section| section.label.to_string())
+            .collect()
     }
 
     fn names(section: &Section) -> Vec<String> {
@@ -8735,7 +8918,10 @@ pub(crate) mod tests {
             },
         );
 
-        assert_eq!(labels(&sections), ["Needs Input", "Working", "Idle", "No Agent"]);
+        assert_eq!(
+            labels(&sections),
+            ["Needs Input", "Working", "Idle", "No Agent"]
+        );
         assert_eq!(names(&sections[3]), ["alpha", "beta"]);
         assert!(sections.iter().all(|section| section.project.is_none()));
     }
@@ -8753,7 +8939,12 @@ pub(crate) mod tests {
             planning.phase = Some(Phase::Planning);
             let mut unknown = a_worktree_row(key, "unknown", false);
             unknown.agents.working = 1;
-            vec![a_worktree_row(key, "alpha", true), testing, planning, unknown]
+            vec![
+                a_worktree_row(key, "alpha", true),
+                testing,
+                planning,
+                unknown,
+            ]
         })];
 
         let sections = arrange(
