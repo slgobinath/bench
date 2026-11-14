@@ -35,7 +35,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use util::ResultExt as _;
 use workspace::{MultiWorkspace, Toast, Workspace, notifications::NotificationId};
-use worktree_panel::{ProjectListing, WorktreePanel};
+use worktree_panel::{BoardEntry, BoardView, ProjectListing, WorktreePanel};
 
 /// How many characters of a selection are returned. A whole-file selection in
 /// a large file would otherwise be the entire response.
@@ -82,6 +82,8 @@ pub fn init(cx: &mut App) {
         server.handle_request::<PingRequest>(|_, _| Task::ready(Ok(serde_json::Map::new())));
         server.add_tool(ListProjects);
         server.add_tool(CreateWorktree);
+        server.add_tool(Board);
+        server.add_tool(FocusWorktree);
         server.add_tool(GetActiveEditor);
         server.add_tool(GetOpenFiles);
         server.add_tool(GetDiagnostics);
@@ -397,6 +399,250 @@ impl McpServerTool for ListProjects {
             })
             .collect();
         respond(ListProjectsOutput { projects })
+    }
+}
+
+#[derive(Clone)]
+struct Board;
+
+/// Reads the board: every worktree of the project, those waiting on the user
+/// first, with what an agent there is waiting on the user for, the newest
+/// recap an agent there wrote, the commits, changes and pull request of each
+/// of its repositories (nested ones under `repos/` included), the Linear
+/// issue's state, and hints at what the work needs next. For an agent
+/// helping the user keep track of the work in every worktree.
+///
+/// The board must be open in Bench (`board: open board`). Pass `refresh` to
+/// ask git and GitHub again first, which takes a few seconds; otherwise the
+/// last check is returned, with how long ago it was.
+#[derive(Deserialize, JsonSchema)]
+struct BoardInput {
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BoardOutput {
+    /// The project's main checkout, where the board is open.
+    project: PathBuf,
+    /// How long ago git and GitHub were last asked, absent before the first
+    /// check has finished.
+    checked_seconds_ago: Option<u64>,
+    worktrees: Vec<BoardWorktreeOutput>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BoardWorktreeOutput {
+    /// Pass it to `focus_worktree` to show the user this worktree.
+    path: Option<PathBuf>,
+    name: String,
+    /// The Linear issue, such as `RB-352`.
+    issue: Option<String>,
+    title: String,
+    issue_state: Option<String>,
+    /// `waiting_on_user`, `working`, `idle`, or `none` when no agent runs here.
+    /// An idle agent whose recap ends in a question is waiting all the same.
+    agent: String,
+    agents: usize,
+    last_active_minutes_ago: Option<u64>,
+    /// What an agent here is waiting on the user for.
+    question: Option<String>,
+    /// The newest recap an agent here wrote: where the work stands and what
+    /// comes next.
+    recap: Option<String>,
+    /// The worktree's own repository first, then the nested ones.
+    repositories: Vec<BoardRepositoryOutput>,
+    hints: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct BoardRepositoryOutput {
+    name: String,
+    /// Commits the repository's default branch does not have.
+    commits_ahead: u32,
+    /// Uncommitted changed and untracked files.
+    changes: usize,
+    /// `Open`, `Draft`, `Merged` or `Closed`, absent when there is none.
+    pull_request: Option<String>,
+}
+
+/// The open board for the project the client is working in, or else the
+/// only one open.
+fn find_board(directory: Option<&Path>, cx: &App) -> Result<Entity<BoardView>> {
+    let mut boards: Vec<Entity<BoardView>> = Vec::new();
+    for window in windows(cx) {
+        let Ok(multi_workspace) = window.read(cx) else {
+            continue;
+        };
+        for workspace in multi_workspace.workspaces() {
+            boards.extend(workspace.read(cx).items_of_type::<BoardView>(cx));
+        }
+    }
+    let ours = directory.and_then(|directory| {
+        boards
+            .iter()
+            .find(|board| {
+                let main_root = board.read(cx).main_root();
+                directory.starts_with(main_root)
+                    || main_root
+                        .parent()
+                        .is_some_and(|parent| directory.starts_with(parent))
+            })
+            .cloned()
+    });
+    match (ours, boards.len()) {
+        (Some(board), _) => Ok(board),
+        (None, 1) => Ok(boards.remove(0)),
+        (None, 0) => anyhow::bail!(
+            "The board is not open. Ask the user to open it in the project's main checkout with `board: open board`."
+        ),
+        (None, _) => anyhow::bail!(
+            "Several boards are open and none is for the directory you are working in."
+        ),
+    }
+}
+
+fn board_worktree_output(entry: BoardEntry) -> BoardWorktreeOutput {
+    let agent = match entry.agents.state() {
+        Some(agent_tracker::AgentState::NeedsInput) => "waiting_on_user",
+        Some(agent_tracker::AgentState::Working) => "working",
+        Some(agent_tracker::AgentState::Idle) => "idle",
+        None => "none",
+    };
+    BoardWorktreeOutput {
+        path: entry.root,
+        name: entry.name.to_string(),
+        issue: entry.issue.map(|issue| issue.to_string()),
+        title: entry.title.to_string(),
+        issue_state: entry.issue_state.map(|state| state.to_string()),
+        agent: agent.to_string(),
+        agents: entry.agents.total(),
+        last_active_minutes_ago: entry.last_active.and_then(|at| {
+            Some(std::time::SystemTime::now().duration_since(at).ok()?.as_secs() / 60)
+        }),
+        question: entry.question.map(|question| question.to_string()),
+        recap: entry.recap.map(|recap| recap.to_string()),
+        repositories: entry
+            .checkouts
+            .into_iter()
+            .map(|checkout| BoardRepositoryOutput {
+                name: checkout.name.to_string(),
+                commits_ahead: checkout.ahead,
+                changes: checkout.changes,
+                pull_request: checkout
+                    .pull_request
+                    .map(|state| state.label().to_string()),
+            })
+            .collect(),
+        hints: entry.hints.into_iter().map(|hint| hint.to_string()).collect(),
+    }
+}
+
+/// How long `board` waits for a refresh before answering with what it has.
+const BOARD_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+impl McpServerTool for Board {
+    type Input = BoardInput;
+    type Output = BoardOutput;
+
+    const NAME: &'static str = "board";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let board = cx.update(|cx| find_board(context.client_directory.as_deref(), cx))?;
+        if input.refresh {
+            cx.update(|cx| board.update(cx, |board, cx| board.refresh(cx)));
+            let started = std::time::Instant::now();
+            while cx.update(|cx| board.read(cx).is_scanning())
+                && started.elapsed() < BOARD_REFRESH_TIMEOUT
+            {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        }
+        let output = cx.update(|cx| {
+            let board = board.read(cx);
+            BoardOutput {
+                project: board.main_root().to_path_buf(),
+                checked_seconds_ago: board.scanned_at().map(|at| at.elapsed().as_secs()),
+                worktrees: board
+                    .entries(cx)
+                    .into_iter()
+                    .map(board_worktree_output)
+                    .collect(),
+            }
+        });
+        respond(output)
+    }
+}
+
+#[derive(Clone)]
+struct FocusWorktree;
+
+/// Shows the user a worktree: makes it the one Bench's window shows, opening
+/// it if it is not open, so the user can answer its agent there. Use it when a
+/// worktree needs the user in person, such as an agent stopped at a
+/// permission prompt. Pass the worktree's `path` from `board` or
+/// `list_projects`.
+#[derive(Deserialize, JsonSchema)]
+struct FocusWorktreeInput {
+    worktree: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+struct FocusWorktreeOutput {
+    path: PathBuf,
+}
+
+impl McpServerTool for FocusWorktree {
+    type Input = FocusWorktreeInput;
+    type Output = FocusWorktreeOutput;
+
+    const NAME: &'static str = "focus_worktree";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            title: None,
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        }
+    }
+
+    async fn run(
+        &self,
+        input: Self::Input,
+        _context: ToolContext,
+        cx: &mut AsyncApp,
+    ) -> Result<ToolResponse<Self::Output>> {
+        let root = PathBuf::from(&input.worktree);
+        let (window, panel) = cx
+            .update(|cx| {
+                window_projects(cx)
+                    .into_iter()
+                    .find(|(_, _, projects)| {
+                        projects
+                            .iter()
+                            .flat_map(|project| &project.worktrees)
+                            .any(|worktree| worktree.root.as_deref() == Some(root.as_path()))
+                    })
+                    .map(|(window, panel, _)| (window, panel))
+            })
+            .with_context(|| format!("{} is not a worktree Bench lists", root.display()))?;
+        window.update(cx, |_, window, cx| {
+            panel.update(cx, |panel, cx| panel.show_worktree(&root, window, cx))
+        })??;
+        respond(FocusWorktreeOutput { path: root })
     }
 }
 

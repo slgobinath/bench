@@ -13,6 +13,8 @@ path = "src/bench_mcp.rs"
 doctest = false
 
 [dependencies]
+# What the agents on the board are doing.
+agent_tracker.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 context_server.workspace = true

@@ -51,8 +51,8 @@ use editor::{Editor, scroll::Autoscroll};
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
 use gpui::{
-    Action, App, Context, Entity, ImageSource, ReadGlobal as _, Resource, SharedString, SharedUri,
-    TaskExt, Window, actions,
+    Action, App, AppContext as _, Context, Entity, ImageSource, ReadGlobal as _, Resource,
+    SharedString, SharedUri, TaskExt, WeakEntity, Window, actions,
 };
 use language::{
     LanguageRegistry,
@@ -69,6 +69,7 @@ use serde::{Deserialize, Serialize};
 use settings::{LanguageModelSelection, Settings as _, SettingsStore, SidebarSide};
 use std::any::TypeId;
 use std::path::{Path, PathBuf};
+use util::path_list::PathList;
 use util::{
     paths::SanitizedPath,
     rel_path::{RelPath, RelPathBuf},
@@ -273,6 +274,8 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    /// The lead agent on a project's board.
+    Board,
 }
 
 impl AgentThreadSource {
@@ -281,6 +284,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::Board => "board",
         }
     }
 }
@@ -591,6 +595,51 @@ impl Agent {
             Self::Stub => Rc::new(crate::test_support::StubAgentServer::default_response()),
         }
     }
+}
+
+/// Starts a Claude Code conversation over ACP in `work_dir`, for a view of
+/// its own to show, such as the lead agent beside a project's board, and sends
+/// it `first_prompt` once it connects.
+///
+/// It needs nothing from the agent panel, so it works with `disable_ai` on,
+/// which turns the panel off: the conversation has its own connection to
+/// Claude Code, which closes when the returned view is dropped.
+pub fn new_claude_conversation(
+    workspace: WeakEntity<Workspace>,
+    project: Entity<Project>,
+    work_dir: &Path,
+    title: SharedString,
+    first_prompt: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ConversationView> {
+    let agent_id = AgentId::from(agent_servers::CLAUDE_AGENT_ID);
+    let server: Rc<dyn agent_servers::AgentServer> =
+        Rc::new(agent_servers::CustomAgentServer::new(agent_id.clone()));
+    let connection_store = cx.new(|cx| AgentConnectionStore::new(project.clone(), cx));
+    let initial_content = first_prompt.map(|prompt| AgentInitialContent::ContentBlock {
+        blocks: vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(prompt))],
+        auto_submit: true,
+    });
+    let work_dirs = PathList::new(&[work_dir]);
+    cx.new(|cx| {
+        ConversationView::new(
+            server,
+            connection_store,
+            Agent::Custom { id: agent_id },
+            None,
+            None,
+            Some(work_dirs),
+            Some(title),
+            initial_content,
+            workspace,
+            project,
+            None,
+            AgentThreadSource::Board,
+            window,
+            cx,
+        )
+    })
 }
 
 /// Content to initialize new external agent with.

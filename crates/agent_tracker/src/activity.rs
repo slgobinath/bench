@@ -187,6 +187,9 @@ pub struct Activity {
     /// What the agent is doing right now, as one line. Cleared when a turn
     /// ends.
     pub action: Option<SharedString>,
+    /// The newest recap Claude Code wrote of the session — where it stands and
+    /// what comes next — which it writes when the user has been away.
+    pub recap: Option<SharedString>,
     pub todos: Vec<Todo>,
     /// Oldest first.
     pub subagents: Vec<Subagent>,
@@ -290,6 +293,11 @@ impl Activity {
                     self.push_feed(at, "Compact", "Context compacted", true);
                 }
                 Some("turn_duration") => self.finish_turn(at),
+                Some("away_summary") => {
+                    if let Some(text) = entry.get("content").and_then(Value::as_str) {
+                        self.recap = Some(recap_text(text).into());
+                    }
+                }
                 _ => {}
             },
             _ => {}
@@ -506,6 +514,15 @@ impl Activity {
 
 /// The phase a skill, slash command or subagent type puts a session in: the
 /// user's own mapping first, then a guess from the words in its name.
+/// A recap without the note Claude Code appends to every one of them.
+fn recap_text(text: &str) -> String {
+    let text = text.trim();
+    text.strip_suffix("(disable recaps in /config)")
+        .unwrap_or(text)
+        .trim()
+        .to_string()
+}
+
 pub fn skill_phase(name: &str, custom: &HashMap<String, Phase>) -> Option<Phase> {
     let name = name.trim().trim_start_matches('/');
     let bare = name.rsplit(':').next().unwrap_or(name);
@@ -997,6 +1014,22 @@ mod tests {
 
     /// The case that was missed with hooks turned off: `/plan` typed at the
     /// prompt, recorded only in the transcript.
+    #[test]
+    fn keeps_the_newest_recap_without_its_note() {
+        let mut session = Session::new();
+        session.take(json!({"type": "system", "subtype": "away_summary", "content": "Old."}));
+        session.prompt("carry on");
+        session.take(json!({
+            "type": "system",
+            "subtype": "away_summary",
+            "content": "You're on RB-7. Next: open the PRs. (disable recaps in /config)",
+        }));
+        assert_eq!(
+            session.activity.recap.as_deref(),
+            Some("You're on RB-7. Next: open the PRs.")
+        );
+    }
+
     #[test]
     fn a_slash_command_in_the_transcript_sets_the_phase() {
         let mut session = Session::new();

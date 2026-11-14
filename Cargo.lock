@@ -2174,6 +2174,7 @@ checksum = "3a8241f3ebb85c056b509d4327ad0358fbbba6ffb340bf388f26350aeda225b1"
 name = "bench_mcp"
 version = "0.1.0"
 dependencies = [
+ "agent_tracker",
  "anyhow",
  "base64 0.22.1",
  "context_server",
@@ -22603,6 +22604,7 @@ name = "worktree_panel"
 version = "0.1.0"
 dependencies = [
  "agent_tracker",
+ "agent_ui",
  "anyhow",
  "db",
  "editor",

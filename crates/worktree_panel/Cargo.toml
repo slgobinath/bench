@@ -19,6 +19,8 @@ fuzzy.workspace = true
 anyhow.workspace = true
 # The agents running in this worktree's terminals.
 agent_tracker.workspace = true
+# The lead agent beside the board: a Claude Code conversation over ACP.
+agent_ui.workspace = true
 git.workspace = true
 # The one place the colour of a pull request's state is decided.
 git_ui_core.workspace = true

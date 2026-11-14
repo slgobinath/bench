@@ -30,6 +30,7 @@ Bench runs your agents where they already live, in the terminal. It does not rep
 
 - **Terminals survive restarts.** A background terminal host owns every shell. Quitting, crashing or updating Bench leaves your agents running, and each terminal reattaches to the same screen and scrollback when Bench comes back.
 - **Bench knows what your agents are doing.** Any terminal running `claude`, `codex`, `gemini` or `aider` is tracked. Bench sends a system notification when an agent stops to ask you something or finishes a turn, and keeps your Mac awake while one is working. Run `agents: install claude hooks` so Claude Code reports its status exactly rather than having Bench infer it from terminal output.
+- **A board in the main checkout.** `board: open board` lists every worktree of the project by what wants you: the question an agent is waiting on, commits with no pull request in any of the worktree's repositories (nested ones under `repos/` included), merged worktrees ready to delete, two agents in one worktree, and each agent's latest recap. Click a card to go to its worktree. **Start Lead Agent** in its header opens Claude Code beside the cards, on the board itself: it tells you what needs you, passes your answers on to the worktrees' agents and takes you to a worktree when only you can act there. It runs over ACP in the main checkout and keeps nothing the board doesn't show, so closing it loses nothing.
 - **Send code to the agent.** Press `cmd->` to send the selection to the Claude Code running in the current worktree. You can also send a file from its tab or the project panel, a commit from the history, a diagnostic straight from the error popover, or a Linear issue's link from its tab or the Issues panel. If no agent is running, Bench starts one. It pastes a mention into the composer and never submits for you.
 - **Paste images into the terminal.** A screenshot on the clipboard goes straight to the agent, including in terminals on SSH hosts.
 
@@ -37,7 +38,7 @@ Bench runs your agents where they already live, in the terminal. It does not rep
 
 ## Agents that drive Bench
 
-Bench runs an MCP server, `bench_mcp`, so the agents in your terminals can use the editor they are sitting in. They can list your projects, create a worktree, read the open files and the active editor, read diagnostics, and open an HTML file. Agents running on SSH hosts can reach it too: run `bench: install mcp on host` once for each host.
+Bench runs an MCP server, `bench_mcp`, so the agents in your terminals can use the editor they are sitting in. They can list your projects, create a worktree, read the open files and the active editor, read diagnostics, and open an HTML file. A lead agent in the main checkout can read the board (`board`) and bring a worktree to the front for you (`focus_worktree`). Agents running on SSH hosts can reach it too: run `bench: install mcp on host` once for each host.
 
 ## A browser in a tab
 

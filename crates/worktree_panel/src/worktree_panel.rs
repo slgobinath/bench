@@ -23,7 +23,10 @@
 //! the only owner of the workspace and project list, and a second copy of it
 //! here would be a second thing to keep honest.
 
+mod board;
 mod worktree_switcher;
+
+pub use board::{BoardCheckout, BoardEntry, BoardView, OpenBoard};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -140,6 +143,7 @@ fn expand_path(path: &str, home: Option<&Path>) -> Option<PathBuf> {
 }
 
 pub fn init(cx: &mut App) {
+    board::init(cx);
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<WorktreePanel>(window, cx);
