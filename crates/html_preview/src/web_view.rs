@@ -65,12 +65,12 @@ pub(crate) enum PageFiles {
     /// The disk, under the worktree's `root`.
     Disk { root: PathBuf, fs: Arc<dyn Fs> },
     /// Another machine, whose disk the web view can't read. Only the page
-    /// itself is served, as the project's buffer has it, so a page shows whole
+    /// itself is served, as last fetched from there, so a page shows whole
     /// only when it carries its styles, scripts and images inline.
     Remote {
         /// The page's path in its worktree.
         page: PathBuf,
-        text: Arc<Mutex<String>>,
+        contents: Arc<Mutex<Vec<u8>>>,
     },
 }
 
@@ -874,7 +874,7 @@ mod platform {
                     }
                 }
             }
-            PageFiles::Remote { page, text } => {
+            PageFiles::Remote { page, contents } => {
                 let Some(path) = resolve_request_path(Path::new(""), request_path) else {
                     return forbidden();
                 };
@@ -885,12 +885,8 @@ mod platform {
                     );
                     return not_found();
                 }
-                match text.lock() {
-                    Ok(text) => response(
-                        StatusCode::OK,
-                        content_type(page),
-                        text.clone().into_bytes(),
-                    ),
+                match contents.lock() {
+                    Ok(contents) => response(StatusCode::OK, content_type(page), contents.clone()),
                     Err(error) => {
                         log::error!("reading a remote page's text: {error}");
                         not_found()

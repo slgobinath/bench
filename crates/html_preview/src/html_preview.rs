@@ -11,14 +11,15 @@ use file_icons::FileIcons;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    Action, App, Bounds, ClipboardItem, Context, DismissEvent, Element, ElementId, Entity,
+    Action, App, AsyncApp, Bounds, ClipboardItem, Context, DismissEvent, Element, ElementId, Entity,
     EntityId, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hitbox, HitboxBehavior,
     InspectorElementId, IntoElement, LayoutId, Pixels, Point, Render, Style, Subscription, Task,
     WeakEntity, Window, actions, anchored, deferred, px, relative,
 };
 use language::{Buffer, BufferEvent};
-use project::{DisableAiSettings, Project, ProjectEntryId, ProjectPath};
+use project::{DisableAiSettings, PathChange, Project, ProjectEntryId, ProjectPath};
 use regex::Regex;
+use remote::{Interactive, RemoteClient};
 use theme::{Appearance, ThemeScope};
 use ui::{ContextMenu, appearance_toggle, prelude::*};
 use util::ResultExt as _;
@@ -154,8 +155,12 @@ pub struct HtmlPreviewView {
     buffer: Option<Entity<Buffer>>,
     /// Set when the tab shows a PDF, which has no buffer to watch.
     pdf: Option<Entity<PdfFile>>,
-    /// The page's text, for a page on another machine; see [`PageFiles::Remote`].
-    remote_text: Option<Arc<Mutex<String>>>,
+    /// The page's contents, for a page on another machine; see [`PageFiles::Remote`].
+    remote_contents: Option<Arc<Mutex<Vec<u8>>>>,
+    /// The connection a PDF on another machine is fetched over, as it has no
+    /// buffer to bring its contents here.
+    remote_pdf_client: Option<Entity<RemoteClient>>,
+    fetch_remote_pdf: Option<Task<()>>,
     /// What is selected in the page, as the page last reported it.
     selection: String,
     /// Where the page is in the window, as last laid out.
@@ -223,17 +228,21 @@ impl HtmlPreviewView {
         cx: &mut Context<Self>,
     ) -> Self {
         let fs = project.read(cx).fs().clone();
-        let remote_text = (!project.read(cx).is_local() && pdf.is_none())
-            .then(|| Arc::new(Mutex::new(String::new())));
+        let remote_contents =
+            (!project.read(cx).is_local()).then(|| Arc::new(Mutex::new(Vec::new())));
+        let remote_pdf_client = pdf
+            .is_some()
+            .then(|| project.read(cx).remote_client())
+            .flatten();
 
         let (events_sender, mut events) = mpsc::unbounded();
         let (abs_path, web_view, load_error) = match root {
             Ok(root) => {
                 let abs_path = root.join(project_path.path.as_std_path());
-                let files = match &remote_text {
-                    Some(text) => PageFiles::Remote {
+                let files = match &remote_contents {
+                    Some(contents) => PageFiles::Remote {
                         page: project_path.path.as_std_path().to_path_buf(),
-                        text: text.clone(),
+                        contents: contents.clone(),
                     },
                     None => PageFiles::Disk { root, fs },
                 };
@@ -322,7 +331,23 @@ impl HtmlPreviewView {
             subscriptions.push(cx.observe(&workspace, |_, _, cx| cx.notify()));
         }
 
-        Self {
+        if remote_pdf_client.is_some() {
+            subscriptions.push(cx.subscribe(
+                &project,
+                |this: &mut Self, _, event: &project::Event, cx| {
+                    if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event
+                        && *worktree_id == this.project_path.worktree_id
+                        && changes.iter().any(|(path, _, change)| {
+                            *path == this.project_path.path && *change != PathChange::Removed
+                        })
+                    {
+                        this.fetch_remote_pdf(cx);
+                    }
+                },
+            ));
+        }
+
+        let mut this = Self {
             focus_handle,
             workspace,
             project_path,
@@ -331,7 +356,9 @@ impl HtmlPreviewView {
             load_error,
             buffer: None,
             pdf,
-            remote_text,
+            remote_contents,
+            remote_pdf_client,
+            fetch_remote_pdf: None,
             selection: String::new(),
             page_bounds: Cell::new(Bounds::default()),
             context_menu: None,
@@ -339,7 +366,9 @@ impl HtmlPreviewView {
             applied_appearance: None,
             _subscriptions: subscriptions,
             _tasks: vec![handle_events, watch_buffer],
-        }
+        };
+        this.fetch_remote_pdf(cx);
+        this
     }
 
     pub fn project_path(&self) -> &ProjectPath {
@@ -349,14 +378,48 @@ impl HtmlPreviewView {
     /// Gives a remote page the buffer's text, which is all the web view can
     /// see of it. Whether the page is a remote one.
     fn take_remote_text(&self, buffer: &Entity<Buffer>, cx: &App) -> bool {
-        let Some(remote_text) = &self.remote_text else {
+        let Some(remote_contents) = &self.remote_contents else {
             return false;
         };
-        match remote_text.lock() {
-            Ok(mut text) => *text = buffer.read(cx).text(),
+        match remote_contents.lock() {
+            Ok(mut contents) => *contents = buffer.read(cx).text().into_bytes(),
             Err(error) => log::error!("updating a remote page's text: {error}"),
         }
         true
+    }
+
+    /// Fetches a PDF on another machine from there and shows it, replacing
+    /// any fetch still under way.
+    fn fetch_remote_pdf(&mut self, cx: &mut Context<Self>) {
+        let (Some(remote_client), Some(contents), Some(_)) = (
+            self.remote_pdf_client.clone(),
+            self.remote_contents.clone(),
+            self.web_view.as_ref(),
+        ) else {
+            return;
+        };
+        let path = self.abs_path.to_string_lossy().into_owned();
+        self.fetch_remote_pdf = Some(cx.spawn(async move |this, cx| {
+            let fetched = read_host_file(&remote_client, path, cx).await;
+            this.update(cx, |this, cx| {
+                match fetched {
+                    Ok(bytes) => {
+                        match contents.lock() {
+                            Ok(mut contents) => *contents = bytes,
+                            Err(error) => log::error!("updating a remote PDF: {error}"),
+                        }
+                        this.load_error = None;
+                        this.reload_page();
+                    }
+                    Err(error) => {
+                        log::error!("fetching a remote PDF: {error:#}");
+                        this.load_error = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
     }
 
     fn handle_page_event(&mut self, event: PageEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -503,8 +566,12 @@ impl HtmlPreviewView {
         }
     }
 
-    fn reload(&mut self, _: &Reload, _: &mut Window, _: &mut Context<Self>) {
-        self.reload_page();
+    fn reload(&mut self, _: &Reload, _: &mut Window, cx: &mut Context<Self>) {
+        if self.remote_pdf_client.is_some() {
+            self.fetch_remote_pdf(cx);
+        } else {
+            self.reload_page();
+        }
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<Self>) {
@@ -546,11 +613,40 @@ impl HtmlPreviewView {
     }
 }
 
-/// The one-based lines of `source` that `selection`, text selected in the
-/// page rendered from it, was found on. Each selected line is looked for in
-/// turn, with its words allowed any whitespace between them, since the page
-/// joins and wraps lines. Lines that markup splits up, such as a word in bold,
-/// are skipped; the range runs from the first line found to the last.
+/// The contents of the file at `path` on the machine `remote_client` is
+/// connected to.
+async fn read_host_file(
+    remote_client: &Entity<RemoteClient>,
+    path: String,
+    cx: &AsyncApp,
+) -> Result<Vec<u8>> {
+    let template = remote_client.read_with(cx, |client, _| {
+        client.build_command(
+            Some("cat".to_owned()),
+            &["--".to_owned(), path],
+            &Default::default(),
+            None,
+            None,
+            Interactive::No,
+        )
+    })?;
+    let mut command = util::command::new_command(template.program);
+    command
+        .args(template.args)
+        .envs(template.env)
+        .stdin(util::command::Stdio::null())
+        .kill_on_drop(true);
+    let output = cx
+        .background_spawn(async move { command.output().await })
+        .await?;
+    anyhow::ensure!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output.stdout)
+}
+
 fn worktree_root(
     project: &Entity<Project>,
     project_path: &ProjectPath,
@@ -565,6 +661,11 @@ fn worktree_root(
         .to_path_buf())
 }
 
+/// The one-based lines of `source` that `selection`, text selected in the
+/// page rendered from it, was found on. Each selected line is looked for in
+/// turn, with its words allowed any whitespace between them, since the page
+/// joins and wraps lines. Lines that markup splits up, such as a word in bold,
+/// are skipped; the range runs from the first line found to the last.
 fn source_lines_for_selection(source: &str, selection: &str) -> Option<RangeInclusive<u32>> {
     let body_start = Regex::new(r"(?i)<body[\s>]")
         .ok()
